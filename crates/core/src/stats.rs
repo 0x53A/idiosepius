@@ -240,6 +240,7 @@ mod tests {
                         prompt: format!("prompt {i}"),
                         body: Body::TrueFalse { answer: true },
                         explanation: None,
+                        explain: Default::default(),
                         difficulty: 2,
                         source: None,
                         tags: vec![],

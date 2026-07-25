@@ -6,20 +6,25 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::db::{NewQuestion, Store};
-use crate::params;
+use crate::db::{NewFact, NewQuestion, Store};
 use crate::model::*;
+use crate::params;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pack {
     pub deck: PackDeck,
     #[serde(default)]
     pub topics: Vec<PackTopic>,
+    /// Shared explanation fragments and symbol definitions. Usually authored
+    /// in a pack of their own (`content/cs-00-facts.json`) and merged in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<PackFact>,
+    #[serde(default)]
     pub questions: Vec<PackQuestion>,
 }
 
@@ -43,6 +48,25 @@ pub struct PackTopic {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackFact {
+    pub uid: String,
+    #[serde(default)]
+    pub kind: FactKind,
+    /// The glyph, for a symbol: `"ζ"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// What it is called: `"zeta"`. Also gives the LaTeX spelling `\zeta`,
+    /// which is how the UI notices that a prompt uses this symbol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackQuestion {
     pub uid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,8 +75,13 @@ pub struct PackQuestion {
     /// `kind` plus its kind-specific fields, flattened into this object.
     #[serde(flatten)]
     pub body: Body,
+    /// Plain-text short explanation. Shorthand for `explain.short`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explanation: Option<String>,
+    /// The structured explanation: `short` and `deep`, each a list of raw
+    /// strings and `{"fact": "uid"}` references.
+    #[serde(default, skip_serializing_if = "Explain::is_empty")]
+    pub explain: Explain,
     #[serde(default = "default_difficulty")]
     pub difficulty: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,6 +127,18 @@ pub fn merge_packs(packs: Vec<Pack>) -> Result<Pack> {
                 merged.topics.push(t);
             }
         }
+        for f in pack.facts {
+            // Two files defining the same fact differently is an authoring
+            // mistake worth stopping for; the whole point of a fact is that
+            // there is one wording of it.
+            match merged.facts.iter().find(|e| e.uid == f.uid) {
+                Some(existing) if existing.body != f.body => {
+                    bail!("fact {:?} is defined twice, with different text", f.uid)
+                }
+                Some(_) => {}
+                None => merged.facts.push(f),
+            }
+        }
         merged.questions.extend(pack.questions);
     }
 
@@ -108,6 +149,7 @@ pub fn merge_packs(packs: Vec<Pack>) -> Result<Pack> {
 pub struct ImportReport {
     pub deck_id: Id,
     pub topics: usize,
+    pub facts: usize,
     pub questions: usize,
     pub retired: usize,
 }
@@ -128,6 +170,16 @@ pub fn load_pack(path: impl AsRef<Path>) -> Result<Pack> {
 pub fn import_pack(store: &mut Store, pack: &Pack) -> Result<ImportReport> {
     // Validate everything before touching the database, so a typo in question
     // 90 does not leave a half-imported deck behind.
+    let mut seen_facts: HashSet<&str> = HashSet::new();
+    for f in &pack.facts {
+        if !seen_facts.insert(f.uid.as_str()) {
+            bail!("duplicate fact uid {:?} in pack", f.uid);
+        }
+        if f.kind == FactKind::Symbol && f.label.is_none() {
+            bail!("symbol fact {} has no label", f.uid);
+        }
+    }
+
     let mut seen_uids = HashMap::new();
     for q in &pack.questions {
         if seen_uids.insert(&q.uid, ()).is_some() {
@@ -140,6 +192,13 @@ pub fn import_pack(store: &mut Store, pack: &Pack) -> Result<ImportReport> {
             && !pack.topics.iter().any(|pt| &pt.slug == t)
         {
             bail!("question {} references unknown topic {:?}", q.uid, t);
+        }
+        // A reference to a fact that is in neither this pack nor the database
+        // already would render as a silent gap in the explanation.
+        for uid in q.explain.referenced_facts() {
+            if !seen_facts.contains(uid) && store.fact(uid)?.is_none() {
+                bail!("question {} references unknown fact {:?}", q.uid, uid);
+            }
         }
     }
 
@@ -180,6 +239,24 @@ pub fn import_pack(store: &mut Store, pack: &Pack) -> Result<ImportReport> {
         );
     }
 
+    // Facts first: the questions below cite them.
+    //
+    // Unlike questions, facts are never retired by an import. A pack that only
+    // carries one topic must not sweep away the shared glossary, and a fact
+    // nobody cites any more costs a row.
+    for f in &pack.facts {
+        store.upsert_fact(&NewFact {
+            deck_id: Some(deck_id),
+            uid: f.uid.clone(),
+            kind: f.kind,
+            label: f.label.clone(),
+            name: f.name.clone(),
+            title: f.title.clone(),
+            body: f.body.clone(),
+            source: f.source.clone(),
+        })?;
+    }
+
     let retired = store.deactivate_deck_questions(deck_id)?;
 
     for q in &pack.questions {
@@ -190,6 +267,7 @@ pub fn import_pack(store: &mut Store, pack: &Pack) -> Result<ImportReport> {
             prompt: q.prompt.clone(),
             body: q.body.clone(),
             explanation: q.explanation.clone(),
+            explain: q.explain.clone(),
             difficulty: q.difficulty.clamp(1, 5),
             source: q.source.clone(),
             tags: q.tags.clone(),
@@ -199,6 +277,7 @@ pub fn import_pack(store: &mut Store, pack: &Pack) -> Result<ImportReport> {
     Ok(ImportReport {
         deck_id,
         topics: pack.topics.len(),
+        facts: pack.facts.len(),
         questions: pack.questions.len(),
         retired: retired.saturating_sub(pack.questions.len()),
     })
@@ -315,6 +394,7 @@ mod tests {
                 multi: false,
             },
             explanation: None,
+            explain: Default::default(),
             difficulty: 2,
             source: None,
             tags: vec![],
@@ -347,6 +427,99 @@ mod tests {
         assert!(err.contains("unknown topic"), "{err}");
     }
 
+    const FACT_PACK: &str = r#"{
+      "deck": { "slug": "cs", "title": "Control Systems" },
+      "facts": [
+        { "uid": "sym-zeta", "kind": "symbol", "label": "ζ", "name": "zeta",
+          "body": "The damping ratio." },
+        { "uid": "note-2nd-order", "title": "Standard second-order form",
+          "body": "$G(s) = \\frac{\\omega_0^2}{s^2 + 2\\zeta\\omega_0 s + \\omega_0^2}$" }
+      ],
+      "questions": [
+        { "uid": "cs-900", "prompt": "ζ = 1 is critically damped.",
+          "kind": "true_false", "answer": true,
+          "explain": {
+            "short": ["Exactly on the boundary."],
+            "deep": ["Standard form: ", { "fact": "note-2nd-order" },
+                     " where ", { "fact": "sym-zeta" }, " sets the damping."]
+          } }
+      ]
+    }"#;
+
+    #[test]
+    fn parses_facts_and_the_two_readings() {
+        let p: Pack = serde_json::from_str(FACT_PACK).unwrap();
+        assert_eq!(p.facts.len(), 2);
+        assert_eq!(p.facts[0].kind, FactKind::Symbol);
+        assert_eq!(p.facts[1].kind, FactKind::Note, "kind defaults to note");
+
+        let e = &p.questions[0].explain;
+        assert_eq!(e.short, vec![Seg::text("Exactly on the boundary.")]);
+        assert_eq!(e.referenced_facts(), vec!["note-2nd-order", "sym-zeta"]);
+    }
+
+    #[test]
+    fn imports_facts_alongside_questions() {
+        let mut store = Store::open_in_memory().unwrap();
+        let pack: Pack = serde_json::from_str(FACT_PACK).unwrap();
+        let r = import_pack(&mut store, &pack).unwrap();
+
+        assert_eq!(r.facts, 2);
+        assert_eq!(store.fact_count().unwrap(), 2);
+        assert_eq!(
+            store.fact("sym-zeta").unwrap().unwrap().label.as_deref(),
+            Some("ζ")
+        );
+
+        let q = store.question_by_uid("cs-900").unwrap().unwrap();
+        assert_eq!(q.deep().len(), 5);
+    }
+
+    #[test]
+    fn a_question_may_not_cite_a_fact_that_does_not_exist() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut pack: Pack = serde_json::from_str(FACT_PACK).unwrap();
+        pack.questions[0].explain.deep.push(Seg::fact("sym-nope"));
+
+        let err = import_pack(&mut store, &pack).unwrap_err().to_string();
+        assert!(err.contains("unknown fact"), "{err}");
+    }
+
+    #[test]
+    fn a_pack_may_cite_a_fact_already_in_the_database() {
+        let mut store = Store::open_in_memory().unwrap();
+        let full: Pack = serde_json::from_str(FACT_PACK).unwrap();
+        import_pack(&mut store, &full).unwrap();
+
+        // Re-importing one topic file on its own, without the glossary.
+        let mut lone = full.clone();
+        lone.facts.clear();
+        assert!(import_pack(&mut store, &lone).is_ok());
+        assert_eq!(store.fact_count().unwrap(), 2, "facts are never retired");
+    }
+
+    #[test]
+    fn a_fact_defined_twice_with_different_wording_is_rejected() {
+        let a: Pack = serde_json::from_str(FACT_PACK).unwrap();
+        let mut b: Pack = serde_json::from_str(FACT_PACK).unwrap();
+        b.facts[0].body = "Something else entirely.".into();
+        let err = merge_packs(vec![a.clone(), b]).unwrap_err().to_string();
+        assert!(err.contains("defined twice"), "{err}");
+
+        // The same wording twice is just two files agreeing.
+        let merged = merge_packs(vec![a.clone(), a]).unwrap();
+        assert_eq!(merged.facts.len(), 2);
+    }
+
+    #[test]
+    fn a_symbol_without_a_glyph_is_rejected() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut pack: Pack = serde_json::from_str(FACT_PACK).unwrap();
+        pack.facts[0].label = None;
+        let err = import_pack(&mut store, &pack).unwrap_err().to_string();
+        assert!(err.contains("no label"), "{err}");
+    }
+
     #[test]
     fn merges_topic_packs_into_one_deck() {
         let a: Pack = serde_json::from_str(pack_json()).unwrap();
@@ -362,12 +535,14 @@ mod tests {
                 title: "Control".into(),
                 ord: 5,
             }],
+            facts: vec![],
             questions: vec![PackQuestion {
                 uid: "cs-100".into(),
                 topic: Some("control".into()),
                 prompt: "A PI controller removes steady-state error.".into(),
                 body: Body::TrueFalse { answer: true },
                 explanation: None,
+                explain: Default::default(),
                 difficulty: 2,
                 source: None,
                 tags: vec![],

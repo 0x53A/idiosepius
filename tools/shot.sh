@@ -34,10 +34,16 @@ shoot() {
   fi
 }
 
+shoot math      --screen math
 shoot decks     --screen decks
 shoot choice    --screen study --card cs-sta-036
 shoot truefalse --screen study --card cs-sta-009
+shoot hover     --screen hover --card cs-sta-009
 shoot swipe-yes --screen study --card cs-sta-009 --drag 95
 shoot swipe-no  --screen study --card cs-mod-002 --drag -95
+shoot feedback  --screen feedback --card cs-sta-009
+shoot explain   --screen explain --card cs-sta-009
+shoot deep      --screen deep --card cs-sta-009
+shoot review    --screen review --card cs-sta-009
 
 echo "done"

@@ -3,3 +3,4 @@
 *.db-shm
 .direnv
 /content
+__pycache__

@@ -13,8 +13,12 @@ cyan/violet for swipe direction, green/magenta (never red) for verdicts.
   stats. Also the `idiodb` CLI for authoring and evaluation. `sql.rs` is the
   database façade; nothing else in the tree touches the driver directly.
 - `crates/app` — the `eframe` binary. `theme.rs` (palette/style), `card.rs`
-  (swipe motion and rotated painting), `app.rs` (screens).
-- `content/` — question packs, one JSON file per topic, merged on import.
+  (swipe motion and rotated painting), `math.rs` + `richtext.rs` (inline
+  LaTeX), `explain.rs` (short/deep readings and facts), `app.rs` (screens).
+- `content/` — a separately versioned nested Git repository containing
+  question packs, one JSON file per topic plus shared facts, merged on import.
+  The application repository ignores it; do not assume one repository's
+  staging or commit operation includes the other.
 
 ## Things worth knowing
 
@@ -24,6 +28,12 @@ there is no cache. Copying the `.db` moves the course and the history together.
 **`uid` is a question's identity.** Re-importing an edited pack must keep the
 attempt history and scheduler state attached. Never key on the prompt text or
 the row id.
+
+**Explanations are shared content.** A question has a short reading and a deep
+reading; either may contain literal text and `{"fact": "uid"}` references.
+Symbol facts supply the glyph, its spoken name, and its meaning. Keep extended
+expressions in `$...$` LaTeX so the math renderer can lay out fractions,
+radicals and scripts instead of displaying a slash-heavy text approximation.
 
 **The event log is append-only.** Nothing may `UPDATE` or `DELETE` from
 `event`. Undo removes the `attempt` row and rewinds the box, but the original

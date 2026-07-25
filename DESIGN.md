@@ -10,9 +10,11 @@ rows, panels, meters. `CornerRadius::ZERO` is set on every widget class in
 `theme.rs`, and no call site passes anything else. Drop shadows are off too,
 because a soft shadow reads as a rounded edge even on a square corner.
 
-**One-pixel borders do the work.** Separation comes from a hairline and a
-change of fill, never from a shadow or a gradient. Borders brighten to the
-accent on hover and to a semantic colour on feedback.
+**Hairline borders do the ordinary work.** Separation comes from a one-pixel
+line and a change of fill, never from a shadow or a gradient. Active surfaces
+brighten on hover; the large Boolean card additionally grows a stepped,
+rectangular outline because a single brighter pixel is too easy to miss.
+Feedback borders use their semantic colour.
 
 **Monospace throughout.** Berkeley Mono if the system has it, JetBrains Mono
 otherwise, egui's default as a last resort. Nothing is vendored, so no font
@@ -71,12 +73,18 @@ nothing pops into being.
   independent, and it settles exactly at zero rather than drifting.
 - **Commit** — the card flies off along the line the hand was moving, fading
   as it goes.
-- **Feedback** — grows in over 0.12 s. A correct answer auto-advances after
-  0.75 s; a wrong one waits, because you should read why.
+- **Feedback** — grows in over 0.12 s, then waits for a key or a stationary
+  click on the panel whether the answer was right or wrong. A release that
+  completes a swipe is not a click and must not dismiss the explanation it
+  just opened.
+- **Hover** — Boolean cards gain a strong, direction-neutral stepped outline;
+  options and feedback panels brighten their border. These transitions are
+  animated. The Boolean halo is made from crisp rectangular lines, not a
+  blurred shadow, and stays neutral until a drag establishes TRUE or FALSE.
 - **Brand coin** — the cyan outline coin makes one 0.95 s Y-axis revolution
-  on boot, when a deck starts, and after a recorded answer. Clicking the large
-  deck-screen coin also spins it. Screenshot mode leaves it settled so captures
-  remain reproducible.
+  on boot, when a deck starts, and after a recorded answer. It remains visible
+  and clickable on every user-facing screen. Screenshot mode leaves it settled
+  so captures remain reproducible.
 
 Everything is driven by `stable_dt`, clamped to 1/20 s so a stalled frame does
 not teleport the card. Animations return whether they still need a repaint, so
@@ -98,3 +106,15 @@ Every action has a pointer route and a keyboard route, and touch works because
 egui treats it as a pointer. True/false additionally maps left-click to *false*
 and right-click to *true*, so the whole deck can be answered without moving the
 mouse.
+
+Only the visible card, option, panel or button is clickable. Empty margin is a
+safe focus target: clicking it must never answer a question or advance the
+session. Clickable study surfaces give animated hover feedback.
+
+The whole interface scales with `Ctrl/Cmd` + `+` or `−`; `Ctrl/Cmd` + `0`
+returns to 100 %. Scaling applies equally to prose, formulas, cards and chrome.
+
+`Ctrl/Cmd` + `C` copies a human-readable transcript of the current screen.
+It preserves authored `$...$` LaTeX rather than copying JSON or flattening
+formulas to screen glyphs. An unanswered card must never leak its answer into
+that transcript.

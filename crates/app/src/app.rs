@@ -1,8 +1,9 @@
 //! Screens and interaction.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, Sense, Stroke, Vec2};
 use idiosepius_core::model::{Deck, Topic};
@@ -13,10 +14,15 @@ use idiosepius_core::{
 
 use crate::card::{self, Motion};
 use crate::coin::CoinAnimation;
+use crate::explain::{self, Depth, Facts};
+use crate::richtext;
 use crate::theme::{Palette, text, tracked};
 
-/// How long a correct answer's feedback stays up before dealing the next card.
-const AUTO_ADVANCE: f32 = 0.75;
+/// How many answered cards stay reachable with `r`.
+///
+/// Not the whole session: this is for "wait, what was that one", not for
+/// browsing history, which is what the summary screen and `idiodb` are for.
+const REVIEW_HISTORY: usize = 40;
 
 pub struct App {
     store: Rc<Store>,
@@ -24,6 +30,11 @@ pub struct App {
     decks: Vec<Deck>,
     error: Option<String>,
     coin: CoinAnimation,
+    /// When the last screen-shaped clipboard export happened, for the brief
+    /// confirmation in the corner.
+    copied_at: Option<Instant>,
+    /// A review asked for this frame, waiting for the screen it came from.
+    pending_review: Option<Box<Review>>,
     /// Development aid: render a few frames, save a PNG, quit. Lets the UI be
     /// checked headlessly (under Xvfb, in CI) instead of by eye.
     shot: Option<Shot>,
@@ -67,18 +78,29 @@ impl Shot {
 
 enum Screen {
     Decks,
+    /// A sheet of formulas, for checking the renderer. Reachable only through
+    /// `--shot --screen math`: a missing glyph or a fraction sitting a pixel
+    /// off is not something to discover on a card the night before an exam.
+    MathCheck,
     Study(Box<Study>),
     Summary(Summary),
+    /// Looking back at a card that has already been answered. Holds the screen
+    /// it was opened from, so closing it returns exactly where you were —
+    /// including a study session that is still running.
+    Review(Box<Review>),
 }
 
 struct Study {
     session: Session,
     deck: Deck,
     topics: HashMap<i64, String>,
+    facts: Rc<Facts>,
     current: Option<Question>,
     motion: Motion,
     /// Tail of question ids already shown, for interleaving.
     recent: Vec<i64>,
+    /// Cards answered this session, oldest first, for looking back at them.
+    history: Vec<Answered>,
     /// Multiple-choice selection for the current card.
     selected: Vec<usize>,
     feedback: Option<Feedback>,
@@ -89,12 +111,27 @@ struct Study {
     grab: Option<Vec2>,
 }
 
+/// A card that has been answered, kept so it can be looked at again.
+#[derive(Clone)]
+struct Answered {
+    question: Question,
+    /// What was answered, when that is known. A card opened from the summary
+    /// screen is a card to re-read, not a record of one attempt.
+    response: Option<Response>,
+    grade: Option<Grade>,
+}
+
 struct Feedback {
     question: Question,
-    grade: Grade,
-    response: Response,
+    /// Both are absent when `e` revealed the answer using skip semantics.
+    grade: Option<Grade>,
+    response: Option<Response>,
     since: Instant,
-    outcome: Outcome,
+    outcome: Option<Outcome>,
+    depth: Depth,
+    /// Pointer position when the press started, so releasing a swipe does not
+    /// also dismiss the explanation it just produced.
+    press_origin: Option<Pos2>,
 }
 
 struct Summary {
@@ -102,11 +139,27 @@ struct Summary {
     deck_id: i64,
     stats: stats::SessionStats,
     weakest: Vec<stats::WeakQuestion>,
+    facts: Rc<Facts>,
+}
+
+/// Looking back over answered cards.
+struct Review {
+    items: Vec<Answered>,
+    idx: usize,
+    depth: Depth,
+    facts: Rc<Facts>,
+    topics: HashMap<i64, String>,
+    back: Screen,
 }
 
 impl App {
     pub fn new(ctx: &egui::Context, store: Store, shot: Option<Shot>) -> Self {
         crate::theme::install(ctx);
+        // Keep egui's browser-style whole-interface zoom available:
+        // Ctrl/Cmd + or =, Ctrl/Cmd -, and Ctrl/Cmd 0 to reset. This scales
+        // cards, explanations, formulas and chrome together rather than
+        // special-casing whichever piece of text happens to be hard to read.
+        ctx.options_mut(|o| o.zoom_with_keyboard = true);
         let store = Rc::new(store);
         let decks = store.decks().unwrap_or_default();
         let animate_coin = shot.is_none();
@@ -116,17 +169,32 @@ impl App {
             decks,
             error: None,
             coin: CoinAnimation::new(animate_coin),
+            copied_at: None,
+            pending_review: None,
             shot,
         };
 
         // Jump straight to the screen being captured.
-        if let Some(target) = app.shot.as_ref().and_then(|s| s.screen.clone())
-            && target != "decks"
-            && let Some(deck) = app.decks.first().cloned()
-            && let Some(mut screen) = app.begin(deck, Mode::Practice)
-        {
-            app.stage_shot(&mut screen);
-            app.screen = screen;
+        match app.shot.as_ref().and_then(|s| s.screen.clone()).as_deref() {
+            None | Some("decks") => {}
+            Some("math") => app.screen = Screen::MathCheck,
+            Some(name) => {
+                if let Some(deck) = app.decks.first().cloned()
+                    && let Some(mut screen) = app.begin(deck, Mode::Practice)
+                {
+                    app.stage_shot(&mut screen);
+                    // The review overlay wraps the screen it was opened from,
+                    // which the first frame will do for us.
+                    if name == "review"
+                        && let Screen::Study(study) = &screen
+                    {
+                        let items = study.history.clone();
+                        let last = items.len().saturating_sub(1);
+                        app.open_review(items, last, study.facts.clone(), study.topics.clone());
+                    }
+                    app.screen = screen;
+                }
+            }
         }
         app
     }
@@ -156,6 +224,30 @@ impl App {
             study.motion.entry = 1.0;
             study.motion.dragging = true; // freeze it: no spring-back mid-capture
             study.motion.offset = Vec2::new(shot.drag, shot.drag * 0.08);
+        }
+
+        // Screens that only exist after an answer or reveal: give ordinary
+        // feedback a deliberately wrong answer, and exercise `e` separately.
+        let wants_feedback = matches!(
+            shot.screen.as_deref(),
+            Some("feedback" | "deep" | "review" | "explain")
+        );
+        let deep = shot.screen.as_deref() == Some("deep");
+        if wants_feedback && let Some(q) = study.current.clone() {
+            if shot.screen.as_deref() == Some("explain") {
+                self.apply(study, Action::Explain);
+            } else {
+                let wrong = match &q.body {
+                    Body::TrueFalse { answer } => Response::TrueFalse { value: !answer },
+                    Body::MultipleChoice { options, .. } => Response::MultipleChoice {
+                        selected: vec![options.iter().position(|o| !o.correct).unwrap_or(0)],
+                    },
+                };
+                self.apply(study, Action::Answer(wrong, Input::Key));
+            }
+            if deep && let Some(fb) = &mut study.feedback {
+                fb.depth = Depth::Deep;
+            }
         }
     }
 
@@ -221,17 +313,190 @@ impl eframe::App for App {
 
         let next = match &mut screen {
             Screen::Decks => self.deck_screen(ui),
+            Screen::MathCheck => {
+                math_check(ui);
+                None
+            }
             Screen::Study(study) => self.study_screen(ui, study),
             Screen::Summary(sum) => self.summary_screen(ui, sum),
+            Screen::Review(review) => self.review_screen(ui, review),
         };
-        self.screen = next.unwrap_or(screen);
+        let mut screen = next.unwrap_or(screen);
+
+        // Opening a review needs the screen it was opened from, which only
+        // exists here: the handler that asked for it is holding a borrow of it.
+        if let Some(mut review) = self.pending_review.take() {
+            review.back = screen;
+            screen = Screen::Review(review);
+        }
+
+        // egui-winit translates Ctrl/Cmd+C into Event::Copy and deliberately
+        // does not emit a C key event, so normal shortcut matching cannot see
+        // it. Consume the platform copy event directly.
+        let copy = ui
+            .ctx()
+            .input_mut(|input| take_copy_event(&mut input.events));
+        if copy {
+            let text = self.visible_text(&screen);
+            if !text.trim().is_empty() {
+                ui.ctx().copy_text(text);
+                self.copied_at = Some(Instant::now());
+            }
+        }
+        self.screen = screen;
 
         self.error_bar(ui);
+        self.copy_notice(ui);
         self.drive_shot(ui.ctx());
     }
 }
 
+fn take_copy_event(events: &mut Vec<egui::Event>) -> bool {
+    let had_copy = events
+        .iter()
+        .any(|event| matches!(event, egui::Event::Copy));
+    if had_copy {
+        events.retain(|event| !matches!(event, egui::Event::Copy));
+    }
+    had_copy
+}
+
 impl App {
+    /// A human-readable transcript of the current screen.
+    ///
+    /// This deliberately exports authored strings, not painted glyphs or
+    /// database JSON. In particular, `$...$` remains LaTeX so a copied card is
+    /// immediately useful in notes or in a question to a chatbot.
+    fn visible_text(&self, screen: &Screen) -> String {
+        match screen {
+            Screen::Decks => {
+                let mut out = String::from("Idiosepius\n\nDecks");
+                if self.decks.is_empty() {
+                    out.push_str("\n\nNo decks yet.");
+                }
+                for deck in &self.decks {
+                    let counts = scheduler::counts(&self.store, deck.id).unwrap_or_default();
+                    let stat = stats::deck_stats(&self.store, deck.id).unwrap_or_default();
+                    let _ = write!(
+                        out,
+                        "\n\n{}\n{} cards · {} new · {} due\nReadiness: {:.0}%",
+                        deck.title,
+                        counts.total,
+                        counts.fresh,
+                        counts.due,
+                        stat.readiness * 100.0
+                    );
+                    if let Some(exam) = deck.exam_at {
+                        let remaining = exam - now_ms();
+                        if remaining > 0 {
+                            let _ = write!(out, "\nExam in {}", fmt_span(remaining));
+                        } else {
+                            out.push_str("\nExam passed");
+                        }
+                    }
+                }
+                out
+            }
+            Screen::MathCheck => {
+                let mut out = String::from("Math renderer");
+                for (name, formula) in MATH_SAMPLES {
+                    let _ = write!(out, "\n\n{name}\n{formula}");
+                }
+                out
+            }
+            Screen::Study(study) => {
+                let Some(question) = study.current.as_ref() else {
+                    return format!("{}\n\nNothing due right now.", study.deck.title);
+                };
+                let topic = question
+                    .topic_id
+                    .and_then(|id| study.topics.get(&id))
+                    .map(String::as_str);
+                match &study.feedback {
+                    Some(feedback) => card_text(
+                        &feedback.question,
+                        topic,
+                        &[],
+                        feedback.response.as_ref(),
+                        feedback.grade,
+                        true,
+                        Some((&study.facts, feedback.depth)),
+                    ),
+                    None => card_text(question, topic, &study.selected, None, None, false, None),
+                }
+            }
+            Screen::Review(review) => {
+                let Some(item) = review.items.get(review.idx) else {
+                    return String::new();
+                };
+                let topic = item
+                    .question
+                    .topic_id
+                    .and_then(|id| review.topics.get(&id))
+                    .map(String::as_str);
+                card_text(
+                    &item.question,
+                    topic,
+                    &[],
+                    item.response.as_ref(),
+                    item.grade,
+                    true,
+                    Some((&review.facts, review.depth)),
+                )
+            }
+            Screen::Summary(summary) => {
+                let stat = &summary.stats;
+                let mut out = format!(
+                    "Session complete\n\nAccuracy: {:.0}%\n{} answered · {} skipped · {} studied",
+                    stat.accuracy * 100.0,
+                    stat.answered,
+                    stat.skipped,
+                    fmt_ms(stat.duration_ms)
+                );
+                if !summary.weakest.is_empty() {
+                    out.push_str("\n\nWorth another look");
+                    for weak in summary.weakest.iter().take(7) {
+                        let _ = write!(out, "\n\n{:.0}% · {}", weak.ema * 100.0, weak.prompt);
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Brief, non-modal confirmation that Ctrl/Cmd+C copied the current view.
+    fn copy_notice(&mut self, ui: &mut egui::Ui) {
+        let Some(since) = self.copied_at else {
+            return;
+        };
+        if since.elapsed() >= Duration::from_millis(900) {
+            self.copied_at = None;
+            return;
+        }
+
+        let full = ui.max_rect();
+        let notice = Rect::from_min_size(
+            full.right_top() + Vec2::new(-114.0, 12.0),
+            Vec2::new(102.0, 28.0),
+        );
+        let p = ui.painter();
+        p.rect_filled(notice, 0, Palette::SURFACE);
+        p.rect_stroke(
+            notice,
+            0,
+            Stroke::new(1.0, Palette::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+        p.text(
+            notice.center(),
+            Align2::CENTER_CENTER,
+            tracked("copied"),
+            text::label(),
+            Palette::ACCENT,
+        );
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
+    }
+
     /// A dismissible strip along the bottom. Errors here are things the user
     /// can do nothing about mid-session, so they must not interrupt studying.
     fn error_bar(&mut self, ui: &mut egui::Ui) {
@@ -417,6 +682,13 @@ impl App {
             text::label(),
             Palette::TEXT_FAINT,
         );
+        ui.painter().text(
+            Pos2::new(panel.right(), panel.bottom() - 18.0),
+            Align2::RIGHT_BOTTOM,
+            tracked("ctrl ± size  ·  ctrl 0 reset"),
+            text::label(),
+            Palette::TEXT_FAINT,
+        );
 
         next
     }
@@ -438,13 +710,16 @@ impl App {
             .collect();
         let counts = scheduler::counts(&self.store, deck.id).unwrap_or_default();
 
+        let facts = Rc::new(Facts::load(&self.store, deck.id));
         let mut study = Study {
             session,
             deck,
             topics,
+            facts,
             current: None,
             motion: Motion::deal(),
             recent: Vec::new(),
+            history: Vec::new(),
             selected: Vec::new(),
             feedback: None,
             answered: 0,
@@ -483,6 +758,69 @@ impl App {
             }
         }
         study.counts = scheduler::counts(&self.store, study.deck.id).unwrap_or_default();
+    }
+
+    /// Put a specific question back on the table, as after an undo.
+    fn deal_again(&mut self, study: &mut Study, question_id: i64) {
+        match self.store.question(question_id) {
+            Ok(Some(q)) => {
+                study.session.show(q.id);
+                study.current = Some(q);
+                study.motion = Motion::deal();
+                study.selected.clear();
+            }
+            Ok(None) => self.deal_next(study),
+            Err(e) => {
+                self.error = Some(format!("could not reopen that card: {e}"));
+                self.deal_next(study);
+            }
+        }
+        study.counts = scheduler::counts(&self.store, study.deck.id).unwrap_or_default();
+    }
+
+    /// Open the weak-card list from the summary screen, starting at the one
+    /// that was clicked. All of them are loaded, so `← →` walks the list.
+    fn open_weakest(&mut self, sum: &Summary, idx: usize) {
+        let items: Vec<Answered> = sum
+            .weakest
+            .iter()
+            .filter_map(|w| self.store.question(w.question_id).ok().flatten())
+            .map(|question| Answered {
+                question,
+                response: None,
+                grade: None,
+            })
+            .collect();
+        let topics: HashMap<i64, String> = self
+            .store
+            .topics(sum.deck_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t: Topic| (t.id, t.title))
+            .collect();
+        self.open_review(items, idx, sum.facts.clone(), topics);
+    }
+
+    /// Open the review overlay on the last `items` answered, newest last.
+    fn open_review(
+        &mut self,
+        items: Vec<Answered>,
+        idx: usize,
+        facts: Rc<Facts>,
+        topics: HashMap<i64, String>,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let idx = idx.min(items.len() - 1);
+        self.pending_review = Some(Box::new(Review {
+            items,
+            idx,
+            depth: Depth::Short,
+            facts,
+            topics,
+            back: Screen::Decks,
+        }));
     }
 }
 
@@ -544,12 +882,23 @@ impl App {
             }
         }
 
-        if let Some(fb) = &study.feedback {
-            let auto = fb.grade.correct && fb.since.elapsed().as_secs_f32() > AUTO_ADVANCE;
-            feedback_panel(ui, fb, stage, full);
-            ctx.request_repaint();
-            if auto {
+        // The explanation stays up until it is dismissed, right or wrong. A
+        // correct answer is exactly when a misconception is cheapest to fix,
+        // and a panel that fades on its own is one you learn to ignore.
+        if study.feedback.is_some() {
+            if let Some(dismissed) = self.feedback_panel(ui, study, stage, full)
+                && dismissed
+            {
                 action = Action::Continue;
+            }
+            // Only the 120 ms grow-in needs continuous frames. Once settled,
+            // an explanation may stay open for minutes without burning CPU.
+            if study
+                .feedback
+                .as_ref()
+                .is_some_and(|fb| fb.since.elapsed().as_secs_f32() < 0.12)
+            {
+                ctx.request_repaint();
             }
         }
 
@@ -560,14 +909,19 @@ impl App {
         self.apply(study, action)
     }
 
-    /// Top and bottom chrome: deck, counters, exam countdown, key hints.
     fn keys(&mut self, ctx: &egui::Context, study: &Study) -> Option<Action> {
         ctx.input(|i| {
             use egui::Key::*;
             if i.key_pressed(Escape) {
                 return Some(Action::Quit);
             }
+            if i.key_pressed(R) {
+                return Some(Action::Look);
+            }
             if study.feedback.is_some() {
+                if i.key_pressed(D) {
+                    return Some(Action::Deeper);
+                }
                 return (i.key_pressed(Space) || i.key_pressed(Enter)).then_some(Action::Continue);
             }
             if i.key_pressed(U) {
@@ -575,6 +929,9 @@ impl App {
             }
             if i.key_pressed(S) {
                 return Some(Action::Skip);
+            }
+            if i.key_pressed(E) {
+                return Some(Action::Explain);
             }
 
             match study.current.as_ref().map(|q| &q.body) {
@@ -620,12 +977,22 @@ impl App {
                         if outcome.grade.correct {
                             study.correct += 1;
                         }
+                        study.history.push(Answered {
+                            question: q.clone(),
+                            response: Some(response.clone()),
+                            grade: Some(outcome.grade),
+                        });
+                        if study.history.len() > REVIEW_HISTORY {
+                            study.history.remove(0);
+                        }
                         study.feedback = Some(Feedback {
                             question: q,
-                            grade: outcome.grade,
-                            response,
+                            grade: Some(outcome.grade),
+                            response: Some(response),
                             since: Instant::now(),
-                            outcome,
+                            outcome: Some(outcome),
+                            depth: Depth::Short,
+                            press_origin: None,
                         });
                     }
                     Err(e) => self.error = Some(format!("could not record answer: {e}")),
@@ -675,16 +1042,68 @@ impl App {
                 None
             }
 
+            Action::Explain => {
+                if let Some(q) = study.current.clone() {
+                    // Revealing is statistically a skip: it is logged, creates
+                    // no attempt, and does not pretend the user got it wrong.
+                    // Unlike `s`, it leaves the card up long enough to learn
+                    // from the answer before dealing the next one.
+                    study.session.skip(q.id);
+                    study.history.push(Answered {
+                        question: q.clone(),
+                        response: None,
+                        grade: None,
+                    });
+                    if study.history.len() > REVIEW_HISTORY {
+                        study.history.remove(0);
+                    }
+                    study.feedback = Some(Feedback {
+                        question: q,
+                        grade: None,
+                        response: None,
+                        since: Instant::now(),
+                        outcome: None,
+                        depth: Depth::Short,
+                        press_origin: None,
+                    });
+                }
+                None
+            }
+
+            // Undo means "let me answer that one again", so the card comes
+            // back rather than being replaced by the next one in the queue.
             Action::Undo => {
                 match study.session.undo_last() {
-                    Ok(Some(_)) => {
+                    Ok(Some(question_id)) => {
                         study.answered = study.answered.saturating_sub(1);
+                        if let Some(last) = study.history.pop()
+                            && last.grade.is_some_and(|g| g.correct)
+                        {
+                            study.correct = study.correct.saturating_sub(1);
+                        }
                         study.feedback = None;
-                        self.deal_next(study);
+                        self.deal_again(study, question_id);
                     }
                     Ok(None) => {}
                     Err(e) => self.error = Some(format!("undo failed: {e}")),
                 }
+                None
+            }
+
+            Action::Deeper => {
+                if let Some(fb) = &mut study.feedback {
+                    fb.depth = fb.depth.toggled();
+                }
+                None
+            }
+
+            // Look back over what has already been answered this session.
+            // The card on screen is deliberately not included: it has not
+            // been answered, and showing it here would give the answer away.
+            Action::Look => {
+                let items = study.history.clone();
+                let last = items.len().saturating_sub(1);
+                self.open_review(items, last, study.facts.clone(), study.topics.clone());
                 None
             }
 
@@ -701,6 +1120,7 @@ impl App {
                     deck_id,
                     stats: stats_now,
                     weakest,
+                    facts: study.facts.clone(),
                 }))
             }
         }
@@ -713,15 +1133,130 @@ enum Action {
     Pick(usize, bool),
     CommitPicks,
     Continue,
+    /// Switch the explanation between its short and deep readings.
+    Deeper,
+    /// Look back at cards already answered.
+    Look,
     Skip,
+    /// Reveal the explanation, recorded exactly like a skip.
+    Explain,
     Undo,
     Quit,
+}
+
+fn card_text(
+    question: &Question,
+    topic: Option<&str>,
+    selected: &[usize],
+    response: Option<&Response>,
+    grade: Option<Grade>,
+    reveal_answer: bool,
+    explanation: Option<(&Facts, Depth)>,
+) -> String {
+    let mut out = String::new();
+    if let Some(topic) = topic.filter(|topic| !topic.trim().is_empty()) {
+        let _ = writeln!(out, "{topic}\n");
+    }
+    let _ = write!(out, "Question\n{}", question.prompt.trim());
+
+    match &question.body {
+        Body::TrueFalse { answer } => {
+            out.push_str("\n\nChoices\n- True\n- False");
+            if let Some(Response::TrueFalse { value }) = response {
+                let _ = write!(out, "\n\nMy answer: {}", truth_word(*value));
+            }
+            if reveal_answer {
+                let _ = write!(out, "\nCorrect answer: {}", truth_word(*answer));
+            }
+        }
+        Body::MultipleChoice { options, multi } => {
+            out.push_str(if *multi {
+                "\n\nChoices (select all that apply)"
+            } else {
+                "\n\nChoices"
+            });
+            for (index, option) in options.iter().enumerate() {
+                let marker = if !reveal_answer && selected.contains(&index) {
+                    " [selected]"
+                } else {
+                    ""
+                };
+                let _ = write!(out, "\n{}. {}{marker}", index + 1, option.text.trim());
+            }
+
+            if let Some(Response::MultipleChoice { selected }) = response {
+                let answer = choice_text(options, selected);
+                let _ = write!(out, "\n\nMy answer: {answer}");
+            }
+            if reveal_answer {
+                let correct: Vec<usize> = options
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, option)| option.correct.then_some(index))
+                    .collect();
+                let _ = write!(out, "\nCorrect answer: {}", choice_text(options, &correct));
+            }
+        }
+    }
+
+    if let Some(grade) = grade {
+        let result = if grade.correct {
+            "Correct"
+        } else if grade.score > 0.0 {
+            "Partly right"
+        } else {
+            "Wrong"
+        };
+        let _ = write!(out, "\nResult: {result}");
+    } else if reveal_answer && response.is_none() {
+        out.push_str("\n\nNo answer was recorded.");
+    }
+
+    if let Some((facts, depth)) = explanation {
+        let explanation = explain::plain_text(question, facts, depth);
+        if !explanation.is_empty() {
+            let label = match depth {
+                Depth::Short => "Explanation",
+                Depth::Deep => "Deep explanation",
+            };
+            let _ = write!(out, "\n\n{label}\n{explanation}");
+        }
+    }
+
+    out
+}
+
+fn truth_word(value: bool) -> &'static str {
+    if value { "True" } else { "False" }
+}
+
+fn choice_text(options: &[idiosepius_core::Choice], indices: &[usize]) -> String {
+    if indices.is_empty() {
+        return "none".to_owned();
+    }
+    indices
+        .iter()
+        .filter_map(|&index| {
+            options
+                .get(index)
+                .map(|option| format!("{}. {}", index + 1, option.text.trim()))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn chrome(ui: &egui::Ui, study: &Study, full: Rect, coin: &mut CoinAnimation) {
     let top = Rect::from_min_size(full.left_top(), Vec2::new(full.width(), 56.0));
     let coin_rect =
         Rect::from_center_size(top.left_center() + Vec2::new(25.0, 0.0), Vec2::splat(36.0));
+    // The coin spins wherever it is drawn. It is the one piece of pure
+    // ornament in the app and it should always answer when you poke it.
+    if ui
+        .interact(coin_rect, Id::new("chrome-coin"), Sense::click())
+        .clicked()
+    {
+        coin.spin();
+    }
     coin.paint(ui, coin_rect);
 
     let p = ui.painter();
@@ -777,13 +1312,21 @@ fn chrome(ui: &egui::Ui, study: &Study, full: Rect, coin: &mut CoinAnimation) {
         p.rect_filled(bar, 0, Palette::ACCENT.gamma_multiply(0.8));
     }
 
-    let hint = match study.current.as_ref().map(|q| &q.body) {
-        Some(Body::TrueFalse { .. }) => "drag or ← →  ·  s skip  ·  u undo  ·  esc end",
-        Some(Body::MultipleChoice { multi: true, .. }) => {
-            "1-5 toggle  ·  enter confirm  ·  s skip  ·  esc end"
+    let hint = if study.feedback.is_some() {
+        "space/click next  ·  d depth  ·  r review  ·  esc end"
+    } else {
+        match study.current.as_ref().map(|q| &q.body) {
+            Some(Body::TrueFalse { .. }) => {
+                "←/→ answer  ·  e explain  ·  s skip  ·  u undo  ·  r review"
+            }
+            Some(Body::MultipleChoice { multi: true, .. }) => {
+                "1-5 select  ·  enter confirm  ·  e explain  ·  s skip  ·  r review"
+            }
+            Some(Body::MultipleChoice { .. }) => {
+                "click/1-5 answer  ·  e explain  ·  s skip  ·  u undo  ·  r review"
+            }
+            None => "esc end",
         }
-        Some(Body::MultipleChoice { .. }) => "click or 1-5  ·  s skip  ·  u undo  ·  esc end",
-        None => "esc end",
     };
     p.text(
         full.center_bottom() - Vec2::new(0.0, 20.0),
@@ -792,6 +1335,18 @@ fn chrome(ui: &egui::Ui, study: &Study, full: Rect, coin: &mut CoinAnimation) {
         text::label(),
         Palette::TEXT_FAINT,
     );
+}
+
+/// The brand coin on screens that do not use the study header.
+///
+/// It lives outside the centred panel so it never steals reading space, but
+/// remains available on every user-facing screen.
+fn corner_coin(ui: &egui::Ui, full: Rect, coin: &mut CoinAnimation, id: &'static str) {
+    let rect = Rect::from_min_size(full.left_top() + Vec2::new(8.0, 8.0), Vec2::splat(38.0));
+    if ui.interact(rect, Id::new(id), Sense::click()).clicked() {
+        coin.spin();
+    }
+    coin.paint(ui, rect);
 }
 
 fn fmt_span(ms: i64) -> String {
@@ -830,6 +1385,7 @@ impl App {
     ) -> Action {
         let mut action = Action::None;
         let interactive = study.feedback.is_none() && !study.motion.is_flying();
+        let mut hovered = false;
 
         if interactive {
             let resp = ui.interact(
@@ -837,6 +1393,7 @@ impl App {
                 Id::new(("tf", q.id)),
                 Sense::click_and_drag(),
             );
+            hovered = resp.hovered();
 
             if resp.drag_started() {
                 study.motion.dragging = true;
@@ -880,6 +1437,10 @@ impl App {
             }
         }
 
+        // A reproducible screenshot of the active state is more useful than
+        // trying to race a real pointer against the headless capture.
+        hovered |= self.shot.as_ref().and_then(|shot| shot.screen.as_deref()) == Some("hover");
+
         // The card that was just answered is still animating away; keep
         // drawing it until it clears the screen.
         if study.feedback.is_some() && !study.motion.is_flying() {
@@ -897,6 +1458,9 @@ impl App {
         card::deck_behind(p, rect, 3, Palette::CARD_DEEP, Palette::LINE);
 
         let progress = motion.commit_progress();
+        let hover = ui
+            .ctx()
+            .animate_bool(Id::new(("tf-hover", q.id)), interactive && hovered);
         let edge = if progress > 0.05 {
             Palette::ACCENT.gamma_multiply(0.3 + 0.7 * progress.abs())
         } else if progress < -0.05 {
@@ -905,12 +1469,19 @@ impl App {
             Palette::LINE_BRIGHT
         };
 
+        card::hover_glow(
+            p,
+            drawn,
+            angle,
+            Palette::TEXT_DIM.gamma_multiply(opacity),
+            hover,
+        );
         card::face(
             p,
             drawn,
             angle,
             Palette::CARD.gamma_multiply(opacity),
-            Stroke::new(1.0, edge.gamma_multiply(opacity)),
+            Stroke::new(1.0 + 1.6 * hover, edge.gamma_multiply(opacity)),
         );
 
         // Topic label and difficulty pips along the top edge.
@@ -945,15 +1516,20 @@ impl App {
             ));
         }
 
-        // Prompt, wrapped and vertically centred.
+        // Prompt, wrapped and vertically centred. Formulas in it are laid out
+        // by `math` and tilt with the card like any other ink on its face.
         let wrap = drawn.width() - 56.0;
-        let size = if q.prompt.len() > 180 { 16.5 } else { 19.0 };
-        let g = p.layout(q.prompt.clone(), text::prompt(size), Palette::TEXT, wrap);
+        let size = if q.prompt.chars().count() > 180 {
+            16.5
+        } else {
+            19.0
+        };
+        let doc = richtext::layout(p, &q.prompt, size, wrap);
         let local = Pos2::new(
             drawn.left() + 28.0,
-            drawn.center().y - g.rect.height() / 2.0 - 6.0,
+            drawn.center().y - doc.height() / 2.0 - 6.0,
         );
-        card::text(p, pivot, angle, local, g, Palette::TEXT, opacity);
+        doc.paint_rotated(p, local, pivot, angle, Palette::TEXT, opacity);
 
         // Footer rail with the two directions.
         card::text_centered(
@@ -1008,27 +1584,18 @@ impl App {
 
         // Measure first: the card is sized to its content, so a two-line
         // question does not sit in a half-empty box.
-        let prompt_galley =
-            ui.painter()
-                .layout(q.prompt.clone(), text::prompt(17.5), Palette::TEXT, wrap);
-        let option_galleys: Vec<_> = options
+        let prompt_doc = richtext::layout(ui.painter(), &q.prompt, 17.5, wrap);
+        let option_docs: Vec<_> = options
             .iter()
-            .map(|o| {
-                ui.painter()
-                    .layout(o.text.clone(), text::body(), Palette::TEXT, wrap - 54.0)
-            })
+            .map(|o| richtext::layout(ui.painter(), &o.text, 15.0, wrap - 54.0))
             .collect();
 
-        let options_h: f32 = option_galleys
+        let options_h: f32 = option_docs
             .iter()
-            .map(|g| (g.rect.height() + 22.0).max(40.0) + 8.0)
+            .map(|d| (d.height() + 22.0).max(40.0) + 8.0)
             .sum();
-        let content_h = 48.0
-            + prompt_galley.rect.height()
-            + 22.0
-            + options_h
-            + if multi { 50.0 } else { 0.0 }
-            + 20.0;
+        let content_h =
+            48.0 + prompt_doc.height() + 22.0 + options_h + if multi { 50.0 } else { 0.0 } + 20.0;
 
         let card_rect = Rect::from_center_size(
             stage.center(),
@@ -1067,17 +1634,18 @@ impl App {
             );
         }
 
-        let prompt_h = prompt_galley.rect.height();
-        p.galley(
+        let prompt_h = prompt_doc.height();
+        prompt_doc.paint(
+            p,
             card_rect.left_top() + Vec2::new(24.0, 48.0),
-            prompt_galley,
             Palette::TEXT,
+            opacity,
         );
 
         let mut y = card_rect.top() + 48.0 + prompt_h + 22.0;
 
-        for (i, (opt, og)) in options.iter().zip(option_galleys).enumerate() {
-            let h = (og.rect.height() + 22.0).max(40.0);
+        for (i, (opt, og)) in options.iter().zip(option_docs).enumerate() {
+            let h = (og.height() + 22.0).max(40.0);
             let row = Rect::from_min_size(
                 Pos2::new(card_rect.left() + 24.0, y),
                 Vec2::new(card_rect.width() - 48.0, h),
@@ -1090,10 +1658,15 @@ impl App {
                 Some(ui.interact(row, Id::new(("opt", q.id, i)), Sense::click()))
             };
             let hot = resp.as_ref().is_some_and(|r| r.hovered());
+            let hover = ui.ctx().animate_bool(Id::new(("opt-hover", q.id, i)), hot);
 
             let (border, fill, label_col) = if revealed {
-                let chose = match &study.feedback.as_ref().unwrap().response {
-                    Response::MultipleChoice { selected } => selected.contains(&i),
+                let chose = match study
+                    .feedback
+                    .as_ref()
+                    .and_then(|feedback| feedback.response.as_ref())
+                {
+                    Some(Response::MultipleChoice { selected }) => selected.contains(&i),
                     _ => false,
                 };
                 if opt.correct {
@@ -1127,7 +1700,12 @@ impl App {
             if fill != Color32::TRANSPARENT {
                 p.rect_filled(row, 0, fill);
             }
-            p.rect_stroke(row, 0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+            p.rect_stroke(
+                row,
+                0,
+                Stroke::new(1.0 + 0.7 * hover, border),
+                egui::StrokeKind::Inside,
+            );
 
             // Index box on the left, so 1-5 on the keyboard is discoverable.
             let key_box = Rect::from_min_size(row.left_top(), Vec2::new(34.0, row.height()));
@@ -1142,7 +1720,7 @@ impl App {
                 text::label(),
                 label_col,
             );
-            p.galley(row.left_top() + Vec2::new(48.0, 11.0), og, label_col);
+            og.paint(p, row.left_top() + Vec2::new(48.0, 11.0), label_col, 1.0);
 
             if resp.is_some_and(|r| r.clicked()) {
                 action = Action::Pick(i, multi);
@@ -1182,102 +1760,513 @@ impl App {
     }
 }
 
-fn feedback_panel(ui: &egui::Ui, fb: &Feedback, stage: Rect, full: Rect) {
-    let is_tf = matches!(fb.question.body, Body::TrueFalse { .. });
+/// The verdict, the truth, and the explanation — the panel you actually learn
+/// from, so it scrolls and it waits for you.
+///
+/// Returns `Some(true)` when the user dismissed it.
+impl App {
+    fn feedback_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        study: &mut Study,
+        stage: Rect,
+        full: Rect,
+    ) -> Option<bool> {
+        let fb = study.feedback.as_ref()?;
+        let (colour, verdict) = match fb.grade {
+            Some(grade) if grade.correct => (Palette::CORRECT, "CORRECT"),
+            Some(grade) if grade.score > 0.0 => (Palette::WRONG, "PARTLY RIGHT"),
+            Some(_) => (Palette::WRONG, "WRONG"),
+            None => (Palette::ACCENT, "EXPLANATION"),
+        };
+        let truth = match &fb.question.body {
+            Body::TrueFalse { answer } => Some(if *answer {
+                "the statement is TRUE"
+            } else {
+                "the statement is FALSE"
+            }),
+            _ => None,
+        };
 
-    // Grow in over ~120 ms so the verdict does not simply blink into being.
-    let t = (fb.since.elapsed().as_secs_f32() / 0.12).clamp(0.0, 1.0);
-    let ease = 1.0 - (1.0 - t).powi(3);
+        // Grow in over ~120 ms so the verdict does not blink into being.
+        let t = (fb.since.elapsed().as_secs_f32() / 0.12).clamp(0.0, 1.0);
+        let ease = 1.0 - (1.0 - t).powi(3);
 
-    let colour = if fb.grade.correct {
-        Palette::CORRECT
-    } else {
-        Palette::WRONG
-    };
-    let verdict = if fb.grade.correct {
-        "CORRECT"
-    } else if fb.grade.score > 0.0 {
-        "PARTLY RIGHT"
-    } else {
-        "WRONG"
-    };
+        const HEAD: f32 = 46.0;
+        const FOOT: f32 = 34.0;
+        let width = stage.width().min(640.0);
+        let inner_w = width - 48.0;
 
-    let explanation = fb.question.explanation.clone().unwrap_or_default();
-    let truth = match &fb.question.body {
-        Body::TrueFalse { answer } => Some(if *answer {
-            "the statement is TRUE"
+        let truth_h = if truth.is_some() { 30.0 } else { 0.0 };
+        let body_h = explain::measure(ui, inner_w, &fb.question, &study.facts, fb.depth);
+        let wanted = HEAD + truth_h + body_h + FOOT + 16.0;
+        let height = wanted.min(full.height() - 120.0).max(110.0);
+
+        // A true/false card has flown off; its explanation takes the middle of
+        // the stage. A choice card is still on screen, so the panel sits under
+        // it rather than over the options it is talking about.
+        let is_tf = matches!(fb.question.body, Body::TrueFalse { .. });
+        let panel = if is_tf {
+            Rect::from_center_size(stage.center(), Vec2::new(width, height))
         } else {
-            "the statement is FALSE"
-        }),
-        _ => None,
-    };
-
-    let wrap = stage.width().min(620.0) - 48.0;
-    let g = ui
-        .painter()
-        .layout(explanation.clone(), text::body(), Palette::TEXT_DIM, wrap);
-
-    let height = g.rect.height() + if is_tf { 132.0 } else { 96.0 };
-    let panel = if is_tf {
-        Rect::from_center_size(stage.center(), Vec2::new(wrap + 48.0, height))
-    } else {
-        Rect::from_min_size(
-            Pos2::new(
-                full.center().x - (wrap + 48.0) / 2.0,
-                full.bottom() - height - 44.0,
-            ),
-            Vec2::new(wrap + 48.0, height),
-        )
-    };
-    let panel = Rect::from_center_size(
-        panel.center(),
-        Vec2::new(panel.width(), panel.height() * (0.9 + 0.1 * ease)),
-    );
-
-    let p = ui.painter();
-    p.rect_filled(panel, 0, Palette::SURFACE);
-    p.rect_stroke(panel, 0, Stroke::new(1.0, colour), egui::StrokeKind::Inside);
-    // Accent rail on the left edge.
-    p.rect_filled(
-        Rect::from_min_size(panel.left_top(), Vec2::new(3.0, panel.height())),
-        0,
-        colour,
-    );
-
-    p.text(
-        panel.left_top() + Vec2::new(24.0, 20.0),
-        Align2::LEFT_TOP,
-        tracked(verdict),
-        text::label(),
-        colour,
-    );
-    p.text(
-        panel.right_top() + Vec2::new(-24.0, 20.0),
-        Align2::RIGHT_TOP,
-        fmt_ms(fb.outcome.latency_ms),
-        text::label(),
-        Palette::TEXT_FAINT,
-    );
-
-    let mut y = panel.top() + 46.0;
-    if let Some(truth) = truth {
-        p.text(
-            Pos2::new(panel.left() + 24.0, y),
-            Align2::LEFT_TOP,
-            truth,
-            text::prompt(17.0),
-            Palette::TEXT,
+            Rect::from_min_size(
+                Pos2::new(full.center().x - width / 2.0, full.bottom() - height - 44.0),
+                Vec2::new(width, height),
+            )
+        };
+        let panel = Rect::from_center_size(
+            panel.center(),
+            Vec2::new(panel.width(), panel.height() * (0.9 + 0.1 * ease)),
         );
-        y += 30.0;
-    }
-    p.galley(Pos2::new(panel.left() + 24.0, y), g, Palette::TEXT_DIM);
+        let hovered = ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|position| panel.contains(position))
+        });
+        let hover = ui
+            .ctx()
+            .animate_bool(Id::new(("feedback-hover", fb.question.id)), hovered);
 
+        let p = ui.painter();
+        p.rect_filled(panel, 0, Palette::SURFACE);
+        p.rect_stroke(
+            panel,
+            0,
+            Stroke::new(1.0 + hover, colour),
+            egui::StrokeKind::Inside,
+        );
+        p.rect_filled(
+            Rect::from_min_size(
+                panel.left_top(),
+                Vec2::new(3.0 + 2.0 * hover, panel.height()),
+            ),
+            0,
+            colour,
+        );
+        p.text(
+            panel.left_top() + Vec2::new(24.0, 18.0),
+            Align2::LEFT_TOP,
+            tracked(verdict),
+            text::label(),
+            colour,
+        );
+        p.text(
+            panel.right_top() + Vec2::new(-24.0, 18.0),
+            Align2::RIGHT_TOP,
+            fb.outcome
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |outcome| fmt_ms(outcome.latency_ms)),
+            text::label(),
+            Palette::TEXT_FAINT,
+        );
+
+        let mut y = panel.top() + HEAD;
+        if let Some(truth) = truth {
+            ui.painter().text(
+                Pos2::new(panel.left() + 24.0, y),
+                Align2::LEFT_TOP,
+                truth,
+                text::prompt(17.0),
+                Palette::TEXT,
+            );
+            y += truth_h;
+        }
+
+        let body_rect = Rect::from_min_max(
+            Pos2::new(panel.left() + 24.0, y),
+            Pos2::new(panel.right() - 16.0, panel.bottom() - FOOT),
+        );
+        let (question, facts, depth) = (&fb.question, study.facts.clone(), fb.depth);
+        explain::scroll_column(ui, body_rect, "feedback", |ui| {
+            explain::body(ui, question, &facts, depth);
+        });
+
+        let footer = Rect::from_min_max(
+            Pos2::new(panel.left(), panel.bottom() - FOOT),
+            panel.right_bottom(),
+        );
+        let p = ui.painter();
+        p.line_segment(
+            [footer.left_top(), footer.right_top()],
+            Stroke::new(1.0, Palette::LINE),
+        );
+        p.text(
+            footer.left_center() + Vec2::new(24.0, 0.0),
+            Align2::LEFT_CENTER,
+            tracked("space or click to continue"),
+            text::label(),
+            Palette::TEXT_FAINT,
+        );
+        p.text(
+            footer.right_center() - Vec2::new(24.0, 0.0),
+            Align2::RIGHT_CENTER,
+            tracked(depth.label()),
+            text::label(),
+            Palette::ACCENT,
+        );
+
+        Some(self.feedback_dismissed(ui, study, panel))
+    }
+
+    /// A stationary click on the explanation panel dismisses it.
+    ///
+    /// Only a real click: the press and the release have to land in nearly the
+    /// same place. Otherwise the release that ends a swipe — the very gesture
+    /// that produced this panel — would dismiss it before it could be read.
+    ///
+    /// Empty margin is deliberately inert, so clicking a backgrounded window
+    /// there is always a safe way to bring it to the foreground.
+    fn feedback_dismissed(&mut self, ui: &egui::Ui, study: &mut Study, panel: Rect) -> bool {
+        let (pressed, released, at) = ui.ctx().input(|i| {
+            (
+                i.pointer
+                    .any_pressed()
+                    .then(|| i.pointer.press_origin())
+                    .flatten(),
+                i.pointer.any_released(),
+                i.pointer.interact_pos(),
+            )
+        });
+
+        // Remember only presses that *began* while the panel was up. The
+        // press that answered the card began before it existed, so the release
+        // ending that swipe cannot dismiss the explanation it just produced.
+        let Some(fb) = &mut study.feedback else {
+            return false;
+        };
+        if let Some(origin) = pressed {
+            fb.press_origin = Some(origin);
+        }
+        let Some(origin) = fb.press_origin else {
+            return false;
+        };
+        if !released {
+            return false;
+        }
+        fb.press_origin = None;
+
+        let Some(at) = at else { return false };
+        // A wheel scroll has no press/release, and a touch or scrollbar drag
+        // fails the movement check. Both ends must be on the panel: the
+        // surrounding margin is a safe focus target.
+        click_hits_panel(origin, at, panel)
+    }
+}
+
+fn click_hits_panel(origin: Pos2, release: Pos2, panel: Rect) -> bool {
+    (release - origin).length() <= 6.0 && panel.contains(origin) && panel.contains(release)
+}
+
+// ------------------------------------------------------ math check screen --
+
+/// Every construct the renderer claims to handle, on one sheet.
+///
+/// Kept in the binary rather than in a test: what can go wrong here — a glyph
+/// the font does not have, a numerator overlapping its bar — is visual, and
+/// only a picture shows it. `tools/shot.sh` captures this alongside the real
+/// screens, so a regression shows up as a diff.
+const MATH_SAMPLES: &[(&str, &str)] = &[
+    (
+        "second-order",
+        r"$G(s) = \frac{\omega_0^2}{s^2 + 2\zeta\omega_0 s + \omega_0^2}$",
+    ),
+    (
+        "settling time",
+        r"$t_{se} \approx \frac{3}{\zeta\omega_0}$ at the 5 % band",
+    ),
+    (
+        "roots",
+        r"$s_{1,2} = -\zeta\omega_0 \pm \omega_0\sqrt{\zeta^2 - 1}$",
+    ),
+    ("nested", r"$\frac{1}{1 + \frac{K}{s(1 + sT)}}$"),
+    (
+        "fences",
+        r"$\left| \frac{a + b}{c} \right| \le \left( 1 + \sqrt{2} \right)^n$",
+    ),
+    ("limits", r"$e_{ss} = \lim_{s \to 0} s \cdot E(s)$"),
+    ("sum", r"$\sum_{k=0}^{n} a_k s^k = 0$"),
+    ("integral", r"$\int_0^\infty e^{-st}f(t)\,dt$"),
+    (
+        "accents",
+        r"$\dot{x} = Ax + Bu, \quad \ddot{x}, \hat{y}, \bar{u}, \vec{v}$",
+    ),
+    (
+        "matrix",
+        r"$\begin{pmatrix} 0 & 1 \\ -\frac{k}{m} & -\frac{d}{m} \end{pmatrix}$",
+    ),
+    (
+        "cases",
+        r"$u(t) = \begin{cases} 0 & t < 0 \\ 1 & t \ge 0 \end{cases}$",
+    ),
+    (
+        "greek",
+        r"$\alpha\beta\gamma\delta\varepsilon\zeta\eta\theta\lambda\mu\pi\sigma\tau\varphi\psi\omega\ \Delta\Phi\Omega$",
+    ),
+    (
+        "relations",
+        r"$a \le b \ne c \approx d \equiv e \propto f \in G \Rightarrow H$",
+    ),
+    (
+        "degrees",
+        r"$\varphi_m \approx 100\zeta\ \text{degrees}, \quad \zeta \approx 0.01\varphi_m$",
+    ),
+    ("unknown", r"$\notacommand{x} + 1$"),
+];
+
+fn math_check(ui: &mut egui::Ui) {
+    let full = ui.available_rect_before_wrap();
+    let p = ui.painter();
     p.text(
-        panel.center_bottom() - Vec2::new(0.0, 18.0),
-        Align2::CENTER_CENTER,
-        tracked("space to continue"),
+        full.left_top() + Vec2::new(24.0, 16.0),
+        Align2::LEFT_TOP,
+        tracked("math renderer"),
         text::label(),
-        Palette::TEXT_FAINT,
+        Palette::ACCENT,
+    );
+
+    let mut y = full.top() + 44.0;
+    let wrap = full.width() - 230.0;
+    for (name, src) in MATH_SAMPLES {
+        let doc = richtext::layout(p, src, 16.0, wrap);
+        p.text(
+            Pos2::new(full.left() + 24.0, y + 2.0),
+            Align2::LEFT_TOP,
+            tracked(name),
+            text::label(),
+            Palette::TEXT_FAINT,
+        );
+        doc.paint(p, Pos2::new(full.left() + 200.0, y), Palette::TEXT, 1.0);
+        y += doc.height().max(20.0) + 12.0;
+        p.line_segment(
+            [
+                Pos2::new(full.left() + 24.0, y - 6.0),
+                Pos2::new(full.right() - 24.0, y - 6.0),
+            ],
+            Stroke::new(1.0, Palette::LINE),
+        );
+    }
+}
+
+// ---------------------------------------------------------- review screen --
+
+impl App {
+    /// A card you have already answered, opened again on purpose.
+    ///
+    /// Everything is here at once — the prompt, what you answered, what was
+    /// right, and the explanation — because the reason to come back to a card
+    /// is that the two-second version did not land the first time.
+    fn review_screen(&mut self, ui: &mut egui::Ui, review: &mut Review) -> Option<Screen> {
+        let full = ui.available_rect_before_wrap();
+        corner_coin(ui, full, &mut self.coin, "review-coin");
+        let item = review.items.get(review.idx)?.clone();
+        let q = &item.question;
+
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(full.width().min(680.0), full.height() - 24.0),
+        );
+
+        let colour = match item.grade {
+            Some(g) if g.correct => Palette::CORRECT,
+            Some(_) => Palette::WRONG,
+            None => Palette::LINE_BRIGHT,
+        };
+
+        let p = ui.painter();
+        p.rect_filled(panel, 0, Palette::SURFACE);
+        p.rect_stroke(
+            panel,
+            0,
+            Stroke::new(1.0, Palette::LINE_BRIGHT),
+            egui::StrokeKind::Inside,
+        );
+        p.rect_filled(
+            Rect::from_min_size(panel.left_top(), Vec2::new(3.0, panel.height())),
+            0,
+            colour,
+        );
+
+        let topic = q
+            .topic_id
+            .and_then(|t| review.topics.get(&t))
+            .cloned()
+            .unwrap_or_default();
+        p.text(
+            panel.left_top() + Vec2::new(24.0, 18.0),
+            Align2::LEFT_TOP,
+            tracked(&format!(
+                "look back  {}/{}",
+                review.idx + 1,
+                review.items.len()
+            )),
+            text::label(),
+            Palette::TEXT_FAINT,
+        );
+        p.text(
+            panel.center_top() + Vec2::new(0.0, 18.0),
+            Align2::CENTER_TOP,
+            tracked(&topic),
+            text::label(),
+            Palette::TEXT_FAINT,
+        );
+        p.text(
+            panel.right_top() + Vec2::new(-24.0, 18.0),
+            Align2::RIGHT_TOP,
+            tracked(match item.grade {
+                Some(g) if g.correct => "you were right",
+                Some(_) => "you were wrong",
+                None => "not answered yet",
+            }),
+            text::label(),
+            colour,
+        );
+        p.line_segment(
+            [
+                panel.left_top() + Vec2::new(0.0, 44.0),
+                panel.right_top() + Vec2::new(0.0, 44.0),
+            ],
+            Stroke::new(1.0, Palette::LINE),
+        );
+
+        const FOOT: f32 = 34.0;
+        let body_rect = Rect::from_min_max(
+            panel.left_top() + Vec2::new(24.0, 56.0),
+            panel.right_bottom() - Vec2::new(16.0, FOOT),
+        );
+
+        let facts = review.facts.clone();
+        let depth = review.depth;
+        explain::scroll_column(ui, body_rect, "review", |ui| {
+            explain::prose(ui, &q.prompt, 18.0, Palette::TEXT);
+            ui.add_space(4.0);
+            answer_summary(ui, &item);
+            ui.add_space(6.0);
+            separator(ui);
+            explain::body(ui, q, &facts, depth);
+        });
+
+        let footer = Rect::from_min_max(
+            Pos2::new(panel.left(), panel.bottom() - FOOT),
+            panel.right_bottom(),
+        );
+        let p = ui.painter();
+        p.line_segment(
+            [footer.left_top(), footer.right_top()],
+            Stroke::new(1.0, Palette::LINE),
+        );
+        p.text(
+            footer.left_center() + Vec2::new(24.0, 0.0),
+            Align2::LEFT_CENTER,
+            tracked("← → other cards  ·  esc back"),
+            text::label(),
+            Palette::TEXT_FAINT,
+        );
+        p.text(
+            footer.right_center() - Vec2::new(24.0, 0.0),
+            Align2::RIGHT_CENTER,
+            tracked(depth.label()),
+            text::label(),
+            Palette::ACCENT,
+        );
+
+        let (back, prev, next, deeper) = ui.ctx().input(|i| {
+            use egui::Key::*;
+            (
+                i.key_pressed(Escape) || i.key_pressed(Space) || i.key_pressed(Enter),
+                i.key_pressed(ArrowLeft),
+                i.key_pressed(ArrowRight),
+                i.key_pressed(D),
+            )
+        });
+        if prev {
+            review.idx = review.idx.saturating_sub(1);
+        }
+        if next {
+            review.idx = (review.idx + 1).min(review.items.len() - 1);
+        }
+        if deeper {
+            review.depth = review.depth.toggled();
+        }
+        if back {
+            return Some(std::mem::replace(&mut review.back, Screen::Decks));
+        }
+        None
+    }
+}
+
+/// What was answered and what was right, in the review view.
+fn answer_summary(ui: &mut egui::Ui, item: &Answered) {
+    let correct = item.grade.is_some_and(|g| g.correct);
+    match (&item.question.body, &item.response) {
+        (Body::TrueFalse { answer }, response) => {
+            let line = match response {
+                Some(Response::TrueFalse { value }) => format!(
+                    "you answered {}   ·   the statement is {}",
+                    if *value { "TRUE" } else { "FALSE" },
+                    if *answer { "TRUE" } else { "FALSE" }
+                ),
+                _ => format!(
+                    "the statement is {}",
+                    if *answer { "TRUE" } else { "FALSE" }
+                ),
+            };
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover());
+            ui.painter().text(
+                rect.left_top(),
+                Align2::LEFT_TOP,
+                line,
+                text::small(),
+                match item.grade {
+                    Some(g) if g.correct => Palette::CORRECT,
+                    Some(_) => Palette::WRONG,
+                    None => Palette::TEXT_DIM,
+                },
+            );
+        }
+        (Body::MultipleChoice { options, .. }, response) => {
+            let selected: Vec<usize> = match response {
+                Some(Response::MultipleChoice { selected }) => selected.clone(),
+                _ => Vec::new(),
+            };
+            for (i, opt) in options.iter().enumerate() {
+                let chose = selected.contains(&i);
+                let colour = match (opt.correct, chose) {
+                    (true, _) => Palette::CORRECT,
+                    (false, true) => Palette::WRONG,
+                    (false, false) => Palette::TEXT_FAINT,
+                };
+                // A leading mark, so the shape of the answer reads without
+                // relying on colour alone.
+                let mark = match (opt.correct, chose) {
+                    (true, true) => "✓",
+                    (true, false) => "·",
+                    (false, true) => "✗",
+                    (false, false) => " ",
+                };
+                ui.horizontal_top(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 20.0), Sense::hover());
+                    ui.painter().text(
+                        rect.left_top(),
+                        Align2::LEFT_TOP,
+                        mark,
+                        text::small(),
+                        colour,
+                    );
+                    explain::prose(ui, &opt.text, 14.5, colour);
+                });
+            }
+        }
+    }
+    let _ = correct;
+}
+
+fn separator(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 9.0), Sense::hover());
+    ui.painter().line_segment(
+        [rect.left_center(), rect.right_center()],
+        Stroke::new(1.0, Palette::LINE),
     );
 }
 
@@ -1286,6 +2275,7 @@ fn feedback_panel(ui: &egui::Ui, fb: &Feedback, stage: Rect, full: Rect) {
 impl App {
     fn summary_screen(&mut self, ui: &mut egui::Ui, sum: &mut Summary) -> Option<Screen> {
         let full = ui.available_rect_before_wrap();
+        corner_coin(ui, full, &mut self.coin, "summary-coin");
         let panel = Rect::from_center_size(
             full.center(),
             Vec2::new(full.width().min(620.0), full.height().min(560.0)),
@@ -1347,19 +2337,51 @@ impl App {
             text::label(),
             Palette::TEXT_FAINT,
         );
+        p.text(
+            panel.right_top() + Vec2::new(0.0, 130.0),
+            Align2::RIGHT_TOP,
+            tracked("click one to read it"),
+            text::label(),
+            Palette::TEXT_FAINT,
+        );
 
-        let mut y = panel.top() + 158.0;
-        for w in sum.weakest.iter().take(7) {
-            let short: String = w.prompt.chars().take(64).collect();
+        // Each row opens the card. A list of things you got wrong that you
+        // cannot then look at is a scolding, not a study aid.
+        let mut open: Option<usize> = None;
+        let mut y = panel.top() + 156.0;
+        for (i, w) in sum.weakest.iter().take(7).enumerate() {
+            let row = Rect::from_min_size(
+                Pos2::new(panel.left(), y - 4.0),
+                Vec2::new(panel.width(), 26.0),
+            );
+            let resp = ui.interact(row, Id::new(("weak", w.question_id)), Sense::click());
+            let hot = resp.hovered();
+            if resp.clicked() {
+                open = Some(i);
+            }
+
+            let p = ui.painter();
+            if hot {
+                p.rect_filled(row, 0, Palette::CARD);
+                p.line_segment(
+                    [row.left_top(), row.left_bottom()],
+                    Stroke::new(2.0, Palette::ACCENT),
+                );
+            }
+            let short: String = w.prompt.chars().take(62).collect();
             p.text(
                 Pos2::new(panel.left() + 52.0, y),
                 Align2::LEFT_TOP,
                 short,
                 text::small(),
-                Palette::TEXT_DIM,
+                if hot {
+                    Palette::TEXT
+                } else {
+                    Palette::TEXT_DIM
+                },
             );
             p.text(
-                Pos2::new(panel.left(), y),
+                Pos2::new(panel.left() + 8.0, y),
                 Align2::LEFT_TOP,
                 format!("{:>3.0}%", w.ema * 100.0),
                 text::small(),
@@ -1369,7 +2391,11 @@ impl App {
                     Palette::TEXT_FAINT
                 },
             );
-            y += 24.0;
+            y += 26.0;
+        }
+
+        if let Some(i) = open {
+            self.open_weakest(sum, i);
         }
 
         let btn = Rect::from_min_size(
@@ -1414,6 +2440,9 @@ impl App {
 
         let _ = sum.session_id;
         let deck_id = sum.deck_id;
+        if self.pending_review.is_some() {
+            return None;
+        }
 
         if resp.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.decks = self.store.decks().unwrap_or_default();
@@ -1436,6 +2465,33 @@ fn headline() -> egui::FontId {
 mod tests {
     use super::*;
 
+    fn clipboard_question() -> Question {
+        Question {
+            id: 1,
+            deck_id: 1,
+            topic_id: None,
+            uid: "clipboard".into(),
+            prompt: r"Which value follows from $G(s)=\frac{1}{s+1}$?".into(),
+            body: Body::MultipleChoice {
+                options: vec![
+                    idiosepius_core::Choice::new(r"$G(0)=1$", true),
+                    idiosepius_core::Choice::new(r"$G(0)=0$", false),
+                ],
+                multi: false,
+            },
+            explanation: None,
+            explain: idiosepius_core::Explain {
+                short: vec![idiosepius_core::Seg::text(
+                    r"Set $s=0$ in the transfer function.",
+                )],
+                deep: Vec::new(),
+            },
+            difficulty: 1,
+            source: None,
+            tags: Vec::new(),
+        }
+    }
+
     #[test]
     fn spans_read_naturally() {
         assert_eq!(fmt_span(90 * 60_000), "1h 30m");
@@ -1448,5 +2504,116 @@ mod tests {
         assert_eq!(fmt_ms(-1), "-");
         assert_eq!(fmt_ms(2500), "2.5s");
         assert_eq!(fmt_ms(65_000), "1m 5s");
+    }
+
+    #[test]
+    fn the_platform_copy_event_is_detected_and_consumed() {
+        let mut events = vec![
+            egui::Event::Text("unrelated".into()),
+            egui::Event::Copy,
+            egui::Event::Copy,
+        ];
+
+        assert!(take_copy_event(&mut events));
+        assert_eq!(events, vec![egui::Event::Text("unrelated".into())]);
+        assert!(!take_copy_event(&mut events));
+    }
+
+    #[test]
+    fn feedback_only_accepts_stationary_clicks_on_its_panel() {
+        let panel = Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(300.0, 300.0));
+
+        assert!(click_hits_panel(
+            Pos2::new(150.0, 150.0),
+            Pos2::new(153.0, 151.0),
+            panel
+        ));
+        assert!(!click_hits_panel(
+            Pos2::new(50.0, 50.0),
+            Pos2::new(50.0, 50.0),
+            panel
+        ));
+        assert!(!click_hits_panel(
+            Pos2::new(150.0, 150.0),
+            Pos2::new(170.0, 150.0),
+            panel
+        ));
+    }
+
+    #[test]
+    fn copying_an_unanswered_card_does_not_leak_the_answer() {
+        let text = card_text(
+            &clipboard_question(),
+            Some("Modeling"),
+            &[1],
+            None,
+            None,
+            false,
+            None,
+        );
+
+        assert!(text.contains(r"$G(s)=\frac{1}{s+1}$"));
+        assert!(text.contains("2. $G(0)=0$ [selected]"));
+        assert!(!text.contains("Correct answer:"));
+    }
+
+    #[test]
+    fn copying_feedback_keeps_latex_and_the_visible_explanation() {
+        let question = clipboard_question();
+        let facts = Facts::default();
+        let text = card_text(
+            &question,
+            Some("Modeling"),
+            &[],
+            Some(&Response::MultipleChoice { selected: vec![1] }),
+            Some(Grade::WRONG),
+            true,
+            Some((&facts, Depth::Short)),
+        );
+
+        assert!(text.contains("My answer: 2. $G(0)=0$"));
+        assert!(text.contains("Correct answer: 1. $G(0)=1$"));
+        assert!(text.contains("Explanation\nSet $s=0$ in the transfer function."));
+    }
+
+    #[test]
+    fn explaining_records_a_skip_without_creating_an_attempt() {
+        let context = egui::Context::default();
+        let store = Store::open_in_memory().unwrap();
+        let deck_id = store
+            .upsert_deck("clipboard", "Clipboard", None, None)
+            .unwrap();
+        store
+            .upsert_question(&idiosepius_core::NewQuestion {
+                deck_id,
+                topic_id: None,
+                uid: "explain".into(),
+                prompt: "The statement is true.".into(),
+                body: Body::TrueFalse { answer: true },
+                explanation: Some("Because it is.".into()),
+                explain: Default::default(),
+                difficulty: 1,
+                source: None,
+                tags: Vec::new(),
+            })
+            .unwrap();
+
+        let mut app = App::new(&context, store, None);
+        let deck = app.decks[0].clone();
+        let Some(Screen::Study(mut study)) = app.begin(deck, Mode::Practice) else {
+            panic!("study should start");
+        };
+        let session_id = study.session.id();
+
+        app.apply(&mut study, Action::Explain);
+
+        assert!(
+            study.feedback.as_ref().is_some_and(|feedback| {
+                feedback.grade.is_none() && feedback.response.is_none()
+            })
+        );
+        let stat = stats::session_stats(&app.store, session_id).unwrap();
+        assert_eq!(stat.skipped, 1);
+        assert_eq!(stat.answered, 0);
     }
 }

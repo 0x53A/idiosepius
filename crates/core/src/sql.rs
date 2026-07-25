@@ -84,7 +84,7 @@ impl Conn {
         f: impl FnOnce(&Row) -> Result<T>,
     ) -> Result<Option<T>> {
         let rows = self.fetch(sql, params)?;
-        rows.first().map(|r| f(r)).transpose()
+        rows.first().map(f).transpose()
     }
 
     /// Every row, mapped. Rows are read eagerly: the result sets here are a
@@ -94,24 +94,25 @@ impl Conn {
         &self,
         sql: &str,
         params: Vec<Value>,
-        mut f: impl FnMut(&Row) -> Result<T>,
+        f: impl FnMut(&Row) -> Result<T>,
     ) -> Result<Vec<T>> {
-        self.fetch(sql, params)?.iter().map(|r| f(r)).collect()
+        self.fetch(sql, params)?.iter().map(f).collect()
     }
 
     fn fetch(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Row>> {
-        self.rt.block_on(async {
-            let mut rows = self.inner.query(sql, params).await?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next().await? {
-                let values = (0..row.column_count())
-                    .map(|i| row.get_value(i))
-                    .collect::<turso::Result<Vec<_>>>()?;
-                out.push(Row { values });
-            }
-            Ok::<_, turso::Error>(out)
-        })
-        .with_context(|| failed(sql))
+        self.rt
+            .block_on(async {
+                let mut rows = self.inner.query(sql, params).await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    let values = (0..row.column_count())
+                        .map(|i| row.get_value(i))
+                        .collect::<turso::Result<Vec<_>>>()?;
+                    out.push(Row { values });
+                }
+                Ok::<_, turso::Error>(out)
+            })
+            .with_context(|| failed(sql))
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -135,7 +136,10 @@ impl Conn {
     /// A transaction that rolls back unless it is committed.
     pub fn transaction(&self) -> Result<Tx<'_>> {
         self.execute("BEGIN", vec![])?;
-        Ok(Tx { conn: self, done: false })
+        Ok(Tx {
+            conn: self,
+            done: false,
+        })
     }
 }
 

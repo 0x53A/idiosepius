@@ -147,6 +147,29 @@ pub fn face(painter: &egui::Painter, rect: Rect, angle: f32, fill: Color32, stro
     painter.add(Shape::convex_polygon(pts, fill, stroke));
 }
 
+/// A crisp, rectangular hover halo around a card.
+///
+/// This is several fading hairlines rather than a blurred shadow: the card
+/// remains square and instrument-like, while the larger active footprint is
+/// immediately visible. The neutral blue-grey deliberately does not suggest
+/// either the TRUE or FALSE swipe direction.
+pub fn hover_glow(painter: &egui::Painter, rect: Rect, angle: f32, color: Color32, strength: f32) {
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= 0.01 {
+        return;
+    }
+
+    for (expansion, width, fade) in [(2.0, 2.2, 0.72), (5.0, 1.8, 0.38), (9.0, 1.2, 0.17)] {
+        face(
+            painter,
+            rect.expand(expansion * strength),
+            angle,
+            Color32::TRANSPARENT,
+            Stroke::new(width * strength, color.gamma_multiply(fade * strength)),
+        );
+    }
+}
+
 /// Paint text belonging to a rotated card.
 ///
 /// `local` is where the text's top-left corner sits in the card's own

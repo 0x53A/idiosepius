@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS question (
     -- kinds do not need a schema migration.
     payload     TEXT NOT NULL,
     explanation TEXT,
+    -- The structured explanation (the `Explain` type): a short and a deep
+    -- reading, each a list of raw text and references into `fact`. JSON,
+    -- because it is authored content that only the UI ever interprets.
+    explain     TEXT,
     difficulty  INTEGER NOT NULL DEFAULT 2,
     source      TEXT,
     tags        TEXT NOT NULL DEFAULT '[]',
@@ -56,6 +60,30 @@ CREATE TABLE IF NOT EXISTS question (
 
 CREATE INDEX IF NOT EXISTS question_deck_idx  ON question(deck_id, active);
 CREATE INDEX IF NOT EXISTS question_topic_idx ON question(topic_id);
+
+-- Explanations that several questions share.
+--
+-- Ten variants of one idea should not carry ten copies of the same paragraph:
+-- they drift apart, and fixing a mistake means finding every copy. A question's
+-- explanation is therefore a list of raw text and references into this table.
+-- Symbols (`kind = 'symbol'`) are the same thing at the smallest scale — one
+-- Greek letter, its name, and what it stands for.
+CREATE TABLE IF NOT EXISTS fact (
+    id         INTEGER PRIMARY KEY,
+    deck_id    INTEGER REFERENCES deck(id) ON DELETE CASCADE,
+    uid        TEXT NOT NULL UNIQUE,
+    kind       TEXT NOT NULL DEFAULT 'note',
+    -- For a symbol: the glyph itself ("ζ") and what to call it ("zeta").
+    label      TEXT,
+    name       TEXT,
+    title      TEXT,
+    body       TEXT NOT NULL,
+    source     TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS fact_deck_idx ON fact(deck_id);
 
 -- ------------------------------------------------------------------- log --
 

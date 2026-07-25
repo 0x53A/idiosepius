@@ -36,6 +36,8 @@ pub mod session;
 pub mod sql;
 pub mod stats;
 
-pub use db::{NewQuestion, Store};
-pub use model::{Body, Choice, Grade, Id, Kind, Millis, Question, Response, now_ms};
+pub use db::{NewFact, NewQuestion, Store};
+pub use model::{
+    Body, Choice, Explain, Fact, FactKind, Grade, Id, Kind, Millis, Question, Response, Seg, now_ms,
+};
 pub use session::{Input, Mode, Session};

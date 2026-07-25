@@ -13,6 +13,7 @@ USAGE
     idiodb <db> decks                list decks with progress
     idiodb <db> stats <deck-slug>    accuracy and readiness, per topic
     idiodb <db> weak <deck-slug>     the cards you keep getting wrong
+    idiodb <db> facts [deck-slug]    the shared explanations and symbols
     idiodb <db> events               dump the event log as JSON lines
 ";
 
@@ -38,9 +39,10 @@ fn main() -> Result<()> {
             let pack = content::merge_packs(packs)?;
             let report = content::import_pack(&mut store, &pack)?;
             println!(
-                "imported {} questions in {} topics into '{}'{}",
+                "imported {} questions in {} topics, {} facts, into '{}'{}",
                 report.questions,
                 report.topics,
+                report.facts,
                 pack.deck.slug,
                 if report.retired > 0 {
                     format!(" ({} retired)", report.retired)
@@ -112,6 +114,22 @@ fn main() -> Result<()> {
             }
         }
 
+        "facts" => {
+            let deck = match args.get(2) {
+                Some(slug) => deck_by_slug(&store, Some(slug))?,
+                None => store.decks()?.first().map(|d| d.id).unwrap_or(0),
+            };
+            for f in store.facts(deck)? {
+                let head = match (&f.label, &f.name, &f.title) {
+                    (Some(l), Some(n), _) => format!("{l} ({n})"),
+                    (Some(l), None, _) => l.clone(),
+                    (None, _, Some(t)) => t.clone(),
+                    _ => String::new(),
+                };
+                println!("  {:<18} {:<28} {}", f.uid, head, one_line(&f.body, 60));
+            }
+        }
+
         "events" => {
             let rows = store.conn().query_all(
                 "SELECT session_id, ts, mono_ms, question_id, kind, data
@@ -138,6 +156,15 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Squash a fact down to something that fits in a terminal column.
+fn one_line(s: &str, width: usize) -> String {
+    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= width {
+        return flat;
+    }
+    flat.chars().take(width - 1).chain(['…']).collect()
 }
 
 fn deck_by_slug(store: &Store, slug: Option<&String>) -> Result<i64> {

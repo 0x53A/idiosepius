@@ -5,6 +5,9 @@
 mod app;
 mod card;
 mod coin;
+mod explain;
+mod math;
+mod richtext;
 mod theme;
 
 use anyhow::{Context, Result};
@@ -16,14 +19,17 @@ idio — study by swiping
 
 USAGE
     idio [<study.db>] [--import <pack.json>…]
-    idio <study.db> --shot <out.pam> [--screen decks|study] [--card <uid>] [--drag <px>]
+    idio <study.db> --shot <out.pam> [--screen <name>] [--card <uid>] [--drag <px>]
 
     With no path, uses ~/idiosepius/study.db.
 
 KEYS
     ← →   answer false / true        1-5    pick an option
-    s     skip                       enter  confirm a multi-select
-    u     undo the last answer       esc    end the session
+    e     explain (counts as skip)   s      skip
+    d     short/deep explanation     r      review answered cards
+    u     undo the last answer       enter  confirm / continue
+    Ctrl/Cmd+C  copy visible text    Ctrl/Cmd+±  scale interface
+    esc   end the session
 ";
 
 fn main() -> Result<()> {

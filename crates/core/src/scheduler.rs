@@ -341,6 +341,7 @@ mod tests {
                         prompt: "?".into(),
                         body: Body::TrueFalse { answer: true },
                         explanation: None,
+                        explain: Default::default(),
                         difficulty: 1,
                         source: None,
                         tags: vec![],

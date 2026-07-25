@@ -8,8 +8,8 @@
 //! Losing a log line is annoying; losing your place the night before an exam
 //! is not acceptable.
 
-use anyhow::Result;
 use crate::params;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::rc::Rc;
@@ -359,6 +359,7 @@ mod tests {
                 prompt: "?".into(),
                 body: Body::TrueFalse { answer: true },
                 explanation: None,
+                explain: Default::default(),
                 difficulty: 1,
                 source: None,
                 tags: vec![],

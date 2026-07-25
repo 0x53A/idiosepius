@@ -154,15 +154,205 @@ pub struct Question {
     pub deck_id: Id,
     pub topic_id: Option<Id>,
     pub uid: String,
-    /// Markdown-ish; `$...$` spans are LaTeX and rendered as such by the UI.
+    /// Prose; `$...$` spans are LaTeX and rendered as such by the UI.
     pub prompt: String,
     pub body: Body,
+    /// Plain-text short explanation. Kept for content that predates
+    /// [`Explain`], and as the fallback when `explain.short` is empty.
     pub explanation: Option<String>,
+    pub explain: Explain,
     /// 1 (recall) .. 5 (multi-step derivation).
     pub difficulty: u8,
     /// Where this came from, e.g. "Lecture Slides - Stability Part 2, p. 14".
     pub source: Option<String>,
     pub tags: Vec<String>,
+}
+
+impl Question {
+    /// What to show immediately after answering: the authored short reading,
+    /// or the legacy plain-text explanation if there is no structured one.
+    pub fn short(&self) -> Vec<Seg> {
+        if self.explain.short.is_empty() {
+            match &self.explanation {
+                Some(s) if !s.trim().is_empty() => vec![Seg::Text(s.clone())],
+                _ => Vec::new(),
+            }
+        } else {
+            self.explain.short.clone()
+        }
+    }
+
+    /// The full reading, for when the short one was not enough.
+    pub fn deep(&self) -> Vec<Seg> {
+        self.explain.deep.clone()
+    }
+}
+
+// ------------------------------------------------------------------ facts --
+
+/// A piece of an explanation: either literal prose or a reference to a
+/// [`Fact`] by uid.
+///
+/// Serialises to the authoring shorthand — a bare string is text, an object
+/// `{"fact": "sym-zeta"}` is a reference — so a pack stays readable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Seg {
+    Text(String),
+    Fact { fact: String },
+}
+
+impl Seg {
+    pub fn text(s: impl Into<String>) -> Self {
+        Seg::Text(s.into())
+    }
+    pub fn fact(uid: impl Into<String>) -> Self {
+        Seg::Fact { fact: uid.into() }
+    }
+    /// The uid this segment points at, if it is a reference.
+    pub fn fact_uid(&self) -> Option<&str> {
+        match self {
+            Seg::Fact { fact } => Some(fact),
+            Seg::Text(_) => None,
+        }
+    }
+}
+
+/// Both readings of a question's explanation.
+///
+/// `short` is what you want the moment the card flips: one or two sentences.
+/// `deep` is what you want when the short one did not land — the derivation,
+/// the surrounding rule, and what every symbol in it means.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Explain {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub short: Vec<Seg>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deep: Vec<Seg>,
+}
+
+impl Explain {
+    pub fn is_empty(&self) -> bool {
+        self.short.is_empty() && self.deep.is_empty()
+    }
+
+    /// Every fact uid mentioned by either reading, in order, without repeats.
+    pub fn referenced_facts(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for seg in self.short.iter().chain(&self.deep) {
+            if let Some(uid) = seg.fact_uid()
+                && !out.contains(&uid)
+            {
+                out.push(uid);
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactKind {
+    /// A statement, rule or derivation.
+    #[default]
+    Note,
+    /// One symbol: the glyph, its name, and what it stands for.
+    Symbol,
+}
+
+impl FactKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FactKind::Note => "note",
+            FactKind::Symbol => "symbol",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "symbol" => FactKind::Symbol,
+            _ => FactKind::Note,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fact {
+    pub id: Id,
+    pub deck_id: Option<Id>,
+    pub uid: String,
+    pub kind: FactKind,
+    /// The symbol itself, for `FactKind::Symbol`: "ζ".
+    pub label: Option<String>,
+    /// What the symbol is called: "zeta".
+    pub name: Option<String>,
+    /// Headline for a note.
+    pub title: Option<String>,
+    /// The prose. `$...$` spans are LaTeX, as everywhere else.
+    pub body: String,
+    pub source: Option<String>,
+}
+
+impl Fact {
+    /// How a symbol is written in LaTeX, derived from its name: `\zeta`.
+    /// Used to spot which symbols a prompt actually contains.
+    pub fn latex_command(&self) -> Option<String> {
+        match (self.kind, &self.name) {
+            (FactKind::Symbol, Some(n)) if n.chars().all(|c| c.is_ascii_alphabetic()) => {
+                Some(format!("\\{n}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Does `text` use this symbol? Matches the glyph itself and the LaTeX
+    /// spelling, so `ζ` and `\zeta` both count.
+    ///
+    /// A latin label only matches on a word boundary. `e_ss` must not be found
+    /// inside "necessary", and a glossary that defines symbols the question
+    /// never used is worse than no glossary.
+    pub fn appears_in(&self, text: &str) -> bool {
+        if let Some(cmd) = self.latex_command()
+            && text.contains(&cmd)
+        {
+            return true;
+        }
+        match &self.label {
+            Some(l) if !l.is_empty() => contains_token(text, l),
+            _ => false,
+        }
+    }
+}
+
+/// Does `needle` occur in `haystack` other than as part of a longer word?
+///
+/// Only the ends that are ASCII letters or digits demand a boundary: `ζ` may
+/// sit against anything, but `K_p` inside `K_ph` is a different symbol.
+fn contains_token(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let first = needle.chars().next().expect("not empty");
+    let last = needle.chars().next_back().expect("not empty");
+    let guard_start = first.is_ascii_alphanumeric();
+    let guard_end = last.is_ascii_alphanumeric();
+
+    for (i, _) in haystack.match_indices(needle) {
+        let before_ok = !guard_start
+            || haystack[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+        let after_ok = !guard_end
+            || haystack[i + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
 }
 
 // --------------------------------------------------------------- answering --
