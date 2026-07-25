@@ -1,0 +1,5 @@
+/target
+*.db-wal
+*.db-shm
+.direnv
+/content

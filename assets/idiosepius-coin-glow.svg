@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img"
+     aria-labelledby="title description">
+  <title id="title">Glowing Idiosepius coin</title>
+  <desc id="description">
+    An irregular coin outlined in bioluminescent cyan and violet, with a pygmy
+    squid and restrained marine scrollwork engraved into its face.
+  </desc>
+
+  <defs>
+    <filter id="cyan-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" result="wide"/>
+      <feGaussianBlur in="SourceGraphic" stdDeviation="1.25" result="near"/>
+      <feMerge>
+        <feMergeNode in="wide"/>
+        <feMergeNode in="near"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="violet-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.8" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <radialGradient id="face" cx="50%" cy="45%" r="62%">
+      <stop offset="0" stop-color="#10262b" stop-opacity=".72"/>
+      <stop offset=".72" stop-color="#081418" stop-opacity=".66"/>
+      <stop offset="1" stop-color="#060a0d" stop-opacity=".86"/>
+    </radialGradient>
+  </defs>
+
+  <style>
+    #coin-art {
+      transform-box: fill-box;
+      transform-origin: center;
+      animation: coin-boot .95s cubic-bezier(.2,.75,.22,1) 1;
+    }
+    svg:hover #coin-art {
+      animation: coin-hover .95s cubic-bezier(.2,.75,.22,1) 1;
+    }
+    @keyframes coin-boot {
+      0%   { transform: scaleX(1); }
+      24%  { transform: scaleX(.06); }
+      50%  { transform: scaleX(-1); }
+      76%  { transform: scaleX(-.06); }
+      100% { transform: scaleX(1); }
+    }
+    @keyframes coin-hover {
+      0%   { transform: scaleX(1); }
+      24%  { transform: scaleX(.06); }
+      50%  { transform: scaleX(-1); }
+      76%  { transform: scaleX(-.06); }
+      100% { transform: scaleX(1); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #coin-art, svg:hover #coin-art { animation: none; }
+    }
+    .cyan {
+      fill: none;
+      stroke: #2fe0c8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .violet {
+      fill: none;
+      stroke: #8c70ec;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+  </style>
+
+  <g id="coin-art">
+    <path d="M128 17
+             C158 15 186 25 209 46
+             C232 68 242 98 239 129
+             C241 163 230 193 207 216
+             C184 238 154 242 124 239
+             C92 242 62 233 40 211
+             C18 188 13 157 17 126
+             C14 95 25 65 48 43
+             C69 23 98 15 128 17Z"
+          fill="url(#face)" stroke="#173940" stroke-width="7" opacity=".95"/>
+
+    <g filter="url(#cyan-glow)" class="cyan">
+      <path d="M128 17
+               C158 15 186 25 209 46
+               C232 68 242 98 239 129
+               C241 163 230 193 207 216
+               C184 238 154 242 124 239
+               C92 242 62 233 40 211
+               C18 188 13 157 17 126
+               C14 95 25 65 48 43
+               C69 23 98 15 128 17Z"
+            stroke-width="1.5"/>
+      <path d="M128 27
+               C157 26 182 34 201 53
+               C221 73 231 99 229 129
+               C231 157 221 184 200 207
+               C180 226 153 231 125 229
+               C98 231 71 223 50 203
+               C31 183 23 156 27 127
+               C24 99 34 72 54 52
+               C73 33 100 25 128 27Z"
+            stroke-width=".9" opacity=".7"/>
+    </g>
+
+    <!-- Mantle and fins -->
+    <g filter="url(#cyan-glow)" class="cyan" stroke-width="1.45">
+      <path d="M128 48
+               C112 54 108 75 109 96
+               C110 112 115 123 119 132
+               C121 137 124 140 128 141
+               C132 140 135 137 137 132
+               C141 123 146 112 147 96
+               C148 75 144 54 128 48Z"/>
+      <path d="M111 69 C100 77 99 98 111 111"/>
+      <path d="M145 69 C156 77 157 98 145 111"/>
+
+      <!-- Five arms on each side: eight arms plus two longer tentacles. -->
+      <path d="M124 137 C116 149 103 154 90 147 C82 143 76 136 69 130"/>
+      <path d="M123 140 C113 158 99 166 83 163 C75 161 68 155 62 149"/>
+      <path d="M124 142 C113 171 99 181 81 180 C73 179 68 175 62 170"/>
+      <path d="M125 143 C117 177 106 195 91 202"/>
+      <path d="M127 143 C124 177 116 207 104 217"/>
+
+      <path d="M132 137 C140 149 153 154 166 147 C174 143 180 136 187 130"/>
+      <path d="M133 140 C143 158 157 166 173 163 C181 161 188 155 194 149"/>
+      <path d="M132 142 C143 171 157 181 175 180 C183 179 188 175 194 170"/>
+      <path d="M131 143 C139 177 150 195 165 202"/>
+      <path d="M129 143 C132 177 140 207 152 217"/>
+    </g>
+
+    <!-- Eyes and engraved mantle flourish -->
+    <g filter="url(#violet-glow)" class="violet" stroke-width="1.25">
+      <ellipse cx="113" cy="125" rx="5.5" ry="8"/>
+      <ellipse cx="143" cy="125" rx="5.5" ry="8"/>
+      <path d="M119 83 C125 88 124 99 117 104 C122 104 125 108 128 114"/>
+      <path d="M137 83 C131 88 132 99 139 104 C134 104 131 108 128 114"/>
+      <path d="M121 119 C124 122 126 126 128 132 C130 126 132 122 135 119"/>
+    </g>
+
+    <!-- Sparse framing ornament, deliberately not a complete wreath. -->
+    <g class="cyan" stroke-width=".85" opacity=".62">
+      <path d="M88 69 C70 67 60 77 62 91 C64 101 75 102 79 95
+               C82 90 78 85 73 87"/>
+      <path d="M168 69 C186 67 196 77 194 91 C192 101 181 102 177 95
+               C174 90 178 85 183 87"/>
+      <path d="M72 188 C62 184 54 189 55 198 C56 204 62 207 67 203
+               C71 199 68 194 64 195"/>
+      <path d="M184 188 C194 184 202 189 201 198 C200 204 194 207 189 203
+               C185 199 188 194 192 195"/>
+    </g>
+
+    <g fill="#d8e6ea" filter="url(#cyan-glow)">
+      <circle cx="113" cy="125" r="1.4"/>
+      <circle cx="143" cy="125" r="1.4"/>
+      <circle cx="128" cy="48" r=".85"/>
+    </g>
+  </g>
+</svg>
