@@ -13,7 +13,7 @@ lives in the application repository rather than beside the packs.
 import json, re, sys, glob, os, math
 import xml.etree.ElementTree as ET
 
-SUPPORTED = set("""frac dfrac tfrac sqrt left right begin end
+SUPPORTED = set("""frac dfrac tfrac sqrt underbrace left right begin end
 text mathrm mathbf mathit mathsf mathcal mathbb operatorname
 dot ddot hat widehat bar overline vec tilde widetilde
 sum prod int iint iiint oint quad qquad hline

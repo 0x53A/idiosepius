@@ -361,7 +361,7 @@ impl App {
         let screen_name = app.shot.as_ref().and_then(|s| s.screen.clone());
         let screen_name = screen_name.as_deref();
         match screen_name {
-            None | Some("decks") => {}
+            None | Some("decks" | "decks-scroll") => {}
             Some("math") => app.screen = Screen::MathCheck,
             Some("plots") => app.screen = Screen::PlotCheck,
             Some("plot-zoom") => {
@@ -1362,10 +1362,21 @@ impl App {
     fn deck_screen(&mut self, ui: &mut egui::Ui) -> Option<Screen> {
         let mut next = None;
         let avail = ui.available_rect_before_wrap();
+        let scroll_to_end =
+            self.shot.as_ref().and_then(|shot| shot.screen.as_deref()) == Some("decks-scroll");
 
+        // Keep a little page around the instrument on ordinary and large
+        // windows, but let the panel fill genuinely short viewports. The old
+        // fixed 560 pt cap made a tall monitor scroll a list that had ample
+        // room available below it.
+        let panel_height = if avail.height() >= 600.0 {
+            (avail.height() - 40.0).min(840.0)
+        } else {
+            avail.height()
+        };
         let panel = Rect::from_center_size(
             avail.center(),
-            Vec2::new(avail.width().min(660.0), avail.height().min(560.0)),
+            Vec2::new(avail.width().min(660.0), panel_height),
         );
 
         let p = ui.painter();
@@ -1384,9 +1395,17 @@ impl App {
             Palette::TEXT_FAINT,
         );
 
+        // On a short window the panel reaches the viewport edge, so use the
+        // slightly smaller rect that still fits above the rule. Elsewhere the
+        // full-size coin moves up just enough for its ink to clear the rule.
+        let (coin_size, coin_y) = if panel.top() <= avail.top() + 1.0 {
+            (60.0, 30.0)
+        } else {
+            (68.0, 28.0)
+        };
         let coin_rect = Rect::from_center_size(
-            panel.right_top() + Vec2::new(-38.0, 34.0),
-            Vec2::splat(68.0),
+            panel.right_top() + Vec2::new(-38.0, coin_y),
+            Vec2::splat(coin_size),
         );
         let coin_response = ui.interact(coin_rect, Id::new("brand-coin"), Sense::click());
         if coin_response.clicked() {
@@ -1412,10 +1431,14 @@ impl App {
                 ui.set_clip_rect(list_rect);
                 ui.spacing_mut().scroll.bar_width = 5.0;
                 ui.spacing_mut().scroll.floating = false;
-                egui::ScrollArea::vertical()
+                let scroll = egui::ScrollArea::vertical()
                     .id_salt("deck-list")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                    .auto_shrink([false, false]);
+                scroll.show(ui, |ui| {
+                        // This list owns its gaps explicitly. Inheriting the
+                        // global item spacing here used to add a second,
+                        // invisible layer of padding after every deck.
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         ui.set_width(list_rect.width() - 10.0);
                         if decks.is_empty() {
                             let (empty, _) = ui.allocate_exact_size(
@@ -1448,7 +1471,7 @@ impl App {
                                 }
                                 DeckRowAction::None => {}
                             }
-                            ui.add_space(12.0);
+                            ui.add_space(10.0);
                         }
 
                         // Importing scrolls with the decks because it produces
@@ -1461,6 +1484,18 @@ impl App {
                             self.import_view = Some(ImportView::Sources);
                             self.import_error = None;
                         }
+                        // A stroke centred exactly on the scroll content's
+                        // final edge loses its lower half to clipping. This
+                        // also gives the last action a little landing room
+                        // when the list genuinely has to scroll.
+                        ui.add_space(8.0);
+                        if scroll_to_end {
+                            let reveal = Rect::from_min_max(
+                                import.min,
+                                Pos2::new(import.right(), import.bottom() + 8.0),
+                            );
+                            ui.scroll_to_rect(reveal, Some(egui::Align::BOTTOM));
+                        }
                     });
             });
         }
@@ -1468,7 +1503,7 @@ impl App {
         // The database is the whole course and the whole history, so taking a
         // copy of it belongs on the screen that lists what is in it — at the
         // bottom, out of the way of the decks themselves.
-        let export = Pos2::new(panel.right(), panel.bottom() - 68.0);
+        let export = Pos2::new(panel.right(), panel.bottom() - 80.0);
         if chrome_button(ui, export, "export database") {
             self.request = Some(Request::ExportDatabase);
         }
@@ -4791,7 +4826,10 @@ const MATH_SAMPLES: &[(&str, &str)] = &[
         "roots",
         r"$s_{1,2} = -\zeta\omega_0 \pm \omega_0\sqrt{\zeta^2 - 1}$",
     ),
-    ("nested", r"$\frac{1}{1 + \frac{K}{s(1 + sT)}}$"),
+    (
+        "nested / brace",
+        r"$\underbrace{\frac{1}{1 + \frac{K}{s(1 + sT)}}}_{\text{closed loop}}$",
+    ),
     (
         "fences",
         r"$\left| \frac{a + b}{c} \right| \le \left( 1 + \sqrt{2} \right)^n$",

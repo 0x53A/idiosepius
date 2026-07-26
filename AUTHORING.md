@@ -357,7 +357,7 @@ hand-written subset, not LaTeX. It shows an unknown command as its own source
 text rather than swallowing it, which is a visible defect on a card. It covers
 fractions, radicals, scripts, sized fences, sums and integrals (`\int`,
 `\iint`, `\iiint`, `\oint`), matrices, accents, blackboard bold (`\mathbb`),
-Greek and the usual relations. Routh tables can use
+underbraces (`\underbrace{…}_{…}`), Greek and the usual relations. Routh tables can use
 `\begin{array}{r|ccc} ... \\ \hline ... \end{array}`: `l`, `c` and `r` set
 column alignment, `|` draws a column rule, and `\hline` draws a row rule. It
 does **not** cover the long tail:

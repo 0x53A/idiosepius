@@ -99,6 +99,12 @@ pub enum Node {
         accent: Accent,
         base: Box<Node>,
     },
+    /// `\underbrace{…}_{…}`: the annotation is centred below a hand-drawn
+    /// brace rather than placed as an ordinary lower-right subscript.
+    Underbrace {
+        body: Box<Node>,
+        annotation: Option<Box<Node>>,
+    },
     /// A big operator with its limits, which sit above and below when the
     /// operator takes them that way.
     BigOp {
@@ -275,6 +281,24 @@ impl<'a> Parser<'a> {
                 sup,
             };
         }
+        if let Node::Underbrace { body, annotation } = base {
+            let underbrace = Node::Underbrace {
+                body,
+                annotation: sub.or(annotation),
+            };
+            // A superscript is not part of the underbrace construct, but
+            // retaining it as an ordinary script is kinder to malformed or
+            // unusual input than dropping it.
+            return if sup.is_some() {
+                Node::Script {
+                    base: Box::new(underbrace),
+                    sup,
+                    sub: None,
+                }
+            } else {
+                underbrace
+            };
+        }
         Node::Script {
             base: Box::new(base),
             sup,
@@ -410,6 +434,11 @@ impl<'a> Parser<'a> {
             "bar" | "overline" => self.accent(Accent::Bar),
             "vec" => self.accent(Accent::Vec),
             "tilde" | "widetilde" => self.accent(Accent::Tilde),
+
+            "underbrace" => Node::Underbrace {
+                body: Box::new(self.arg()),
+                annotation: None,
+            },
 
             "sum" => big(Big::Sum, true),
             "prod" => big(Big::Prod, true),
@@ -1062,6 +1091,9 @@ fn layout_node(painter: &Painter, node: &Node, size: f32) -> Bx {
             layout_fenced(painter, *left, *right, inner, size)
         }
         Node::Accented { accent, base } => layout_accent(painter, *accent, base, size),
+        Node::Underbrace { body, annotation } => {
+            layout_underbrace(painter, body, annotation.as_deref(), size)
+        }
         Node::BigOp {
             op,
             limits,
@@ -1438,6 +1470,88 @@ fn layout_accent(painter: &Painter, accent: Accent, base: &Node, size: f32) -> B
     out.ascent = (-top) + extra;
     out.items.extend(items);
     out
+}
+
+/// A horizontal curly brace below a body, with an optional centred annotation.
+///
+/// The brace is four cubic strokes rather than a font glyph: its width follows
+/// the body, and the same geometry rotates rigidly with a swiped card.
+fn layout_underbrace(painter: &Painter, body: &Node, annotation: Option<&Node>, size: f32) -> Bx {
+    let body = layout_node(painter, body, size);
+    let note = annotation.map(|n| layout_node(painter, n, (size * 0.70).max(7.5)));
+
+    let brace_width = body.width.max(size * 0.9);
+    let width = brace_width.max(note.as_ref().map_or(0.0, |n| n.width));
+    let body_x = (width - body.width) / 2.0;
+    let brace_x = (width - brace_width) / 2.0;
+
+    let gap = size * 0.10;
+    let brace_top = body.descent + gap;
+    let brace_height = size * 0.34;
+    let shoulder_y = brace_top + brace_height * 0.42;
+    let tip_y = brace_top + brace_height;
+    let quarter = brace_width * 0.25;
+    let middle = brace_width * 0.50;
+    let three_quarters = brace_width * 0.75;
+    let cusp = brace_width * 0.06;
+    let rule = rule_width(size);
+
+    let point = |x: f32, y: f32| Pos2::new(brace_x + x, y);
+    let mut items = body.clone().shift(Vec2::new(body_x, 0.0)).items;
+    items.extend([
+        Item::Curve {
+            points: [
+                point(0.0, brace_top),
+                point(0.0, shoulder_y),
+                point(quarter * 0.25, shoulder_y),
+                point(quarter, shoulder_y),
+            ],
+            width: rule,
+        },
+        Item::Curve {
+            points: [
+                point(quarter, shoulder_y),
+                point(middle - quarter * 0.35, shoulder_y),
+                point(middle - cusp, tip_y - brace_height * 0.08),
+                point(middle, tip_y),
+            ],
+            width: rule,
+        },
+        Item::Curve {
+            points: [
+                point(middle, tip_y),
+                point(middle + cusp, tip_y - brace_height * 0.08),
+                point(middle + quarter * 0.35, shoulder_y),
+                point(three_quarters, shoulder_y),
+            ],
+            width: rule,
+        },
+        Item::Curve {
+            points: [
+                point(three_quarters, shoulder_y),
+                point(brace_width - quarter * 0.25, shoulder_y),
+                point(brace_width, shoulder_y),
+                point(brace_width, brace_top),
+            ],
+            width: rule,
+        },
+    ]);
+
+    let mut descent = tip_y + rule / 2.0;
+    if let Some(note) = note {
+        let note_y = tip_y + size * 0.12 + note.ascent;
+        let note_x = (width - note.width) / 2.0;
+        let placed = note.shift(Vec2::new(note_x, note_y));
+        descent = descent.max(placed.descent);
+        items.extend(placed.items);
+    }
+
+    Bx {
+        items,
+        width,
+        ascent: body.ascent,
+        descent,
+    }
 }
 
 /// The big operators, drawn rather than set: `∑` and `∫` are missing from
@@ -1909,6 +2023,25 @@ mod tests {
             Node::Accented {
                 accent: Accent::Dot,
                 base: Box::new(sym("x")),
+            }
+        );
+    }
+
+    #[test]
+    fn an_underbrace_claims_its_subscript_as_a_centred_annotation() {
+        let Node::Row(items) = parse(r"\underbrace{x+y}_{\text{sum}} + z") else {
+            panic!("expected an underbrace followed by the rest of the row")
+        };
+        assert_eq!(items.len(), 3, "the row after the underbrace must survive");
+        assert_eq!(
+            items[0],
+            Node::Underbrace {
+                body: Box::new(Node::Row(vec![
+                    sym("x"),
+                    Node::Sym("+".into(), Class::Bin),
+                    sym("y"),
+                ])),
+                annotation: Some(Box::new(sym("sum"))),
             }
         );
     }

@@ -128,9 +128,14 @@ done
 env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 620x420x24" \
   env LIBGL_ALWAYS_SOFTWARE=1 \
   ./target/debug/idiosepius-app "$db" --shot "$out/decks-small.pam" --screen decks 2>/dev/null
+env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 620x420x24" \
+  env LIBGL_ALWAYS_SOFTWARE=1 \
+  ./target/debug/idiosepius-app "$db" --shot "$out/decks-small-end.pam" --screen decks-scroll 2>/dev/null
 if command -v magick >/dev/null; then
   magick "$out/decks-small.pam" "$out/decks-small.png" && rm -f "$out/decks-small.pam"
+  magick "$out/decks-small-end.pam" "$out/decks-small-end.png" && rm -f "$out/decks-small-end.pam"
   echo "  $out/decks-small.png"
+  echo "  $out/decks-small-end.png"
 fi
 
 echo "done"

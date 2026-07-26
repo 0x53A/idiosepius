@@ -158,8 +158,10 @@ its entire active question bank available immediately, whether or not the deck
 contains any authored lessons.
 
 The home screen's deck list scrolls independently of its title and database
-actions. A short window or a database with many decks must not push import or
-export beyond the viewport.
+actions. It uses the available vertical room before introducing a scrollbar,
+and its final import row must be fully revealable rather than clipped against
+the scroll boundary. A short window or a database with many decks must not
+push import or export beyond the viewport.
 
 The question bank is grouped in authored topic order. Its current topic header
 sticks to the top of the scrolling list and remains the collapse control, so a
