@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#060a0d">
+    <title>Idiosepius</title>
+    <style>
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #060a0d;
+      }
+
+      idiosepius-app {
+        display: block;
+        width: 100%;
+        height: 100%;
+        color: #d8e6ea;
+        font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <idiosepius-app>Loading Idiosepius…</idiosepius-app>
+    <script type="module">
+      import init from "./pkg/idiosepius_app.js";
+      await init();
+    </script>
+  </body>
+</html>

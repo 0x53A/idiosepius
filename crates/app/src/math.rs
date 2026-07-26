@@ -59,7 +59,9 @@ pub enum Accent {
 pub enum Big {
     Sum,
     Prod,
-    Int,
+    /// `\int`, `\iint`, `\iiint`: one, two or three integral signs, kerned
+    /// tighter than writing the command that many times would give.
+    Int(u8),
     Oint,
 }
 
@@ -68,6 +70,8 @@ pub enum Node {
     Row(Vec<Node>),
     /// A run of characters set as they are.
     Sym(String, Class),
+    /// `\mathbb{…}`: double-struck letters, drawn rather than looked up.
+    Bb(String),
     Frac(Box<Node>, Box<Node>),
     Sqrt {
         index: Option<Box<Node>>,
@@ -374,6 +378,10 @@ impl<'a> Parser<'a> {
                 Node::Sym(self.literal_arg(), Class::Ord)
             }
 
+            // Blackboard bold has to say "a set of numbers", which a
+            // passed-through `R` does not.
+            "mathbb" => Node::Bb(self.literal_arg()),
+
             "dot" => self.accent(Accent::Dot),
             "ddot" => self.accent(Accent::DDot),
             "hat" | "widehat" => self.accent(Accent::Hat),
@@ -383,7 +391,9 @@ impl<'a> Parser<'a> {
 
             "sum" => big(Big::Sum, true),
             "prod" => big(Big::Prod, true),
-            "int" => big(Big::Int, false),
+            "int" => big(Big::Int(1), false),
+            "iint" => big(Big::Int(2), false),
+            "iiint" => big(Big::Int(3), false),
             "oint" => big(Big::Oint, false),
 
             "," => Node::Space(0.17),
@@ -538,7 +548,7 @@ fn big(op: Big, limits: bool) -> Node {
 
 fn flatten(n: Node) -> String {
     match n {
-        Node::Sym(s, _) => s,
+        Node::Sym(s, _) | Node::Bb(s) => s,
         Node::Row(items) => items.into_iter().map(flatten).collect(),
         _ => String::new(),
     }
@@ -918,8 +928,15 @@ fn font(size: f32) -> FontId {
 /// One run of characters, measured by its actual ink so that stacking is
 /// tight: font line height would leave a fraction looking hollow.
 fn run(painter: &Painter, s: &str, size: f32) -> Bx {
+    run_with_ink(painter, s, size).0
+}
+
+/// A run, plus the left edge of its ink. Only the double-struck letters need
+/// the second half: their extra stroke goes against the stem, and the side
+/// bearing between the box and the stem varies with the letter.
+fn run_with_ink(painter: &Painter, s: &str, size: f32) -> (Bx, f32) {
     if s.is_empty() {
-        return Bx::default();
+        return (Bx::default(), 0.0);
     }
     let galley = painter.layout_no_wrap(s.to_owned(), font(size), Color32::WHITE);
     let baseline = galley
@@ -939,15 +956,18 @@ fn run(painter: &Painter, s: &str, size: f32) -> Bx {
         (0.0, 0.0)
     };
 
-    Bx {
-        items: vec![Item::Text {
-            pos: Pos2::new(0.0, -baseline),
-            galley: galley.clone(),
-        }],
-        width: galley.rect.width(),
-        ascent,
-        descent,
-    }
+    (
+        Bx {
+            items: vec![Item::Text {
+                pos: Pos2::new(0.0, -baseline),
+                galley: galley.clone(),
+            }],
+            width: galley.rect.width(),
+            ascent,
+            descent,
+        },
+        if ink.is_positive() { ink.min.x } else { 0.0 },
+    )
 }
 
 fn layout_node(painter: &Painter, node: &Node, size: f32) -> Bx {
@@ -965,6 +985,7 @@ fn layout_node(painter: &Painter, node: &Node, size: f32) -> Bx {
             }
             bx
         }
+        Node::Bb(s) => layout_bb(painter, s, size),
         Node::Row(items) => layout_row(painter, items, size),
         Node::Frac(num, den) => layout_frac(painter, num, den, size),
         Node::Sqrt { index, body } => layout_sqrt(painter, index.as_deref(), body, size),
@@ -998,6 +1019,45 @@ fn class_of_node(n: &Node) -> Class {
         Node::Row(items) => items.first().map_or(Class::Ord, class_of_node),
         _ => Class::Ord,
     }
+}
+
+/// A double-struck letter: the ordinary letter with its stem struck twice.
+///
+/// Not the Unicode codepoints. `ℝ` (U+211D) is missing from the monospaced
+/// face the rest of the maths is set in, and a tofu box in the domain of a
+/// function is worse than no `\mathbb` at all — the same reason `∑` and `∫`
+/// are drawn here rather than looked up. The extra stroke sits to the left of
+/// the letter, which is where it goes when the letter is written by hand.
+fn layout_bb(painter: &Painter, s: &str, size: f32) -> Bx {
+    let rule = rule_width(size);
+    let mut out = Bx::default();
+
+    for c in s.chars() {
+        let (letter, ink_left) = run_with_ink(painter, &c.to_string(), size);
+        let mut glyph = if c.is_alphanumeric() {
+            // The stroke all but touches the stem: any further off and it
+            // reads as a pipe character standing next to the letter.
+            let hair = rule * 0.4;
+            let dx = (rule + hair - ink_left).max(0.0);
+            let mut g = letter.clone().shift(Vec2::new(dx, 0.0));
+            let height = letter.ascent.max(size * 0.5);
+            g.items.push(Item::Rule(Rect::from_min_size(
+                Pos2::new(dx + ink_left - hair - rule, -height),
+                Vec2::new(rule, height),
+            )));
+            g.width = letter.width + dx;
+            g.ascent = g.ascent.max(height);
+            g
+        } else {
+            letter
+        };
+        if out.width == 0.0 && out.items.is_empty() {
+            out = std::mem::take(&mut glyph);
+        } else {
+            out.append(glyph, 0.0);
+        }
+    }
+    out
 }
 
 fn layout_row(painter: &Painter, items: &[Node], size: f32) -> Bx {
@@ -1311,6 +1371,12 @@ fn bigop_shape(op: Big, size: f32) -> Bx {
     let rule = (size * 0.075).max(1.2);
     let top = -h * 0.72;
     let bottom = h * 0.28;
+    // `∬` is two signs sharing a shoulder, not two integrals side by side.
+    let signs = match op {
+        Big::Int(n) => n.clamp(1, 3) as usize,
+        _ => 1,
+    };
+    let kern = w * 0.46;
 
     let items = match op {
         Big::Sum => vec![Item::Poly {
@@ -1339,16 +1405,21 @@ fn bigop_shape(op: Big, size: f32) -> Bx {
                 width: rule,
             },
         ],
-        Big::Int | Big::Oint => {
-            let mut v = vec![Item::Curve {
-                points: [
-                    Pos2::new(w * 0.05, bottom + h * 0.06),
-                    Pos2::new(w * 0.72, bottom - h * 0.10),
-                    Pos2::new(w * 0.08, top + h * 0.10),
-                    Pos2::new(w * 0.75, top - h * 0.06),
-                ],
-                width: rule,
-            }];
+        Big::Int(_) | Big::Oint => {
+            let mut v: Vec<Item> = (0..signs)
+                .map(|i| {
+                    let dx = i as f32 * kern;
+                    Item::Curve {
+                        points: [
+                            Pos2::new(dx + w * 0.05, bottom + h * 0.06),
+                            Pos2::new(dx + w * 0.72, bottom - h * 0.10),
+                            Pos2::new(dx + w * 0.08, top + h * 0.10),
+                            Pos2::new(dx + w * 0.75, top - h * 0.06),
+                        ],
+                        width: rule,
+                    }
+                })
+                .collect();
             if op == Big::Oint {
                 v.push(Item::Poly {
                     points: circle_points(Pos2::new(w * 0.40, (top + bottom) / 2.0), size * 0.26),
@@ -1361,7 +1432,7 @@ fn bigop_shape(op: Big, size: f32) -> Bx {
 
     Bx {
         items,
-        width: w + size * 0.12,
+        width: w + kern * (signs - 1) as f32 + size * 0.12,
         ascent: -top,
         descent: bottom,
     }
@@ -1613,8 +1684,43 @@ mod tests {
         let Node::BigOp { op, limits, .. } = parse(r"\int_0^\infty") else {
             panic!("expected an integral")
         };
-        assert_eq!(op, Big::Int);
+        assert_eq!(op, Big::Int(1));
         assert!(!limits, "an integral is set inline, not with limits");
+    }
+
+    #[test]
+    fn multiple_integrals_are_one_operator_with_several_signs() {
+        for (src, signs) in [(r"\int", 1), (r"\iint", 2), (r"\iiint", 3)] {
+            let Node::BigOp { op, .. } = parse(src) else {
+                panic!("expected an integral for {src}")
+            };
+            assert_eq!(op, Big::Int(signs));
+        }
+    }
+
+    #[test]
+    fn blackboard_bold_is_its_own_node_rather_than_a_plain_letter() {
+        assert_eq!(parse(r"\mathbb{R}"), Node::Bb("R".into()));
+        assert_eq!(
+            parse(r"\mathbb{R}^n"),
+            Node::Script {
+                base: Box::new(Node::Bb("R".into())),
+                sup: Some(Box::new(sym("n"))),
+                sub: None,
+            }
+        );
+        assert_eq!(
+            parse(r"\mathbb{R}^2 \to \mathbb{R}"),
+            Node::Row(vec![
+                Node::Script {
+                    base: Box::new(Node::Bb("R".into())),
+                    sup: Some(Box::new(sym("2"))),
+                    sub: None,
+                },
+                Node::Sym("→".into(), Class::Rel),
+                Node::Bb("R".into()),
+            ])
+        );
     }
 
     #[test]

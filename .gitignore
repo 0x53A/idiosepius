@@ -4,3 +4,4 @@
 .direnv
 /content
 __pycache__
+web/pkg/

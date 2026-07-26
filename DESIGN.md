@@ -29,6 +29,24 @@ defaulted. Use it for labels; never for prose.
 **Prose is sentence case at reading size.** Prompts and explanations are the
 content — they get the size and the contrast. Everything else recedes.
 
+**A wrong choice gets its own diagnosis.** An option's authored `note` says why
+*that* option was the wrong one, so it belongs with the option — indented under
+the row that was picked, in the verdict colour — and not in the explanation
+block, which says what is true rather than what went wrong. Only the options
+the learner actually selected show theirs while answering; the review screen
+shows all of them, because there the card is being studied rather than
+answered. An unanswered card shows none: a note names a wrong option, so it
+leaks the answer exactly as surely as marking the option would.
+
+**A cited fact is quoted, not woven in.** Facts are inset behind a two-pixel
+rail — violet for a symbol, cyan for a note or a formula — because the point of
+a shared fact is that it is the same wherever it appears, and it has to be
+recognisable as the same thing on the fifth card that cites it. A formula fact
+additionally sets its equation on a display line of its own, above the prose: a
+formula cited mid-derivation has to be readable at a glance, which it is not
+when it is buried in a sentence. No third rail colour was introduced for it —
+the palette says "shared fact", the display line says "formula".
+
 ## Palette
 
 | role | colour | |

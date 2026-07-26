@@ -75,6 +75,55 @@ impl Facts {
     }
 }
 
+/// Which of a question's authored option notes may be shown.
+///
+/// A note is addressed to whoever picked that option — "That is the settling
+/// time", "Inverted — check the units" — so who is reading decides which ones
+/// belong on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteView {
+    /// Nothing has been answered. A note names a wrong option, so showing one
+    /// leaks the answer exactly as surely as marking the option would.
+    Hidden,
+    /// Only the options actually selected. Answering is a diagnosis of *your*
+    /// mistake; every note at once turns that into a wall.
+    Picked,
+    /// Every note on the card. Right on the review screen, where the card is
+    /// being studied rather than answered: the set of notes is a map of the
+    /// mistakes the question was built to catch.
+    All,
+}
+
+/// The note to draw under each option, in option order.
+///
+/// `None` where there is nothing to say — either the option carries no note,
+/// or this reader is not entitled to it.
+pub fn option_notes<'a>(
+    options: &'a [idiosepius_core::Choice],
+    picked: &[usize],
+    view: NoteView,
+) -> Vec<Option<&'a str>> {
+    options
+        .iter()
+        .enumerate()
+        .map(|(i, option)| {
+            let visible = match view {
+                NoteView::Hidden => false,
+                NoteView::Picked => picked.contains(&i),
+                NoteView::All => true,
+            };
+            if !visible {
+                return None;
+            }
+            option
+                .note
+                .as_deref()
+                .map(str::trim)
+                .filter(|note| !note.is_empty())
+        })
+        .collect()
+}
+
 /// Which reading is on screen. `l`/`d` toggles between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Depth {
@@ -141,7 +190,7 @@ pub fn fact_block(ui: &mut Ui, fact: &Fact) {
                         Palette::VIOLET,
                     );
                 }
-                FactKind::Note => {
+                FactKind::Note | FactKind::Formula => {
                     if let Some(title) = &fact.title {
                         let (rect, _) = ui.allocate_exact_size(
                             Vec2::new(ui.available_width(), 18.0),
@@ -154,6 +203,16 @@ pub fn fact_block(ui: &mut Ui, fact: &Fact) {
                             text::label(),
                             Palette::ACCENT,
                         );
+                    }
+                    // The equation gets a display line of its own. A formula
+                    // cited mid-derivation has to be readable at a glance,
+                    // which it is not when it is buried in a sentence.
+                    if fact.kind == FactKind::Formula
+                        && let Some(f) = &fact.label
+                    {
+                        ui.add_space(2.0);
+                        prose(ui, &format!("${f}$"), 16.5, Palette::TEXT);
+                        ui.add_space(2.0);
                     }
                 }
             }
@@ -318,6 +377,14 @@ fn fact_text(fact: &Fact) -> String {
             (None, None) => String::new(),
         },
         FactKind::Note => fact.title.clone().unwrap_or_default(),
+        // The transcript keeps authored LaTeX, so the formula travels as
+        // `$...$` rather than as whatever the screen happened to draw.
+        FactKind::Formula => match (&fact.title, &fact.label) {
+            (Some(title), Some(f)) => format!("{title}:  ${f}$"),
+            (None, Some(f)) => format!("${f}$"),
+            (Some(title), None) => title.clone(),
+            (None, None) => String::new(),
+        },
     };
 
     let mut parts = Vec::new();

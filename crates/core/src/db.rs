@@ -1,6 +1,7 @@
 //! Database handle, migrations, and content access.
 
 use anyhow::{Context, Result, bail};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use crate::model::*;
@@ -17,12 +18,56 @@ pub struct Store {
 }
 
 impl Store {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_conn(Conn::open(path)?)
     }
 
     pub fn open_in_memory() -> Result<Self> {
         Self::from_conn(Conn::open_in_memory()?)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn open_browser(database: Vec<u8>, wal: Vec<u8>) -> Result<Self> {
+        Self::from_conn(Conn::open_browser(database, wal)?)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn browser_snapshot(&self) -> crate::browser_io::BrowserSnapshot {
+        self.conn.browser_snapshot()
+    }
+
+    /// Fold the WAL into the ordinary SQLite file and return a coherent
+    /// snapshot. Browser persistence uses the same checkpointed form as an
+    /// explicit export, so restoring never depends on two files being replaced
+    /// atomically by OPFS.
+    #[cfg(target_arch = "wasm32")]
+    pub fn browser_checkpoint_snapshot(&self) -> Result<crate::browser_io::BrowserSnapshot> {
+        self.conn
+            .query_all("PRAGMA wal_checkpoint(TRUNCATE)", vec![], |_| Ok(()))?;
+        Ok(self.conn.browser_snapshot())
+    }
+
+    /// The whole study database as one ordinary SQLite file.
+    ///
+    /// The WAL is folded in first, so what comes out is self-contained: the
+    /// course, the history and the scheduler state in a single file that
+    /// `sqlite3` — or another copy of this app — opens directly.
+    pub fn export_database(&self) -> Result<Vec<u8>> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(self.browser_checkpoint_snapshot()?.database)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.conn
+                .query_all("PRAGMA wal_checkpoint(TRUNCATE)", vec![], |_| Ok(()))?;
+            let path = self
+                .conn
+                .path()
+                .ok_or_else(|| anyhow::anyhow!("this database is in memory; there is no file"))?;
+            std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+        }
     }
 
     fn from_conn(conn: Conn) -> Result<Self> {
@@ -469,6 +514,41 @@ mod tests {
         assert_eq!(got.uid, "u1");
         assert_eq!(got.body, Body::TrueFalse { answer: true });
         assert_eq!(got.tags, vec!["tag".to_string()]);
+    }
+
+    /// An export has to be a file another copy of the app can open, which
+    /// means the WAL must be folded in rather than left beside it.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn exporting_yields_a_self_contained_sqlite_file() {
+        let dir = std::env::temp_dir().join(format!("idiosepius-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("study.db");
+
+        let store = Store::open(&path).unwrap();
+        let deck = store.upsert_deck("test", "Test", None, None).unwrap();
+        store.upsert_question(&q(deck, "u1")).unwrap();
+        let bytes = store.export_database().unwrap();
+        drop(store);
+
+        assert!(bytes.starts_with(b"SQLite format 3\0"));
+
+        let copy = dir.join("copy.db");
+        std::fs::write(&copy, bytes).unwrap();
+        let reopened = Store::open(&copy).unwrap();
+        assert_eq!(
+            reopened.question_by_uid("u1").unwrap().map(|q| q.uid),
+            Some("u1".to_string()),
+            "the export must carry writes that were still only in the WAL"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_in_memory_database_has_no_file_to_export() {
+        let (store, _) = store_with_deck();
+        assert!(store.export_database().is_err());
     }
 
     #[test]

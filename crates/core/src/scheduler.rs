@@ -35,6 +35,14 @@ const EXAM_HORIZON: f64 = 0.4;
 /// Weight of the newest attempt in the correctness moving average.
 const EMA_ALPHA: f64 = 0.4;
 
+/// Multiplicative noise applied to a card's score before ranking. Wide enough
+/// that cards within about a fifth of each other trade places from draw to
+/// draw — which covers the whole spread of `difficulty` and of a mildly stale
+/// `ema` — and narrow enough that a genuinely weak card still outranks a fresh
+/// one every time.
+const JITTER_LOW: f64 = 0.8;
+const JITTER_HIGH: f64 = 1.25;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Next {
     pub box_after: i32,
@@ -231,10 +239,21 @@ pub fn next_card(
         .and_then(|id| candidates.iter().find(|c| c.id == *id))
         .and_then(|c| c.topic_id);
 
+    // How far back to suppress. A fixed four-card memory is a loop on a deck
+    // of a hundred and thirty, so the window grows with the deck.
+    let cooldown = recent.len().min((candidates.len() / 8).max(4));
+
+    let mut rng = rand::rng();
     let mut scored: Vec<(f64, &Candidate)> = candidates
         .iter()
-        .map(|c| (score(c, now, mode, recent, last_topic), c))
+        .map(|c| (score(c, now, mode, recent, cooldown, last_topic), c))
         .filter(|(s, _)| *s > 0.0)
+        // Jitter before ranking. Without it the sort is stable over exactly
+        // equal scores, so a deck of otherwise identical fresh cards is served
+        // in row-id order and the pool below never reaches past the first few.
+        // It also lets neighbouring scores interleave, which is what keeps a
+        // coarse term like `difficulty` a preference instead of a gate.
+        .map(|(s, c)| (s * rng.random_range(JITTER_LOW..JITTER_HIGH), c))
         .collect();
 
     if scored.is_empty() {
@@ -271,14 +290,20 @@ pub fn next_card(
     store.question(chosen.id)
 }
 
-fn score(c: &Candidate, now: Millis, mode: Mode, recent: &[Id], last_topic: Option<Id>) -> f64 {
+fn score(
+    c: &Candidate,
+    now: Millis,
+    mode: Mode,
+    recent: &[Id],
+    cooldown: usize,
+    last_topic: Option<Id>,
+) -> f64 {
     // Never show the same card twice in a row.
     if recent.last().is_some_and(|last| *last == c.id) {
         return 0.0;
     }
-    // Soft cooldown over a short window, so a small deck still cycles but
+    // Soft cooldown over a recent window, so a small deck still cycles but
     // does not feel like a loop of three cards.
-    let cooldown = recent.len().min(4);
     if recent[recent.len().saturating_sub(cooldown)..].contains(&c.id) {
         return 0.0;
     }
@@ -438,6 +463,61 @@ mod tests {
             assert_ne!(q.id, *recent.last().unwrap());
             recent.push(q.id);
         }
+    }
+
+    /// Draw `n` cards the way the app does, keeping the same recent tail.
+    fn draw(store: &Store, deck: Id, n: usize) -> Vec<Id> {
+        let mut recent: Vec<Id> = Vec::new();
+        let mut drawn = Vec::with_capacity(n);
+        for _ in 0..n {
+            let q = next_card(store, deck, Mode::Practice, &recent, None)
+                .unwrap()
+                .expect("deck is not empty");
+            drawn.push(q.id);
+            recent.push(q.id);
+            if recent.len() > 32 {
+                recent.remove(0);
+            }
+        }
+        drawn
+    }
+
+    #[test]
+    fn a_large_fresh_deck_is_covered_rather_than_looped() {
+        let (store, deck, _) = setup(100);
+        let distinct: std::collections::HashSet<Id> = draw(&store, deck, 60).into_iter().collect();
+        // Identical fresh cards score identically, and a stable sort over a
+        // tie serves them in row-id order: this used to loop over the first
+        // handful of rows and never reach the rest of the deck.
+        assert!(
+            distinct.len() > 40,
+            "only {} distinct cards in 60 draws",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn a_hard_minority_does_not_monopolise_the_deck() {
+        let (store, deck, ids) = setup(60);
+        // Ten harder cards among fifty, the shape the real Control Systems
+        // deck had when it served nothing but its ten difficulty-4 questions.
+        for id in ids.iter().take(10) {
+            store
+                .conn()
+                .execute(
+                    "UPDATE question SET difficulty = 4 WHERE id = ?1",
+                    params![*id],
+                )
+                .unwrap();
+        }
+
+        let hard: std::collections::HashSet<Id> = ids[..10].iter().copied().collect();
+        let drawn = draw(&store, deck, 100);
+        let easy = drawn.iter().filter(|id| !hard.contains(id)).count();
+        assert!(
+            easy > 50,
+            "the fifty easier cards took only {easy} of 100 draws"
+        );
     }
 
     #[test]

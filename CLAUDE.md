@@ -14,11 +14,23 @@ cyan/violet for swipe direction, green/magenta (never red) for verdicts.
   database façade; nothing else in the tree touches the driver directly.
 - `crates/app` — the `eframe` binary. `theme.rs` (palette/style), `card.rs`
   (swipe motion and rotated painting), `math.rs` + `richtext.rs` (inline
-  LaTeX), `explain.rs` (short/deep readings and facts), `app.rs` (screens).
-- `content/` — a separately versioned nested Git repository containing
-  question packs, one JSON file per topic plus shared facts, merged on import.
-  The application repository ignores it; do not assume one repository's
-  staging or commit operation includes the other.
+  LaTeX), `explain.rs` (short/deep readings and facts), `app.rs` (screens),
+  `import.rs` (decoding picked JSON/ZIP packs), `browser.rs` (the wasm shell:
+  OPFS persistence, file picker, download).
+- `content/` — one directory per module, each a separately versioned Git
+  repository holding question packs: one JSON file per topic plus shared
+  facts, merged on import. Currently `control-systems/` (deck `control-systems`,
+  prefix `cs`), `maths-2/` (deck `maths-2`, prefix `ma`, German) and
+  `automotive-mechatronics/` (deck `automotive-mechatronics`, prefix `atm`).
+  The application repository ignores `content/`; do not assume one repository's
+  staging or commit operation includes another's. **Each module has its own
+  `CLAUDE.md`** with its course conventions — read it before editing a pack,
+  along with `AUTHORING.md` here, which is the module-agnostic guide and lives
+  in this repository so there is one copy of it rather than one per course.
+
+  One import invocation covers one deck, but one database holds as many decks
+  as you like: `./reimport.sh -m cs`, `-m ma` and `-m atm` against the same
+  path put all three on the start screen with separate exam dates and schedules.
 
 ## Things worth knowing
 
@@ -34,6 +46,46 @@ reading; either may contain literal text and `{"fact": "uid"}` references.
 Symbol facts supply the glyph, its spoken name, and its meaning. Keep extended
 expressions in `$...$` LaTeX so the math renderer can lay out fractions,
 radicals and scripts instead of displaying a slash-heavy text approximation.
+
+**A formula fact is the formula sheet.** `FactKind::Formula` holds the equation
+in `label` as bare LaTeX — no `$` fences, because it is always set as maths —
+and renders as a display line inside the fact block. The set of them *is* the
+printed sheet, which is why they are a kind of their own rather than notes:
+they have to be enumerable, not merely findable. A calculation question's deep
+reading starts by citing one, then substitutes through to the answer.
+
+**Who an option note is addressed to decides where it is shown.**
+`explain::NoteView` is the single decision — `Hidden`, `Picked` or `All` — and
+`explain::option_notes` is the only place that applies it, so the card, the
+review screen and the clipboard transcript cannot drift apart. There are ~1,230
+authored notes across the three decks.
+
+- A note is addressed to *whoever picked that option*, so the card shows the
+  note of each option the learner actually selected — not all of them. That is
+  how they are written: "That is the settling time", "Inverted — check the
+  units". Showing every note at once turns a diagnosis into a wall.
+- For `multi`, that means a note per wrongly-ticked option. A correct option
+  they *missed* has no note to show; the question-level explanation covers it.
+- The note sits with its option, not with the explanation block: it says why
+  *this* choice was wrong, and the explanation says what is true. It is drawn
+  indented under its own row, in that row's verdict colour, and it grows the
+  card — it is not appended to the feedback panel.
+- The review screen is the exception, and uses `All`. There the card is being
+  studied rather than answered, so showing every note is right: the set of them
+  is a map of the mistakes the question is built to catch.
+- An unanswered card must never leak a note, for the same reason it must not
+  leak the answer — a note names which option is wrong. That applies to
+  `Ctrl+C` as much as to the screen.
+
+**Files are the shell's job, not a screen's.** Importing a deck and exporting
+the database are asked for on the deck screen — the dashed row under the last
+deck, and the button at the bottom — but the deck screen only records an
+`app::Request`. On the desktop `App` serves it itself, from a thread so a
+portal dialog cannot freeze the window; in the browser `BrowserApp` takes it
+with `take_request()` and reaches for an `<input type=file>` or a download.
+That is why the web build has no toolbar of its own: there is nothing left for
+one to hold. Both routes decode packs through `import::decode_packs`, so a ZIP
+of packs behaves identically on either.
 
 **The event log is append-only.** Nothing may `UPDATE` or `DELETE` from
 `event`. Undo removes the `attempt` row and rewinds the box, but the original
@@ -113,6 +165,29 @@ to include `crates/core` and the `idiodb` binary.
 cargo test                        # app only (default member)
 nix-shell --run ./tools/shot.sh   # headless UI screenshots -> target/shots/
 ```
+
+**The content tooling lives here, in `tools/`, not beside the packs.** All of
+it is generic, so a copy per module repository only guaranteed drift — and did:
+there were two `packfmt.py` with different APIs before they were merged. Run it
+from this directory, against `content/<module>/`:
+
+```
+python3 tools/check-packs.py                 # every $...$ span, every module
+python3 tools/packfmt.py --check content/*/*.json
+./tools/build-sheet.sh cs                    # formula sheet PDF, beside its pack
+```
+
+`check-packs.py` is a mirror of `math.rs`'s command set — **a command added to
+the renderer must be added to its `SUPPORTED`**, which is precisely why it
+belongs in this repository. `build-sheet.sh` needs LaTeX, which is kept out of
+`shell.nix` (direnv puts every `cd` into that shell and tectonic is large); it
+re-enters `tools/sheet-shell.nix` on its own.
+
+`shell.nix` also carries `dbus.lib` for a non-obvious reason: `rfd`'s
+xdg-portal backend *dlopens* `libdbus-1.so.3`. Without it the native import and
+export pickers fail to open, fall through to a zenity that is not installed
+either, and return "nothing was picked" — indistinguishable from Cancel, so the
+buttons silently do nothing.
 
 Check UI changes with `tools/shot.sh` rather than by eye. `--card <uid>` and
 `--drag <px>` pin a capture to a specific question and a frozen mid-swipe, so

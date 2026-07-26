@@ -13,7 +13,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::rc::Rc;
-use std::time::Instant;
+use web_time::Instant;
 
 use crate::db::Store;
 use crate::model::*;

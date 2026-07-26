@@ -19,6 +19,12 @@ let
     xorg.libXi
     xorg.libXrandr
     vulkan-loader
+    # rfd's xdg-portal backend dlopens libdbus-1.so.3 to talk to the file
+    # portal. Without it the picker cannot open, silently falls through to a
+    # zenity that is not installed either, and returns "nothing was picked" —
+    # which is indistinguishable from the user pressing Cancel. Import and
+    # export then do nothing at all, with no error. Keep dbus on this list.
+    dbus.lib
   ];
 in
 pkgs.mkShell {

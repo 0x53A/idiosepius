@@ -167,7 +167,7 @@ pub fn load_pack(path: impl AsRef<Path>) -> Result<Pack> {
 /// updates the text in place and leaves attempt history and scheduling alone.
 /// Questions no longer present in the pack are retired (`active = 0`) rather
 /// than deleted, which keeps their history readable.
-pub fn import_pack(store: &mut Store, pack: &Pack) -> Result<ImportReport> {
+pub fn import_pack(store: &Store, pack: &Pack) -> Result<ImportReport> {
     // Validate everything before touching the database, so a typo in question
     // 90 does not leave a half-imported deck behind.
     let mut seen_facts: HashSet<&str> = HashSet::new();
@@ -177,6 +177,11 @@ pub fn import_pack(store: &mut Store, pack: &Pack) -> Result<ImportReport> {
         }
         if f.kind == FactKind::Symbol && f.label.is_none() {
             bail!("symbol fact {} has no label", f.uid);
+        }
+        // A formula sheet entry without its formula is the one thing the
+        // sheet exists to carry, so refuse the pack rather than print a gap.
+        if f.kind == FactKind::Formula && f.label.is_none() {
+            bail!("formula fact {} has no label", f.uid);
         }
     }
 
@@ -456,6 +461,36 @@ mod tests {
         let e = &p.questions[0].explain;
         assert_eq!(e.short, vec![Seg::text("Exactly on the boundary.")]);
         assert_eq!(e.referenced_facts(), vec!["note-2nd-order", "sym-zeta"]);
+    }
+
+    #[test]
+    fn a_formula_fact_carries_its_equation_in_the_label() {
+        let src = r#"{
+          "deck": { "slug": "cs", "title": "Control Systems" },
+          "facts": [
+            { "uid": "f-peak-time", "kind": "formula", "title": "Peak time",
+              "label": "t_p = \\frac{\\pi}{\\omega_d}",
+              "body": "Half a period of the damped oscillation." }
+          ]
+        }"#;
+        let p: Pack = serde_json::from_str(src).unwrap();
+        assert_eq!(p.facts[0].kind, FactKind::Formula);
+        assert_eq!(p.facts[0].label.as_deref(), Some("t_p = \\frac{\\pi}{\\omega_d}"));
+    }
+
+    #[test]
+    fn a_formula_without_its_formula_is_refused() {
+        let src = r#"{
+          "deck": { "slug": "cs", "title": "Control Systems" },
+          "facts": [
+            { "uid": "f-nameless", "kind": "formula", "title": "Peak time",
+              "body": "Half a period of the damped oscillation." }
+          ]
+        }"#;
+        let store = Store::open_in_memory().unwrap();
+        let pack: Pack = serde_json::from_str(src).unwrap();
+        let err = import_pack(&store, &pack).unwrap_err().to_string();
+        assert!(err.contains("f-nameless"), "{err}");
     }
 
     #[test]

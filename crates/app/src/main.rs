@@ -6,6 +6,7 @@ mod app;
 mod card;
 mod coin;
 mod explain;
+mod import;
 mod math;
 mod richtext;
 mod theme;

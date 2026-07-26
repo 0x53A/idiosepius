@@ -12,19 +12,43 @@
 //! is just an error rather than something to smuggle out through the row type.
 
 use anyhow::{Context, Result, anyhow};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
-use tokio::runtime::Runtime;
+#[cfg(not(target_arch = "wasm32"))]
 use turso::Builder;
 
-pub use turso::Value;
+/// The five SQLite storage classes used at the façade boundary.
+///
+/// Keeping this tiny enum local lets native use the high-level `turso` crate
+/// while the browser uses `turso_core` directly, without leaking either
+/// driver's row/value types into the rest of the application.
+#[derive(Clone, Debug)]
+pub enum Value {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
 
 /// An open database, plus the runtime its futures are driven on.
 pub struct Conn {
-    rt: Runtime,
+    #[cfg(not(target_arch = "wasm32"))]
+    rt: tokio::runtime::Runtime,
+    #[cfg(not(target_arch = "wasm32"))]
     inner: turso::Connection,
+    /// Where the file is, for the one operation that is about the file rather
+    /// than its contents: copying the database out. `None` for `:memory:`.
+    #[cfg(not(target_arch = "wasm32"))]
+    path: Option<std::path::PathBuf>,
+    #[cfg(target_arch = "wasm32")]
+    inner: std::sync::Arc<turso_core::Connection>,
+    #[cfg(target_arch = "wasm32")]
+    io: std::sync::Arc<crate::browser_io::BrowserIo>,
 }
 
 impl Conn {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let name = path
@@ -34,9 +58,18 @@ impl Conn {
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::build(":memory:").context("opening an in-memory database")
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self::build(":memory:").context("opening an in-memory database")
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self::open_browser(Vec::new(), Vec::new())
+                .context("opening an in-memory browser database")
+        }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn build(name: &str) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -45,23 +78,65 @@ impl Conn {
             let db = Builder::new_local(name).build().await?;
             db.connect()
         })?;
-        Ok(Conn { rt, inner })
+        Ok(Conn {
+            rt,
+            inner,
+            path: (name != ":memory:").then(|| std::path::PathBuf::from(name)),
+        })
+    }
+
+    /// The file this connection is reading and writing, if it is a file.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn open_browser(database: Vec<u8>, wal: Vec<u8>) -> Result<Self> {
+        use turso_core::{Database, OpenOptions, SqliteDialect};
+
+        let io = std::sync::Arc::new(crate::browser_io::BrowserIo::new(database, wal));
+        let options = OpenOptions::new(std::sync::Arc::new(SqliteDialect));
+        let db = Database::open(io.clone(), crate::browser_io::DB_NAME, options)?;
+        let inner = db.connect()?;
+        Ok(Self { inner, io })
     }
 
     /// Number of rows changed.
     pub fn execute(&self, sql: &str, params: Vec<Value>) -> Result<usize> {
+        #[cfg(not(target_arch = "wasm32"))]
         let n = self
             .rt
-            .block_on(self.inner.execute(sql, params))
+            .block_on(
+                self.inner
+                    .execute(sql, params.into_iter().map(to_turso).collect::<Vec<_>>()),
+            )
             .with_context(|| failed(sql))?;
+        #[cfg(target_arch = "wasm32")]
+        let n = {
+            let mut stmt = self.inner.prepare(sql).with_context(|| failed(sql))?;
+            bind_core(&mut stmt, params).with_context(|| failed(sql))?;
+            stmt.run_ignore_rows().with_context(|| failed(sql))?;
+            stmt.n_change() as u64
+        };
         Ok(n as usize)
     }
 
     /// Several statements at once, for `schema.sql`.
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.rt
-            .block_on(self.inner.execute_batch(sql))
-            .context("running a statement batch")
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.rt
+                .block_on(self.inner.execute_batch(sql))
+                .context("running a statement batch")
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.inner
+                .prepare_execute_batch(sql)
+                .context("running a statement batch")?;
+            Ok(())
+        }
     }
 
     /// The first row, or an error if the query produced none. Right for
@@ -100,19 +175,42 @@ impl Conn {
     }
 
     fn fetch(&self, sql: &str, params: Vec<Value>) -> Result<Vec<Row>> {
-        self.rt
-            .block_on(async {
-                let mut rows = self.inner.query(sql, params).await?;
-                let mut out = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    let values = (0..row.column_count())
-                        .map(|i| row.get_value(i))
-                        .collect::<turso::Result<Vec<_>>>()?;
-                    out.push(Row { values });
-                }
-                Ok::<_, turso::Error>(out)
-            })
-            .with_context(|| failed(sql))
+        #[cfg(not(target_arch = "wasm32"))]
+        let query = async {
+            let params = params.into_iter().map(to_turso).collect::<Vec<_>>();
+            let mut rows = self.inner.query(sql, params).await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let values = (0..row.column_count())
+                    .map(|i| row.get_value(i))
+                    .collect::<turso::Result<Vec<_>>>()?;
+                out.push(Row {
+                    values: values.into_iter().map(from_turso).collect(),
+                });
+            }
+            Ok::<_, turso::Error>(out)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let rows = self.rt.block_on(query);
+        #[cfg(target_arch = "wasm32")]
+        let rows = (|| {
+            let mut stmt = self.inner.prepare(sql)?;
+            bind_core(&mut stmt, params)?;
+            let rows = stmt.run_collect_rows()?;
+            Ok::<_, turso_core::LimboError>(
+                rows.into_iter()
+                    .map(|values| Row {
+                        values: values.into_iter().map(from_core).collect(),
+                    })
+                    .collect(),
+            )
+        })();
+        rows.with_context(|| failed(sql))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn browser_snapshot(&self) -> crate::browser_io::BrowserSnapshot {
+        self.io.snapshot()
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -140,6 +238,63 @@ impl Conn {
             conn: self,
             done: false,
         })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn to_turso(value: Value) -> turso::Value {
+    match value {
+        Value::Null => turso::Value::Null,
+        Value::Integer(value) => turso::Value::Integer(value),
+        Value::Real(value) => turso::Value::Real(value),
+        Value::Text(value) => turso::Value::Text(value),
+        Value::Blob(value) => turso::Value::Blob(value),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn from_turso(value: turso::Value) -> Value {
+    match value {
+        turso::Value::Null => Value::Null,
+        turso::Value::Integer(value) => Value::Integer(value),
+        turso::Value::Real(value) => Value::Real(value),
+        turso::Value::Text(value) => Value::Text(value),
+        turso::Value::Blob(value) => Value::Blob(value),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn bind_core(statement: &mut turso_core::Statement, params: Vec<Value>) -> turso_core::Result<()> {
+    use std::num::NonZero;
+
+    for (index, value) in params.into_iter().enumerate() {
+        let index = NonZero::new(index + 1).expect("SQL parameter indices start at one");
+        statement.bind_at(index, to_core(value)?)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn to_core(value: Value) -> turso_core::Result<turso_core::Value> {
+    Ok(match value {
+        Value::Null => turso_core::Value::Null,
+        Value::Integer(value) => turso_core::Value::from_i64(value),
+        Value::Real(value) => turso_core::Value::from_f64(value),
+        Value::Text(value) => turso_core::Value::build_text(value),
+        Value::Blob(value) => turso_core::Value::from_slice(&value)?,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn from_core(value: turso_core::Value) -> Value {
+    use turso_core::Numeric;
+
+    match value {
+        turso_core::Value::Null => Value::Null,
+        turso_core::Value::Numeric(Numeric::Integer(value)) => Value::Integer(value),
+        turso_core::Value::Numeric(Numeric::Float(value)) => Value::Real(f64::from(value)),
+        turso_core::Value::Text(value) => Value::Text(value.as_str().to_owned()),
+        turso_core::Value::Blob(value) => Value::Blob(value.to_vec()),
     }
 }
 

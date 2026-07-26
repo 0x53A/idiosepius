@@ -1,7 +1,7 @@
 //! Content types: what a question *is*, and what answering one looks like.
 
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 pub type Id = i64;
 /// Milliseconds since the Unix epoch, UTC.
@@ -258,6 +258,11 @@ pub enum FactKind {
     Note,
     /// One symbol: the glyph, its name, and what it stands for.
     Symbol,
+    /// One entry of the formula sheet: the equation a derivation may start
+    /// from. Separated from `Note` because the formula sheet is a document in
+    /// its own right — printed for the exam, and shown as its own view — so
+    /// its members have to be enumerable, not merely findable.
+    Formula,
 }
 
 impl FactKind {
@@ -265,12 +270,14 @@ impl FactKind {
         match self {
             FactKind::Note => "note",
             FactKind::Symbol => "symbol",
+            FactKind::Formula => "formula",
         }
     }
 
     pub fn parse(s: &str) -> Self {
         match s {
             "symbol" => FactKind::Symbol,
+            "formula" => FactKind::Formula,
             _ => FactKind::Note,
         }
     }
@@ -282,7 +289,9 @@ pub struct Fact {
     pub deck_id: Option<Id>,
     pub uid: String,
     pub kind: FactKind,
-    /// The symbol itself, for `FactKind::Symbol`: "ζ".
+    /// The thing itself: for `FactKind::Symbol` the glyph, "ζ"; for
+    /// `FactKind::Formula` the equation as LaTeX, `t_p = \frac{\pi}{\omega_d}`
+    /// — no `$` fences, because a formula is always set as maths.
     pub label: Option<String>,
     /// What the symbol is called: "zeta".
     pub name: Option<String>,

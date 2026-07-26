@@ -108,53 +108,105 @@ enum Token {
 /// `$` opens and closes a formula; `\$` is a literal dollar sign. An unclosed
 /// `$` takes the rest of the string, which is what an author who forgot the
 /// closing one meant anyway.
+///
+/// `*` opens and closes emphasis over a *span*, as Markdown does, so
+/// `*mehrere Wörter*` emphasises both of them; `**` is accepted and means the
+/// same thing, because authors type it. A `*` with no closing partner is
+/// ordinary ink — a lone asterisk in prose must not silently emphasise
+/// everything after it — and `\*` is always literal.
+///
+/// Emphasis is a property of a whole word, since a word is one galley: a word
+/// any part of which is inside a span is emphasised entirely.
 fn tokenize(src: &str) -> Vec<Token> {
+    let chars: Vec<char> = src.chars().collect();
     let mut out = Vec::new();
     let mut word = String::new();
-    let mut chars = src.chars().peekable();
+    let mut word_emphasized = false;
+    let mut emphasis = false;
+    let mut i = 0;
 
-    let flush = |word: &mut String, out: &mut Vec<Token>| {
+    let flush = |word: &mut String, word_emphasized: &mut bool, out: &mut Vec<Token>| {
         if !word.is_empty() {
-            let mut text = std::mem::take(word);
-            let emphasized = match (text.find('*'), text.rfind('*')) {
-                (Some(start), Some(end)) if end > start + 1 => {
-                    text.remove(end);
-                    text.remove(start);
-                    true
-                }
-                _ => false,
-            };
-            out.push(Token::Word { text, emphasized });
+            out.push(Token::Word {
+                text: std::mem::take(word),
+                emphasized: *word_emphasized,
+            });
         }
+        *word_emphasized = false;
     };
 
-    while let Some(c) = chars.next() {
+    while i < chars.len() {
+        let c = chars[i];
         match c {
-            '\\' if chars.peek() == Some(&'$') => {
-                chars.next();
-                word.push('$');
+            '\\' if matches!(chars.get(i + 1), Some('$' | '*')) => {
+                word.push(chars[i + 1]);
+                word_emphasized |= emphasis;
+                i += 2;
+            }
+            '*' => {
+                let run = chars[i..].iter().take_while(|c| **c == '*').count().min(2);
+                if emphasis {
+                    emphasis = false;
+                    i += run;
+                } else if closes_later(&chars, i + run) {
+                    emphasis = true;
+                    i += run;
+                } else {
+                    word.push('*');
+                    i += 1;
+                }
             }
             '$' => {
-                flush(&mut word, &mut out);
-                let mut formula = String::new();
-                for c in chars.by_ref() {
-                    if c == '$' {
-                        break;
-                    }
-                    formula.push(c);
+                flush(&mut word, &mut word_emphasized, &mut out);
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != '$' {
+                    j += 1;
                 }
-                out.push(Token::Math(formula));
+                out.push(Token::Math(chars[start..j].iter().collect()));
+                i = (j + 1).min(chars.len());
             }
             '\n' => {
-                flush(&mut word, &mut out);
+                flush(&mut word, &mut word_emphasized, &mut out);
                 out.push(Token::Break);
+                i += 1;
             }
-            c if c.is_whitespace() => flush(&mut word, &mut out),
-            c => word.push(c),
+            c if c.is_whitespace() => {
+                flush(&mut word, &mut word_emphasized, &mut out);
+                i += 1;
+            }
+            c => {
+                word.push(c);
+                word_emphasized |= emphasis;
+                i += 1;
+            }
         }
     }
-    flush(&mut word, &mut out);
+    flush(&mut word, &mut word_emphasized, &mut out);
     out
+}
+
+/// Is there a closing `*` after `from`?
+///
+/// Formulas are skipped: `$a * b$` is multiplication, and must not turn a
+/// stray asterisk in the surrounding prose into an emphasis marker.
+fn closes_later(chars: &[char], from: usize) -> bool {
+    let mut i = from;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => i += 2,
+            '$' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '$' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '*' => return true,
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// Lay out a single text run and report where its baseline sits.
@@ -338,6 +390,69 @@ mod tests {
         };
         assert_eq!(text, "important.");
         assert!(emphasized);
+    }
+
+    /// `(text, emphasized)` for every word.
+    fn words(src: &str) -> Vec<(String, bool)> {
+        tokenize(src)
+            .into_iter()
+            .filter_map(|t| match t {
+                Token::Word { text, emphasized } => Some((text, emphasized)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn emphasis_spans_several_words() {
+        assert_eq!(
+            words("das ist *mehrere Wörter* lang"),
+            [
+                ("das".into(), false),
+                ("ist".into(), false),
+                ("mehrere".into(), true),
+                ("Wörter".into(), true),
+                ("lang".into(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_doubled_asterisk_is_the_same_emphasis_and_leaves_no_ink() {
+        assert_eq!(words("ganz **fett** hier")[1], ("fett".into(), true));
+    }
+
+    #[test]
+    fn an_unmatched_asterisk_stays_ink() {
+        // Otherwise a lone asterisk emphasises the whole rest of the card.
+        assert_eq!(
+            words("a * b and on and on"),
+            [
+                ("a".into(), false),
+                ("*".into(), false),
+                ("b".into(), false),
+                ("and".into(), false),
+                ("on".into(), false),
+                ("and".into(), false),
+                ("on".into(), false),
+            ]
+        );
+        assert_eq!(
+            words(r"literal \*star\*"),
+            [("literal".into(), false), ("*star*".into(), false)]
+        );
+    }
+
+    #[test]
+    fn an_asterisk_inside_a_formula_does_not_open_emphasis() {
+        assert_eq!(
+            words(r"the product $a * b$ grows"),
+            [
+                ("the".into(), false),
+                ("product".into(), false),
+                ("grows".into(), false),
+            ]
+        );
     }
 
     #[test]

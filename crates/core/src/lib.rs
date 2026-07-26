@@ -36,6 +36,9 @@ pub mod session;
 pub mod sql;
 pub mod stats;
 
+#[cfg(target_arch = "wasm32")]
+pub mod browser_io;
+
 pub use db::{NewFact, NewQuestion, Store};
 pub use model::{
     Body, Choice, Explain, Fact, FactKind, Grade, Id, Kind, Millis, Question, Response, Seg, now_ms,

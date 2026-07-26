@@ -146,6 +146,12 @@ fn style_of(style: &mut egui::Style) {
 /// Berkeley Mono if the system has it, JetBrains Mono otherwise, and egui's
 /// built-in font if neither is installed. Nothing is vendored into the repo,
 /// so no font licence travels with the source.
+#[cfg(target_arch = "wasm32")]
+fn install_fonts(ctx: &egui::Context) {
+    egui_web_component::install_fonts(ctx);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let mut installed = None;
@@ -188,6 +194,7 @@ fn install_fonts(ctx: &egui::Context) {
 
 /// Ask fontconfig where a family lives, and verify it actually returned that
 /// family — `fc-match` always answers with *something*.
+#[cfg(not(target_arch = "wasm32"))]
 fn find_font(family: &str) -> Option<String> {
     let out = std::process::Command::new("fc-match")
         .args(["-f", "%{family}\t%{file}", family])

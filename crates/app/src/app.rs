@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
-use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, Sense, Stroke, Vec2};
+use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use idiosepius_core::model::{Deck, Topic};
 use idiosepius_core::session::{Event, Outcome};
 use idiosepius_core::{
@@ -30,14 +31,47 @@ pub struct App {
     decks: Vec<Deck>,
     error: Option<String>,
     coin: CoinAnimation,
-    /// When the last screen-shaped clipboard export happened, for the brief
-    /// confirmation in the corner.
-    copied_at: Option<Instant>,
+    /// A brief confirmation in the corner: a copy, an import, an export.
+    notice: Option<Notice>,
+    /// Something the shell has to do, asked for by a screen this frame.
+    request: Option<Request>,
+    /// A native file dialog, running on a thread of its own so the window
+    /// keeps painting while it is open.
+    #[cfg(not(target_arch = "wasm32"))]
+    dialog: Option<std::sync::mpsc::Receiver<Picked>>,
     /// A review asked for this frame, waiting for the screen it came from.
     pending_review: Option<Box<Review>>,
     /// Development aid: render a few frames, save a PNG, quit. Lets the UI be
     /// checked headlessly (under Xvfb, in CI) instead of by eye.
     shot: Option<Shot>,
+}
+
+/// Something only the shell around the app can do: put a file picker on
+/// screen, hand a file back to the user.
+///
+/// The deck screen records the ask and someone else carries it out — a native
+/// dialog on the desktop, an `<input type=file>` and a download in the
+/// browser — because those two have nothing in common but the intent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Request {
+    ImportDeck,
+    ExportDatabase,
+}
+
+/// What a native file dialog came back with.
+#[cfg(not(target_arch = "wasm32"))]
+enum Picked {
+    Decks(Vec<std::path::PathBuf>),
+    ExportTo(std::path::PathBuf),
+    /// The dialog was cancelled, or could not be shown at all.
+    Nothing,
+}
+
+/// A short-lived confirmation in the top-right corner.
+struct Notice {
+    text: String,
+    since: Instant,
+    ttl: Duration,
 }
 
 /// A pending `--shot` capture.
@@ -169,7 +203,10 @@ impl App {
             decks,
             error: None,
             coin: CoinAnimation::new(animate_coin),
-            copied_at: None,
+            notice: None,
+            request: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            dialog: None,
             pending_review: None,
             shot,
         };
@@ -197,6 +234,51 @@ impl App {
             }
         }
         app
+    }
+
+    pub(crate) fn import_pack(
+        &mut self,
+        pack: &idiosepius_core::content::Pack,
+    ) -> anyhow::Result<idiosepius_core::content::ImportReport> {
+        let report = idiosepius_core::content::import_pack(&self.store, pack)?;
+        self.decks = self.store.decks()?;
+        self.screen = Screen::Decks;
+        Ok(report)
+    }
+
+    pub(crate) fn export_database(&self) -> anyhow::Result<Vec<u8>> {
+        self.store.export_database()
+    }
+
+    /// Take the shell action a screen asked for this frame, if any.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn take_request(&mut self) -> Option<Request> {
+        self.request.take()
+    }
+
+    /// Say something short in the corner: an import landed, a file was written.
+    pub(crate) fn notify(&mut self, text: impl Into<String>) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            since: Instant::now(),
+            ttl: Duration::from_millis(2600),
+        });
+    }
+
+    pub(crate) fn report_error(&mut self, text: impl Into<String>) {
+        self.error = Some(text.into());
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn browser_snapshot(&self) -> idiosepius_core::browser_io::BrowserSnapshot {
+        self.store.browser_snapshot()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn browser_checkpoint_snapshot(
+        &self,
+    ) -> anyhow::Result<idiosepius_core::browser_io::BrowserSnapshot> {
+        self.store.browser_checkpoint_snapshot()
     }
 
     /// Put the captured screen into a fixed, reproducible state.
@@ -340,15 +422,138 @@ impl eframe::App for App {
             let text = self.visible_text(&screen);
             if !text.trim().is_empty() {
                 ui.ctx().copy_text(text);
-                self.copied_at = Some(Instant::now());
+                self.notice = Some(Notice {
+                    text: "copied".into(),
+                    since: Instant::now(),
+                    ttl: Duration::from_millis(900),
+                });
             }
         }
         self.screen = screen;
 
+        // On the desktop the app is its own shell, so it answers the file
+        // requests itself. In the browser they belong to `BrowserApp`, which
+        // takes them after this returns.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.serve_requests(ui.ctx());
+
         self.error_bar(ui);
-        self.copy_notice(ui);
+        self.corner_notice(ui);
         self.drive_shot(ui.ctx());
     }
+}
+
+// --------------------------------------------------------- native dialogs --
+
+/// Importing a deck and exporting the database, on the desktop.
+///
+/// The dialog runs on a thread of its own and answers through a channel: a
+/// portal dialog can sit open for a minute, and the window behind it has to
+/// keep painting. Only one is allowed at a time — a second file picker over
+/// the first is a bug, not a feature.
+#[cfg(not(target_arch = "wasm32"))]
+impl App {
+    fn serve_requests(&mut self, ctx: &egui::Context) {
+        self.poll_dialog();
+        let Some(request) = self.request.take() else {
+            return;
+        };
+        if self.dialog.is_some() {
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        let suggested = default_export_name();
+        let spawned = std::thread::Builder::new()
+            .name("idiosepius-file-dialog".into())
+            .spawn(move || {
+                let picked = match request {
+                    Request::ImportDeck => rfd::FileDialog::new()
+                        .set_title("Import deck packs")
+                        .add_filter("deck packs", &["json", "zip"])
+                        .pick_files()
+                        .map_or(Picked::Nothing, Picked::Decks),
+                    Request::ExportDatabase => rfd::FileDialog::new()
+                        .set_title("Export study database")
+                        .add_filter("SQLite database", &["db"])
+                        .set_file_name(suggested)
+                        .save_file()
+                        .map_or(Picked::Nothing, Picked::ExportTo),
+                };
+                let _ = tx.send(picked);
+                ctx.request_repaint();
+            });
+
+        match spawned {
+            Ok(_) => self.dialog = Some(rx),
+            Err(e) => self.error = Some(format!("could not open a file dialog: {e}")),
+        }
+    }
+
+    fn poll_dialog(&mut self) {
+        let Some(rx) = &self.dialog else { return };
+        let picked = match rx.try_recv() {
+            Ok(picked) => picked,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            // The thread died without answering; drop the dialog and move on.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Picked::Nothing,
+        };
+        self.dialog = None;
+
+        match picked {
+            Picked::Nothing => {}
+            Picked::Decks(paths) => self.import_paths(&paths),
+            Picked::ExportTo(path) => self.export_to(&path),
+        }
+    }
+
+    /// Import the picked files through exactly the code path the browser uses,
+    /// so a ZIP of packs behaves the same on both.
+    fn import_paths(&mut self, paths: &[std::path::PathBuf]) {
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            match std::fs::read(path) {
+                Ok(bytes) => files.push(crate::import::PickedFile {
+                    name: path.to_string_lossy().into_owned(),
+                    bytes,
+                }),
+                Err(e) => {
+                    self.report_error(format!("could not read {}: {e}", path.display()));
+                    return;
+                }
+            }
+        }
+
+        match crate::import::decode_packs(files).and_then(|pack| self.import_pack(&pack)) {
+            Ok(report) => {
+                self.notify(format!("imported {} questions", report.questions));
+                self.error = None;
+            }
+            Err(e) => self.report_error(format!("deck import failed: {e:#}")),
+        }
+    }
+
+    fn export_to(&mut self, path: &std::path::Path) {
+        let written = self
+            .export_database()
+            .and_then(|bytes| Ok(std::fs::write(path, bytes)?));
+        match written {
+            Ok(()) => {
+                self.notify("database exported");
+                self.error = None;
+            }
+            Err(e) => self.report_error(format!("could not export the database: {e:#}")),
+        }
+    }
+}
+
+/// `idiosepius-2026-07-26.db`: dated, because an export is a snapshot and the
+/// first thing you want to know about one is when it was taken.
+#[cfg(not(target_arch = "wasm32"))]
+fn default_export_name() -> String {
+    let day = idiosepius_core::content::format_rfc3339_ms(now_ms());
+    format!("idiosepius-{}.db", day.get(..10).unwrap_or("export"))
 }
 
 fn take_copy_event(events: &mut Vec<egui::Event>) -> bool {
@@ -420,9 +625,19 @@ impl App {
                         feedback.response.as_ref(),
                         feedback.grade,
                         true,
+                        explain::NoteView::Picked,
                         Some((&study.facts, feedback.depth)),
                     ),
-                    None => card_text(question, topic, &study.selected, None, None, false, None),
+                    None => card_text(
+                        question,
+                        topic,
+                        &study.selected,
+                        None,
+                        None,
+                        false,
+                        explain::NoteView::Hidden,
+                        None,
+                    ),
                 }
             }
             Screen::Review(review) => {
@@ -441,6 +656,7 @@ impl App {
                     item.response.as_ref(),
                     item.grade,
                     true,
+                    explain::NoteView::All,
                     Some((&review.facts, review.depth)),
                 )
             }
@@ -464,20 +680,29 @@ impl App {
         }
     }
 
-    /// Brief, non-modal confirmation that Ctrl/Cmd+C copied the current view.
-    fn copy_notice(&mut self, ui: &mut egui::Ui) {
-        let Some(since) = self.copied_at else {
+    /// Brief, non-modal confirmation of something that just happened — a copy,
+    /// an import, an export. It never asks for a click and never blocks.
+    fn corner_notice(&mut self, ui: &mut egui::Ui) {
+        let Some(note) = &self.notice else {
             return;
         };
-        if since.elapsed() >= Duration::from_millis(900) {
-            self.copied_at = None;
+        if note.since.elapsed() >= note.ttl {
+            self.notice = None;
             return;
         }
+        let label = tracked(&note.text);
 
         let full = ui.max_rect();
+        let width = (ui
+            .painter()
+            .layout_no_wrap(label.clone(), text::label(), Palette::ACCENT)
+            .rect
+            .width()
+            + 26.0)
+            .max(102.0);
         let notice = Rect::from_min_size(
-            full.right_top() + Vec2::new(-114.0, 12.0),
-            Vec2::new(102.0, 28.0),
+            full.right_top() + Vec2::new(-width - 12.0, 12.0),
+            Vec2::new(width, 28.0),
         );
         let p = ui.painter();
         p.rect_filled(notice, 0, Palette::SURFACE);
@@ -490,7 +715,7 @@ impl App {
         p.text(
             notice.center(),
             Align2::CENTER_CENTER,
-            tracked("copied"),
+            label,
             text::label(),
             Palette::ACCENT,
         );
@@ -589,11 +814,11 @@ impl App {
             ui.painter().text(
                 Pos2::new(panel.left(), y),
                 Align2::LEFT_TOP,
-                "No decks yet. Import one:\n\n  idiodb study.db import content/*.json",
+                "No decks yet. Import a pack — one or more .json files, or a .zip of them.",
                 text::body(),
                 Palette::TEXT_DIM,
             );
-            return None;
+            y += 42.0;
         }
 
         for deck in &decks {
@@ -675,6 +900,23 @@ impl App {
             y += 116.0;
         }
 
+        // Importing sits with the decks because that is what it produces, and
+        // it is dashed because it is not one: the row is an opening, not a
+        // thing you can study.
+        let import =
+            Rect::from_min_size(Pos2::new(panel.left(), y), Vec2::new(panel.width(), 54.0));
+        if dashed_row(ui, import, "import deck") {
+            self.request = Some(Request::ImportDeck);
+        }
+
+        // The database is the whole course and the whole history, so taking a
+        // copy of it belongs on the screen that lists what is in it — at the
+        // bottom, out of the way of the decks themselves.
+        let export = Pos2::new(panel.right(), panel.bottom() - 68.0);
+        if chrome_button(ui, export, "export database") {
+            self.request = Some(Request::ExportDatabase);
+        }
+
         ui.painter().text(
             Pos2::new(panel.left(), panel.bottom() - 18.0),
             Align2::LEFT_BOTTOM,
@@ -744,7 +986,10 @@ impl App {
             Ok(Some(q)) => {
                 study.session.show(q.id);
                 study.recent.push(q.id);
-                if study.recent.len() > 12 {
+                // The scheduler decides how much of this tail it actually
+                // suppresses; keep enough of it that a large deck can use a
+                // wide cooldown window.
+                if study.recent.len() > 32 {
                     study.recent.remove(0);
                 }
                 study.current = Some(q);
@@ -1151,6 +1396,7 @@ fn card_text(
     response: Option<&Response>,
     grade: Option<Grade>,
     reveal_answer: bool,
+    notes: explain::NoteView,
     explanation: Option<(&Facts, Depth)>,
 ) -> String {
     let mut out = String::new();
@@ -1175,6 +1421,14 @@ fn card_text(
             } else {
                 "\n\nChoices"
             });
+            // The same rule the screen follows: a note names a wrong option,
+            // so an unanswered card must not leak one into the transcript
+            // either.
+            let picked: Vec<usize> = match response {
+                Some(Response::MultipleChoice { selected }) => selected.clone(),
+                _ => Vec::new(),
+            };
+            let option_notes = explain::option_notes(options, &picked, notes);
             for (index, option) in options.iter().enumerate() {
                 let marker = if !reveal_answer && selected.contains(&index) {
                     " [selected]"
@@ -1182,6 +1436,9 @@ fn card_text(
                     ""
                 };
                 let _ = write!(out, "\n{}. {}{marker}", index + 1, option.text.trim());
+                if let Some(note) = option_notes[index] {
+                    let _ = write!(out, "\n   Note: {note}");
+                }
             }
 
             if let Some(Response::MultipleChoice { selected }) = response {
@@ -1349,6 +1606,79 @@ fn corner_coin(ui: &egui::Ui, full: Rect, coin: &mut CoinAnimation, id: &'static
     coin.paint(ui, rect);
 }
 
+/// A deck-width row with a dashed border: an action that would *produce* a
+/// deck, sitting where the deck it produces will appear.
+///
+/// Dashed rather than solid because the row is an opening, not a thing to
+/// study — the same hairline the deck rows use, just interrupted, so it reads
+/// as belonging to the list without pretending to be a member of it.
+fn dashed_row(ui: &egui::Ui, rect: Rect, label: &str) -> bool {
+    let response = ui.interact(rect, Id::new(("dashed-row", label)), Sense::click());
+    let colour = if response.hovered() {
+        Palette::ACCENT
+    } else {
+        Palette::LINE_BRIGHT
+    };
+    let ink = if response.hovered() {
+        Palette::ACCENT
+    } else {
+        Palette::TEXT_DIM
+    };
+
+    let p = ui.painter();
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+        rect.left_top(),
+    ];
+    p.extend(Shape::dashed_line(
+        &corners,
+        Stroke::new(1.0, colour),
+        6.0,
+        5.0,
+    ));
+    p.text(
+        rect.left_center() + Vec2::new(18.0, 0.0),
+        Align2::LEFT_CENTER,
+        format!("+   {}", tracked(label)),
+        text::label(),
+        ink,
+    );
+    response.clicked()
+}
+
+/// A small bordered button for chrome actions, laid out from its right edge
+/// and sized to its own label — tracked capitals are much wider than the text
+/// they are made of, and a guessed width clips them.
+fn chrome_button(ui: &egui::Ui, right_top: Pos2, label: &str) -> bool {
+    let caps = tracked(label);
+    let width = ui
+        .painter()
+        .layout_no_wrap(caps.clone(), text::label(), Palette::TEXT)
+        .rect
+        .width()
+        + 28.0;
+    let rect = Rect::from_min_size(right_top - Vec2::new(width, 0.0), Vec2::new(width, 30.0));
+    let response = ui.interact(rect, Id::new(("chrome-button", label)), Sense::click());
+    let colour = if response.hovered() {
+        Palette::ACCENT
+    } else {
+        Palette::TEXT_DIM
+    };
+    let p = ui.painter();
+    p.rect_stroke(rect, 0, Stroke::new(1.0, colour), egui::StrokeKind::Inside);
+    p.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        caps,
+        text::label(),
+        colour,
+    );
+    response.clicked()
+}
+
 fn fmt_span(ms: i64) -> String {
     let mins = ms / 60_000;
     let (d, h, m) = (mins / 1440, (mins % 1440) / 60, mins % 60);
@@ -1373,6 +1703,12 @@ fn fmt_ms(ms: i64) -> String {
 }
 
 // ------------------------------------------------------------- card views --
+
+/// Left inset of an option note, chosen to line up with the option text
+/// rather than with the row edge or the index box.
+const NOTE_INDENT: f32 = 48.0;
+/// Air between an option row and the note hanging under it.
+const NOTE_GAP: f32 = 10.0;
 
 impl App {
     fn true_false_card(
@@ -1590,9 +1926,42 @@ impl App {
             .map(|o| richtext::layout(ui.painter(), &o.text, 15.0, wrap - 54.0))
             .collect();
 
+        // A note diagnoses the option it sits under, so it is laid out with
+        // that row and grows the card, rather than being appended to the
+        // explanation panel — which says what is true, not what went wrong.
+        // Before the card is answered there is nothing to show: a note names a
+        // wrong option and would give the answer away.
+        let picked_options: Vec<usize> = match study
+            .feedback
+            .as_ref()
+            .and_then(|feedback| feedback.response.as_ref())
+        {
+            Some(Response::MultipleChoice { selected }) => selected.clone(),
+            _ => Vec::new(),
+        };
+        let note_docs: Vec<Option<_>> = explain::option_notes(
+            options,
+            &picked_options,
+            if revealed {
+                explain::NoteView::Picked
+            } else {
+                explain::NoteView::Hidden
+            },
+        )
+        .into_iter()
+        .map(|note| {
+            note.map(|note| richtext::layout(ui.painter(), note, 13.5, wrap - NOTE_INDENT - 12.0))
+        })
+        .collect();
+
         let options_h: f32 = option_docs
             .iter()
-            .map(|d| (d.height() + 22.0).max(40.0) + 8.0)
+            .zip(&note_docs)
+            .map(|(d, note)| {
+                (d.height() + 22.0).max(40.0)
+                    + 8.0
+                    + note.as_ref().map_or(0.0, |n| n.height() + NOTE_GAP)
+            })
             .sum();
         let content_h =
             48.0 + prompt_doc.height() + 22.0 + options_h + if multi { 50.0 } else { 0.0 } + 20.0;
@@ -1644,7 +2013,7 @@ impl App {
 
         let mut y = card_rect.top() + 48.0 + prompt_h + 22.0;
 
-        for (i, (opt, og)) in options.iter().zip(option_docs).enumerate() {
+        for (i, ((opt, og), note)) in options.iter().zip(option_docs).zip(&note_docs).enumerate() {
             let h = (og.height() + 22.0).max(40.0);
             let row = Rect::from_min_size(
                 Pos2::new(card_rect.left() + 24.0, y),
@@ -1726,6 +2095,19 @@ impl App {
                 action = Action::Pick(i, multi);
             }
             y += h + 8.0;
+
+            // Indented under the row it belongs to, in that row's verdict
+            // colour, so it reads as an annotation on the choice and not as a
+            // second explanation.
+            if let Some(note) = note {
+                note.paint(
+                    ui.painter(),
+                    Pos2::new(row.left() + NOTE_INDENT, y + NOTE_GAP - 8.0),
+                    label_col,
+                    1.0,
+                );
+                y += note.height() + NOTE_GAP;
+            }
         }
 
         if multi && !revealed {
@@ -1988,6 +2370,14 @@ const MATH_SAMPLES: &[(&str, &str)] = &[
     ("sum", r"$\sum_{k=0}^{n} a_k s^k = 0$"),
     ("integral", r"$\int_0^\infty e^{-st}f(t)\,dt$"),
     (
+        "iterated",
+        r"$\iint_D f(x,y)\,dA = \iiint_V \rho(x,y,z)\,dV$",
+    ),
+    (
+        "number sets",
+        r"$f: \mathbb{R}^2 \to \mathbb{R}, \quad n \in \mathbb{N}, \ z \in \mathbb{C}$",
+    ),
+    (
         "accents",
         r"$\dot{x} = Ax + Bu, \quad \ddot{x}, \hat{y}, \bar{u}, \vec{v}$",
     ),
@@ -2230,6 +2620,10 @@ fn answer_summary(ui: &mut egui::Ui, item: &Answered) {
                 Some(Response::MultipleChoice { selected }) => selected.clone(),
                 _ => Vec::new(),
             };
+            // Here the card is being studied rather than answered, so every
+            // note is shown: together they are a map of the mistakes the
+            // question was built to catch.
+            let notes = explain::option_notes(options, &selected, explain::NoteView::All);
             for (i, opt) in options.iter().enumerate() {
                 let chose = selected.contains(&i);
                 let colour = match (opt.correct, chose) {
@@ -2256,6 +2650,12 @@ fn answer_summary(ui: &mut egui::Ui, item: &Answered) {
                     );
                     explain::prose(ui, &opt.text, 14.5, colour);
                 });
+                if let Some(note) = notes[i] {
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(18.0);
+                        explain::prose(ui, note, 13.0, colour.gamma_multiply(0.75));
+                    });
+                }
             }
         }
     }
@@ -2474,8 +2874,10 @@ mod tests {
             prompt: r"Which value follows from $G(s)=\frac{1}{s+1}$?".into(),
             body: Body::MultipleChoice {
                 options: vec![
-                    idiosepius_core::Choice::new(r"$G(0)=1$", true),
-                    idiosepius_core::Choice::new(r"$G(0)=0$", false),
+                    idiosepius_core::Choice::new(r"$G(0)=1$", true)
+                        .with_note("Right — the pole does not contribute at DC."),
+                    idiosepius_core::Choice::new(r"$G(0)=0$", false)
+                        .with_note("That is $G(\\infty)$, not the DC gain."),
                 ],
                 multi: false,
             },
@@ -2549,12 +2951,55 @@ mod tests {
             None,
             None,
             false,
+            explain::NoteView::Hidden,
             None,
         );
 
         assert!(text.contains(r"$G(s)=\frac{1}{s+1}$"));
         assert!(text.contains("2. $G(0)=0$ [selected]"));
         assert!(!text.contains("Correct answer:"));
+        // A note names a wrong option, so it gives the answer away just as
+        // surely as the answer line does.
+        assert!(!text.contains("Note:"));
+    }
+
+    #[test]
+    fn feedback_shows_only_the_note_of_the_option_that_was_picked() {
+        let question = clipboard_question();
+        let facts = Facts::default();
+        let text = card_text(
+            &question,
+            Some("Modeling"),
+            &[],
+            Some(&Response::MultipleChoice { selected: vec![1] }),
+            Some(Grade::WRONG),
+            true,
+            explain::NoteView::Picked,
+            Some((&facts, Depth::Short)),
+        );
+
+        assert!(text.contains(r"Note: That is $G(\infty)$, not the DC gain."));
+        // The note on the option they did not choose is not their diagnosis.
+        assert!(!text.contains("the pole does not contribute at DC"));
+    }
+
+    #[test]
+    fn review_shows_every_note_because_the_card_is_being_studied() {
+        let question = clipboard_question();
+        let facts = Facts::default();
+        let text = card_text(
+            &question,
+            Some("Modeling"),
+            &[],
+            Some(&Response::MultipleChoice { selected: vec![1] }),
+            Some(Grade::WRONG),
+            true,
+            explain::NoteView::All,
+            Some((&facts, Depth::Short)),
+        );
+
+        assert!(text.contains("the pole does not contribute at DC"));
+        assert!(text.contains(r"That is $G(\infty)$, not the DC gain."));
     }
 
     #[test]
@@ -2568,6 +3013,7 @@ mod tests {
             Some(&Response::MultipleChoice { selected: vec![1] }),
             Some(Grade::WRONG),
             true,
+            explain::NoteView::Picked,
             Some((&facts, Depth::Short)),
         );
 
