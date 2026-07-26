@@ -59,6 +59,9 @@ pub struct App {
     pending_lesson_practice: Option<(Deck, Vec<Question>)>,
     /// A plot opened from any prompt or explanation at a readable size.
     plot_zoom: Option<Figure>,
+    /// Back operations asked for by the browser's History API. They are
+    /// applied through the same route as the on-screen button and Escape.
+    pending_back: usize,
     /// Development aid: render a few frames, save a PNG, quit. Lets the UI be
     /// checked headlessly (under Xvfb, in CI) instead of by eye.
     shot: Option<Shot>,
@@ -156,6 +159,8 @@ struct Lessons {
     read: HashSet<i64>,
     selected: Option<usize>,
     facts: Rc<Facts>,
+    /// Screenshot-only initial position; normal navigation leaves this empty.
+    initial_scroll: Option<f32>,
 }
 
 struct QuestionBank {
@@ -276,6 +281,49 @@ struct Review {
     back: Screen,
 }
 
+fn screen_depth(screen: &Screen) -> usize {
+    match screen {
+        Screen::Decks | Screen::MathCheck | Screen::PlotCheck => 0,
+        Screen::Course(_) | Screen::Summary(_) => 1,
+        Screen::Lessons(lessons) => 2 + usize::from(lessons.selected.is_some()),
+        Screen::Questions(_) | Screen::Progress(_) => 2,
+        Screen::Study(study) => match &study.route {
+            StudyRoute::Scheduled => 1,
+            StudyRoute::Single { back } | StudyRoute::Lesson { back, .. } => screen_depth(back) + 1,
+        },
+        Screen::Review(review) => screen_depth(&review.back) + 1,
+    }
+}
+
+fn screen_back_button(ui: &egui::Ui, full: Rect) -> bool {
+    let rect = Rect::from_min_size(
+        full.right_top() + Vec2::new(-52.0, 8.0),
+        Vec2::new(44.0, 44.0),
+    );
+    let response = ui
+        .interact(rect, Id::new("screen-back"), Sense::click())
+        .on_hover_text("Back");
+    let hot = response.hovered() || response.has_focus();
+    let colour = if hot {
+        Palette::ACCENT
+    } else {
+        Palette::TEXT_DIM
+    };
+    ui.painter()
+        .rect_filled(rect, 0, if hot { Palette::CARD } else { Palette::SURFACE });
+    ui.painter()
+        .rect_stroke(rect, 0, Stroke::new(1.0, colour), egui::StrokeKind::Inside);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "←",
+        text::title(),
+        colour,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Back"));
+    response.clicked()
+}
+
 impl App {
     pub fn new(ctx: &egui::Context, store: Store, shot: Option<Shot>) -> Self {
         crate::theme::install(ctx);
@@ -305,11 +353,14 @@ impl App {
             pending_question: None,
             pending_lesson_practice: None,
             plot_zoom: None,
+            pending_back: 0,
             shot,
         };
 
         // Jump straight to the screen being captured.
-        match app.shot.as_ref().and_then(|s| s.screen.clone()).as_deref() {
+        let screen_name = app.shot.as_ref().and_then(|s| s.screen.clone());
+        let screen_name = screen_name.as_deref();
+        match screen_name {
             None | Some("decks") => {}
             Some("math") => app.screen = Screen::MathCheck,
             Some("plots") => app.screen = Screen::PlotCheck,
@@ -329,14 +380,34 @@ impl App {
                     }
                 }
             }
-            Some("lesson") => {
+            Some("lesson" | "lesson-end") => {
                 if let Some(deck) = app.decks.first().cloned()
                     && let Some(mut screen) = app.lessons(deck)
                 {
                     if let Screen::Lessons(lessons) = &mut screen
                         && !lessons.lessons.is_empty()
                     {
-                        lessons.selected = Some(0);
+                        // `--card` pins a lesson capture the same way it pins
+                        // a question: by uid, so a screenshot of one reading
+                        // stays that reading when the pack grows.
+                        let wanted = app.shot.as_ref().and_then(|shot| shot.card.as_deref());
+                        lessons.selected = Some(
+                            wanted
+                                .and_then(|uid| lessons.lessons.iter().position(|l| l.uid == uid))
+                                .unwrap_or(0),
+                        );
+                        // The glossary and the practice row are at the foot of
+                        // a reading, so one capture has to start there; on a
+                        // reading proper, `--drag` scrolls to a figure the
+                        // same way it freezes a swipe — both are pixels.
+                        lessons.initial_scroll = match screen_name {
+                            Some("lesson-end") => Some(f32::MAX),
+                            _ => app
+                                .shot
+                                .as_ref()
+                                .map(|shot| shot.drag)
+                                .filter(|drag| *drag > 0.0),
+                        };
                     }
                     app.screen = screen;
                 }
@@ -435,6 +506,28 @@ impl App {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn take_request(&mut self) -> Option<Request> {
         self.request.take()
+    }
+
+    /// Number of browser-history steps represented by the current view.
+    ///
+    /// This is intentionally about navigation, not enum nesting: ending a
+    /// scheduled study session replaces it with its summary at the same depth,
+    /// while opening a lesson reader adds a step inside `Screen::Lessons`.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn navigation_depth(&self) -> usize {
+        let overlay = match self.import_view {
+            Some(ImportView::Sources) => 1,
+            Some(ImportView::Examples | ImportView::Github | ImportView::Loading) => 2,
+            None if self.plot_zoom.is_some() => 1,
+            None => 0,
+        };
+        screen_depth(&self.screen) + overlay
+    }
+
+    /// Queue browser Back presses for the next egui frame.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn request_back(&mut self, steps: usize) {
+        self.pending_back = self.pending_back.saturating_add(steps);
     }
 
     /// Say something short in the corner: an import landed, a file was written.
@@ -610,6 +703,12 @@ impl eframe::App for App {
         } else {
             false
         };
+        let escape_back = if self.plot_zoom.is_none() {
+            ui.ctx()
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        } else {
+            false
+        };
 
         // Move the screen out of `self` for the duration of the frame. The
         // screen owns a `Session`, which needs `&mut`, while the handlers also
@@ -636,6 +735,10 @@ impl eframe::App for App {
             Screen::Review(review) => self.review_screen(ui, review),
         };
         let mut screen = next.unwrap_or(screen);
+        let touch_back = screen_depth(&screen) > 0
+            && self.import_view.is_none()
+            && self.plot_zoom.is_none()
+            && screen_back_button(ui, ui.max_rect());
 
         // Opening a review needs the screen it was opened from, which only
         // exists here: the handler that asked for it is holding a borrow of it.
@@ -648,6 +751,16 @@ impl eframe::App for App {
         }
         if let Some((deck, questions)) = self.pending_lesson_practice.take() {
             screen = self.begin_lesson_practice(deck, questions, screen);
+        }
+
+        let mut back_steps = std::mem::take(&mut self.pending_back);
+        if escape_back || touch_back {
+            back_steps = back_steps.saturating_add(1);
+        }
+        for _ in 0..back_steps {
+            if !self.back_once(&mut screen) {
+                break;
+            }
         }
 
         // egui-winit translates Ctrl/Cmd+C into Event::Copy and deliberately
@@ -689,6 +802,54 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Apply one logical Back operation, regardless of whether it came from
+    /// Escape, the touch button, or browser history.
+    fn back_once(&mut self, screen: &mut Screen) -> bool {
+        match self.import_view {
+            Some(ImportView::Sources) => {
+                self.import_view = None;
+                self.import_error = None;
+                return true;
+            }
+            Some(ImportView::Examples | ImportView::Github) => {
+                self.import_view = Some(ImportView::Sources);
+                self.import_error = None;
+                return true;
+            }
+            // A repository request cannot be cancelled once fetch has begun.
+            Some(ImportView::Loading) => return false,
+            None => {}
+        }
+        if self.plot_zoom.take().is_some() {
+            return true;
+        }
+
+        let next = match screen {
+            Screen::Decks => None,
+            Screen::Course(_) => Some(Screen::Decks),
+            Screen::Lessons(lessons) if lessons.selected.is_some() => {
+                lessons.selected = None;
+                return true;
+            }
+            Screen::Lessons(lessons) => Some(Screen::Course(lessons.deck.clone())),
+            Screen::Questions(bank) => Some(Screen::Course(bank.deck.clone())),
+            Screen::Progress(progress) => Some(Screen::Course(progress.deck.clone())),
+            Screen::Study(study) => self.apply(study, Action::Quit),
+            Screen::Summary(_) => {
+                self.decks = self.store.decks().unwrap_or_default();
+                Some(Screen::Decks)
+            }
+            Screen::Review(review) => Some(std::mem::replace(&mut review.back, Screen::Decks)),
+            Screen::MathCheck | Screen::PlotCheck => Some(Screen::Decks),
+        };
+        if let Some(next) = next {
+            *screen = next;
+            true
+        } else {
+            false
+        }
+    }
+
     fn show_plot_zoom(&mut self, ctx: &egui::Context, close_requested: bool) {
         let Some(figure) = self.plot_zoom.clone() else {
             return;
@@ -710,12 +871,13 @@ impl App {
                 let (rect, _) = ui.allocate_exact_size(enlarged.size, Sense::hover());
                 enlarged.paint_rotated(ui.painter(), rect.min, rect.min, 0.0, 1.0);
                 ui.add_space(8.0);
-                ui.colored_label(
-                    Palette::TEXT_FAINT,
-                    tracked("esc or click outside to close"),
-                );
+                ui.add_sized(
+                    [ui.available_width(), 44.0],
+                    egui::Button::new(tracked("close")),
+                )
+                .clicked()
             });
-        if close_requested || modal.should_close() {
+        if close_requested || modal.should_close() || modal.inner {
             self.plot_zoom = None;
         }
     }
@@ -1318,13 +1480,15 @@ impl App {
             text::label(),
             Palette::TEXT_FAINT,
         );
-        ui.painter().text(
-            Pos2::new(panel.right(), panel.bottom() - 18.0),
-            Align2::RIGHT_BOTTOM,
-            tracked("ctrl ± size  ·  ctrl 0 reset"),
-            text::label(),
-            Palette::TEXT_FAINT,
-        );
+        if panel.width() >= 620.0 {
+            ui.painter().text(
+                Pos2::new(panel.right(), panel.bottom() - 18.0),
+                Align2::RIGHT_BOTTOM,
+                tracked("ctrl ± size  ·  ctrl 0 reset"),
+                text::label(),
+                Palette::TEXT_FAINT,
+            );
+        }
 
         next
     }
@@ -1340,34 +1504,37 @@ impl App {
         let stat = stats::deck_stats(&self.store, deck.id).unwrap_or_default();
         let lesson_count = self.store.lesson_count(deck.id).unwrap_or(0);
         let p = ui.painter();
+        let header_x = header_left(full, panel);
 
         p.text(
-            panel.left_top(),
+            Pos2::new(header_x, panel.top()),
             Align2::LEFT_TOP,
             tracked("course"),
             text::label(),
             Palette::TEXT_FAINT,
         );
         p.text(
-            panel.left_top() + Vec2::new(0.0, 26.0),
+            Pos2::new(header_x, panel.top() + 26.0),
             Align2::LEFT_TOP,
             &deck.title,
             text::title(),
             Palette::TEXT,
         );
+        if panel.width() >= 560.0 {
+            p.text(
+                Pos2::new(panel.right().min(full.right() - 64.0), panel.top() + 20.0),
+                Align2::RIGHT_TOP,
+                format!("{:.0}%", stat.readiness * 100.0),
+                text::number(),
+                if stat.readiness > 0.6 {
+                    Palette::CORRECT
+                } else {
+                    Palette::TEXT_DIM
+                },
+            );
+        }
         p.text(
-            panel.right_top() + Vec2::new(0.0, 20.0),
-            Align2::RIGHT_TOP,
-            format!("{:.0}%", stat.readiness * 100.0),
-            text::number(),
-            if stat.readiness > 0.6 {
-                Palette::CORRECT
-            } else {
-                Palette::TEXT_DIM
-            },
-        );
-        p.text(
-            panel.left_top() + Vec2::new(0.0, 60.0),
+            Pos2::new(header_x, panel.top() + 60.0),
             Align2::LEFT_TOP,
             format!(
                 "{} questions   {} new   {} due",
@@ -1384,58 +1551,69 @@ impl App {
             Stroke::new(1.0, Palette::LINE),
         );
 
-        let mut y = panel.top() + 112.0;
-        let lessons =
-            Rect::from_min_size(Pos2::new(panel.left(), y), Vec2::new(panel.width(), 86.0));
-        if navigation_row(
-            ui,
-            lessons,
-            ("course", deck.id, "lessons"),
-            "lessons",
-            "Learn or revisit the course in order.",
-            &format!("{lesson_count} readings"),
-        ) {
-            return self.lessons(deck.clone());
-        }
-        y += 98.0;
-
-        let questions =
-            Rect::from_min_size(Pos2::new(panel.left(), y), Vec2::new(panel.width(), 86.0));
-        if navigation_row(
-            ui,
-            questions,
-            ("course", deck.id, "questions"),
-            "questions",
-            "Browse the complete unlocked question bank.",
-            &format!("{} available", counts.total),
-        ) {
-            return self.question_bank(deck.clone());
-        }
-        y += 98.0;
-
-        let progress =
-            Rect::from_min_size(Pos2::new(panel.left(), y), Vec2::new(panel.width(), 86.0));
-        if navigation_row(
-            ui,
-            progress,
-            ("course", deck.id, "progress"),
-            "progress",
-            "Readiness, topic accuracy and weak questions.",
-            &format!("{} attempted", stat.attempted),
-        ) {
-            return self.progress(deck.clone());
+        let destinations = Rect::from_min_max(
+            panel.left_top() + Vec2::new(0.0, 100.0),
+            panel.right_bottom() - Vec2::new(0.0, 44.0),
+        );
+        let mut destination = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(destinations), |ui| {
+            ui.set_clip_rect(destinations);
+            egui::ScrollArea::vertical()
+                .id_salt(("course", deck.id))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(destinations.width() - 8.0);
+                    for (name, description, meta) in [
+                        (
+                            "lessons",
+                            "Learn or revisit the course in order.",
+                            format!("{lesson_count} readings"),
+                        ),
+                        (
+                            "questions",
+                            "Browse the complete unlocked question bank.",
+                            format!("{} available", counts.total),
+                        ),
+                        (
+                            "progress",
+                            "Readiness, topic accuracy and weak questions.",
+                            format!("{} attempted", stat.attempted),
+                        ),
+                    ] {
+                        let (row, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 86.0),
+                            Sense::hover(),
+                        );
+                        if navigation_row(
+                            ui,
+                            row,
+                            ("course", deck.id, name),
+                            name,
+                            description,
+                            &meta,
+                        ) {
+                            destination = Some(name);
+                        }
+                        ui.add_space(12.0);
+                    }
+                });
+        });
+        match destination {
+            Some("lessons") => return self.lessons(deck.clone()),
+            Some("questions") => return self.question_bank(deck.clone()),
+            Some("progress") => return self.progress(deck.clone()),
+            _ => {}
         }
 
         ui.painter().text(
             panel.left_bottom(),
             Align2::LEFT_BOTTOM,
-            tracked("esc back to decks"),
+            tracked("back is at top right"),
             text::label(),
             Palette::TEXT_FAINT,
         );
 
-        ui.input(|i| i.key_pressed(egui::Key::Escape))
-            .then_some(Screen::Decks)
+        None
     }
 
     fn lessons(&mut self, deck: Deck) -> Option<Screen> {
@@ -1462,6 +1640,7 @@ impl App {
             read,
             selected: None,
             facts,
+            initial_scroll: None,
         })))
     }
 
@@ -1481,29 +1660,32 @@ impl App {
             .iter()
             .filter(|lesson| screen.read.contains(&lesson.id))
             .count();
+        let header_x = header_left(full, panel);
         {
             let p = ui.painter();
             p.text(
-                panel.left_top(),
+                Pos2::new(header_x, panel.top()),
                 Align2::LEFT_TOP,
                 tracked("lessons"),
                 text::label(),
                 Palette::ACCENT,
             );
             p.text(
-                panel.left_top() + Vec2::new(0.0, 28.0),
+                Pos2::new(header_x, panel.top() + 28.0),
                 Align2::LEFT_TOP,
                 &screen.deck.title,
                 text::title(),
                 Palette::TEXT,
             );
-            p.text(
-                panel.right_top() + Vec2::new(0.0, 30.0),
-                Align2::RIGHT_TOP,
-                tracked(&format!("{read_count} / {} read", screen.lessons.len())),
-                text::label(),
-                Palette::TEXT_DIM,
-            );
+            if panel.width() >= 560.0 {
+                p.text(
+                    Pos2::new(panel.right().min(full.right() - 64.0), panel.top() + 30.0),
+                    Align2::RIGHT_TOP,
+                    tracked(&format!("{read_count} / {} read", screen.lessons.len())),
+                    text::label(),
+                    Palette::TEXT_DIM,
+                );
+            }
             p.line_segment(
                 [
                     panel.left_top() + Vec2::new(0.0, 68.0),
@@ -1586,13 +1768,12 @@ impl App {
         ui.painter().text(
             panel.left_bottom(),
             Align2::LEFT_BOTTOM,
-            tracked("esc back to course"),
+            tracked("back is at top right"),
             text::label(),
             Palette::TEXT_FAINT,
         );
 
-        ui.input(|i| i.key_pressed(egui::Key::Escape))
-            .then_some(Screen::Course(screen.deck.clone()))
+        None
     }
 
     fn lesson_reader(&mut self, ui: &mut egui::Ui, screen: &mut Lessons) -> Option<Screen> {
@@ -1609,17 +1790,18 @@ impl App {
             .get(&lesson.topic_id)
             .map(String::as_str)
             .unwrap_or("Uncategorised");
+        let header_x = header_left(full, panel);
         {
             let p = ui.painter();
             p.text(
-                panel.left_top(),
+                Pos2::new(header_x, panel.top()),
                 Align2::LEFT_TOP,
                 tracked(topic),
                 text::label(),
                 Palette::ACCENT,
             );
             p.text(
-                panel.left_top() + Vec2::new(0.0, 26.0),
+                Pos2::new(header_x, panel.top() + 26.0),
                 Align2::LEFT_TOP,
                 &lesson.title,
                 text::title(),
@@ -1638,17 +1820,26 @@ impl App {
             panel.left_top() + Vec2::new(0.0, 80.0),
             panel.right_bottom() - Vec2::new(0.0, 28.0),
         );
+        let requested_scroll = screen.initial_scroll.take();
         ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
             ui.set_clip_rect(body_rect);
             egui::ScrollArea::vertical()
                 .id_salt(("lesson-reader", lesson.id))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    if let Some(offset) = requested_scroll {
+                        ui.scroll_with_delta(Vec2::new(0.0, -offset));
+                    }
                     ui.set_width(body_rect.width() - 12.0);
                     explain::prose(ui, &lesson.summary, 15.0, Palette::TEXT_DIM);
                     ui.add_space(14.0);
                     for block in &lesson.body {
                         lesson_block(ui, block, &screen.facts);
+                        ui.add_space(12.0);
+                    }
+                    // The same glossary a deep reading gets: a lesson uses
+                    // more notation than any one card does, not less.
+                    if explain::glossary(ui, &explain::lesson_symbols(&lesson, &screen.facts)) {
                         ui.add_space(12.0);
                     }
                     if let Some(source) = &lesson.source {
@@ -1717,14 +1908,11 @@ impl App {
         ui.painter().text(
             panel.left_bottom(),
             Align2::LEFT_BOTTOM,
-            tracked("esc back to lessons"),
+            tracked("back is at top right"),
             text::label(),
             Palette::TEXT_FAINT,
         );
 
-        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-            screen.selected = None;
-        }
         None
     }
 
@@ -1779,6 +1967,8 @@ impl App {
     }
 
     fn questions_screen(&mut self, ui: &mut egui::Ui, bank: &mut QuestionBank) -> Option<Screen> {
+        const GROUP_HEADER_HEIGHT: f32 = 44.0;
+
         struct Group {
             topic_id: Option<i64>,
             title: String,
@@ -1792,27 +1982,30 @@ impl App {
             Vec2::new(full.width().min(720.0), full.height() - 24.0),
         );
         let p = ui.painter();
+        let header_x = header_left(full, panel);
         p.text(
-            panel.left_top(),
+            Pos2::new(header_x, panel.top()),
             Align2::LEFT_TOP,
             tracked("question bank"),
             text::label(),
             Palette::ACCENT,
         );
         p.text(
-            panel.left_top() + Vec2::new(0.0, 26.0),
+            Pos2::new(header_x, panel.top() + 26.0),
             Align2::LEFT_TOP,
             &bank.deck.title,
             text::title(),
             Palette::TEXT,
         );
-        p.text(
-            panel.right_top() + Vec2::new(0.0, 30.0),
-            Align2::RIGHT_TOP,
-            tracked(&format!("{} unlocked", bank.questions.len())),
-            text::label(),
-            Palette::TEXT_DIM,
-        );
+        if panel.width() >= 560.0 {
+            p.text(
+                Pos2::new(panel.right().min(full.right() - 64.0), panel.top() + 30.0),
+                Align2::RIGHT_TOP,
+                tracked(&format!("{} unlocked", bank.questions.len())),
+                text::label(),
+                Palette::TEXT_DIM,
+            );
+        }
         p.line_segment(
             [
                 panel.left_top() + Vec2::new(0.0, 66.0),
@@ -1821,12 +2014,15 @@ impl App {
             Stroke::new(1.0, Palette::LINE),
         );
 
+        let compact_filters = panel.width() < 560.0;
+        let filters_height = if compact_filters { 100.0 } else { 52.0 };
         let filters_rect = Rect::from_min_max(
             panel.left_top() + Vec2::new(0.0, 74.0),
-            panel.right_top() + Vec2::new(0.0, 106.0),
+            panel.right_top() + Vec2::new(0.0, 74.0 + filters_height),
         );
         ui.scope_builder(egui::UiBuilder::new().max_rect(filters_rect), |ui| {
-            ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+            ui.horizontal_wrapped(|ui| {
                 ui.label(
                     egui::RichText::new("SHOW")
                         .font(text::label())
@@ -1863,7 +2059,7 @@ impl App {
         }
 
         let body = Rect::from_min_max(
-            panel.left_top() + Vec2::new(0.0, 112.0),
+            panel.left_top() + Vec2::new(0.0, 80.0 + filters_height),
             panel.right_bottom() - Vec2::new(0.0, 34.0),
         );
         let mut open = None;
@@ -1879,7 +2075,7 @@ impl App {
                     .id_salt("question-bank")
                     .auto_shrink([false, false])
                     .scroll_bar_rect(Rect::from_min_max(
-                        body.left_top() + Vec2::new(0.0, 31.0),
+                        body.left_top() + Vec2::new(0.0, GROUP_HEADER_HEIGHT),
                         body.right_bottom(),
                     ));
                 let requested_scroll = bank.initial_scroll.take();
@@ -1897,7 +2093,7 @@ impl App {
                         }
 
                         let (heading, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), 31.0),
+                            Vec2::new(ui.available_width(), GROUP_HEADER_HEIGHT),
                             Sense::hover(),
                         );
                         let collapsed = bank.collapsed.contains(&group.topic_id);
@@ -1992,7 +2188,10 @@ impl App {
         // Paint this after the scroll contents so it stays above them. Its
         // button is the same collapse control as the in-flow group header.
         if let Some((topic_id, title, count)) = sticky_group {
-            let sticky = Rect::from_min_size(body.left_top(), Vec2::new(body.width() - 10.0, 31.0));
+            let sticky = Rect::from_min_size(
+                body.left_top(),
+                Vec2::new(body.width() - 10.0, GROUP_HEADER_HEIGHT),
+            );
             let collapsed = bank.collapsed.contains(&topic_id);
             if question_group_header(
                 ui,
@@ -2007,7 +2206,10 @@ impl App {
             }
         } else if body.is_positive() {
             ui.painter().rect_filled(
-                Rect::from_min_size(body.left_top(), Vec2::new(body.width() - 10.0, 31.0)),
+                Rect::from_min_size(
+                    body.left_top(),
+                    Vec2::new(body.width() - 10.0, GROUP_HEADER_HEIGHT),
+                ),
                 0,
                 Palette::BG,
             );
@@ -2035,13 +2237,12 @@ impl App {
         ui.painter().text(
             panel.left_bottom(),
             Align2::LEFT_BOTTOM,
-            tracked("esc back  ·  click a question to answer it"),
+            tracked("tap a question to answer it"),
             text::label(),
             Palette::TEXT_FAINT,
         );
 
-        ui.input(|i| i.key_pressed(egui::Key::Escape))
-            .then_some(Screen::Course(bank.deck.clone()))
+        None
     }
 
     fn progress(&mut self, deck: Deck) -> Option<Screen> {
@@ -2081,29 +2282,32 @@ impl App {
         );
         let stat = &progress.deck_stats;
         let p = ui.painter();
+        let header_x = header_left(full, panel);
         p.text(
-            panel.left_top(),
+            Pos2::new(header_x, panel.top()),
             Align2::LEFT_TOP,
             tracked("progress"),
             text::label(),
             Palette::ACCENT,
         );
         p.text(
-            panel.left_top() + Vec2::new(0.0, 26.0),
+            Pos2::new(header_x, panel.top() + 26.0),
             Align2::LEFT_TOP,
             &progress.deck.title,
             text::title(),
             Palette::TEXT,
         );
+        if panel.width() >= 560.0 {
+            p.text(
+                Pos2::new(panel.right().min(full.right() - 64.0), panel.top() + 18.0),
+                Align2::RIGHT_TOP,
+                format!("{:.0}%", stat.readiness * 100.0),
+                text::number(),
+                Palette::ACCENT,
+            );
+        }
         p.text(
-            panel.right_top() + Vec2::new(0.0, 18.0),
-            Align2::RIGHT_TOP,
-            format!("{:.0}%", stat.readiness * 100.0),
-            text::number(),
-            Palette::ACCENT,
-        );
-        p.text(
-            panel.left_top() + Vec2::new(0.0, 58.0),
+            Pos2::new(header_x, panel.top() + 58.0),
             Align2::LEFT_TOP,
             format!(
                 "{} / {} attempted   {:.0}% accuracy",
@@ -2189,7 +2393,7 @@ impl App {
             }
             for (index, weak) in progress.weakest.iter().enumerate() {
                 let response = ui.add_sized(
-                    [ui.available_width(), 40.0],
+                    [ui.available_width(), 44.0],
                     egui::Button::new("").frame(false),
                 );
                 let hot = response.hovered() || response.has_focus();
@@ -2228,7 +2432,7 @@ impl App {
         ui.painter().text(
             panel.left_bottom(),
             Align2::LEFT_BOTTOM,
-            tracked("esc back to course"),
+            tracked("back is at top right"),
             text::label(),
             Palette::TEXT_FAINT,
         );
@@ -2252,8 +2456,7 @@ impl App {
             );
         }
 
-        ui.input(|i| i.key_pressed(egui::Key::Escape))
-            .then_some(Screen::Course(progress.deck.clone()))
+        None
     }
 
     fn begin(&mut self, deck: Deck, mode: Mode) -> Option<Screen> {
@@ -2564,35 +2767,41 @@ impl App {
 
         if study.feedback.is_none() {
             match study.current.clone() {
-                Some(q) => {
-                    let card_width = stage.width().min(560.0) - 40.0;
-                    let text_size = if q.prompt_text().chars().count() > 180 {
-                        16.5
-                    } else {
-                        19.0
-                    };
-                    let prompt_height =
-                        blocks::layout(ui.painter(), &q.prompt, text_size, card_width - 56.0)
-                            .height();
-                    // The footer and top chrome need about 120 points around the
-                    // content. Measuring the actual sequence lets a second plot
-                    // grow the card just as another paragraph does.
-                    let card_height = (prompt_height + 120.0).max(400.0);
-                    let card_rect = Rect::from_center_size(
-                        stage.center(),
-                        Vec2::new(card_width, stage.height().min(card_height + 20.0) - 20.0),
-                    );
-                    match &q.body {
-                        Body::TrueFalse { .. } => {
-                            action = self.true_false_card(ui, study, &q, card_rect, full);
-                        }
-                        Body::MultipleChoice { options, multi } => {
-                            let opts = options.clone();
-                            let multi = *multi;
-                            action = self.choice_card(ui, study, &q, &opts, multi, stage);
-                        }
+                Some(q) => match &q.body {
+                    Body::TrueFalse { .. } => {
+                        const ANSWER_HEIGHT: f32 = 48.0;
+                        const ANSWER_GAP: f32 = 12.0;
+                        let card_width = stage.width().min(560.0) - 40.0;
+                        let text_size = if q.prompt_text().chars().count() > 180 {
+                            16.5
+                        } else {
+                            19.0
+                        };
+                        let prompt_height =
+                            blocks::layout(ui.painter(), &q.prompt, text_size, card_width - 56.0)
+                                .height();
+                        let card_height = (prompt_height + 120.0).max(400.0);
+                        let mut card_stage = stage;
+                        card_stage.set_bottom(stage.bottom() - ANSWER_GAP - ANSWER_HEIGHT);
+                        let card_rect = Rect::from_center_size(
+                            card_stage.center(),
+                            Vec2::new(
+                                card_width,
+                                card_stage.height().min(card_height + 20.0) - 20.0,
+                            ),
+                        );
+                        let controls = Rect::from_min_size(
+                            Pos2::new(card_rect.left() + 18.0, card_rect.bottom() + ANSWER_GAP),
+                            Vec2::new(card_rect.width() - 36.0, ANSWER_HEIGHT),
+                        );
+                        action = self.true_false_card(ui, study, &q, card_rect, controls);
                     }
-                }
+                    Body::MultipleChoice { options, multi } => {
+                        let opts = options.clone();
+                        let multi = *multi;
+                        action = self.choice_card(ui, study, &q, &opts, multi, stage);
+                    }
+                },
                 None => {
                     ui.painter().text(
                         stage.center(),
@@ -2643,9 +2852,6 @@ impl App {
     fn keys(&mut self, ctx: &egui::Context, study: &Study) -> Option<Action> {
         ctx.input(|i| {
             use egui::Key::*;
-            if i.key_pressed(Escape) {
-                return Some(Action::Quit);
-            }
             if study.feedback.is_some() {
                 if i.key_pressed(D) {
                     return Some(Action::Deeper);
@@ -3025,13 +3231,15 @@ fn chrome(ui: &egui::Ui, study: &Study, full: Rect, coin: &mut CoinAnimation) {
 
     let p = ui.painter();
 
-    p.text(
-        top.left_center() + Vec2::new(54.0, 0.0),
-        Align2::LEFT_CENTER,
-        &study.deck.title,
-        text::label(),
-        Palette::TEXT_DIM,
-    );
+    if full.width() >= 620.0 {
+        p.text(
+            top.left_center() + Vec2::new(54.0, 0.0),
+            Align2::LEFT_CENTER,
+            &study.deck.title,
+            text::label(),
+            Palette::TEXT_DIM,
+        );
+    }
 
     let acc = if study.answered > 0 {
         study.correct as f32 / study.answered as f32
@@ -3039,7 +3247,12 @@ fn chrome(ui: &egui::Ui, study: &Study, full: Rect, coin: &mut CoinAnimation) {
         0.0
     };
     p.text(
-        top.center(),
+        if full.width() < 520.0 {
+            let fraction = if full.width() < 360.0 { 0.30 } else { 0.36 };
+            Pos2::new(full.left() + full.width() * fraction, top.center().y)
+        } else {
+            top.center()
+        },
         Align2::CENTER_CENTER,
         format!("{} / {}", study.correct, study.answered),
         text::title(),
@@ -3057,10 +3270,18 @@ fn chrome(ui: &egui::Ui, study: &Study, full: Rect, coin: &mut CoinAnimation) {
         _ => format!("{} due", study.counts.due + study.counts.fresh),
     };
     p.text(
-        top.right_center() + Vec2::new(-22.0, 0.0),
+        top.right_center() + Vec2::new(-66.0, 0.0),
         Align2::RIGHT_CENTER,
-        tracked(&right),
-        text::label(),
+        if full.width() < 520.0 {
+            right
+        } else {
+            tracked(&right)
+        },
+        if full.width() < 520.0 {
+            text::small()
+        } else {
+            text::label()
+        },
         Palette::ACCENT,
     );
 
@@ -3182,6 +3403,14 @@ fn corner_coin(ui: &egui::Ui, full: Rect, coin: &mut CoinAnimation, id: &'static
     coin.paint(ui, rect);
 }
 
+fn header_left(full: Rect, panel: Rect) -> f32 {
+    if panel.top() < full.top() + 56.0 && panel.left() < full.left() + 56.0 {
+        full.left() + 56.0
+    } else {
+        panel.left()
+    }
+}
+
 enum DeckRowAction {
     None,
     Open,
@@ -3285,31 +3514,33 @@ fn deck_row(
     let mut filled = bar;
     filled.set_width(bar.width() * stat.readiness as f32);
     p.rect_filled(filled, 0, Palette::ACCENT);
-    p.text(
-        open.right_top() + Vec2::new(-18.0, 16.0),
-        Align2::RIGHT_TOP,
-        format!("{:.0}%", stat.readiness * 100.0),
-        text::number(),
-        if stat.readiness > 0.6 {
-            Palette::CORRECT
-        } else {
-            Palette::TEXT_DIM
-        },
-    );
-    if let Some(exam) = deck.exam_at {
-        let left = exam - now_ms();
-        let (label, colour) = if left > 0 {
-            (format!("exam in {}", fmt_span(left)), Palette::ACCENT)
-        } else {
-            ("exam passed".to_owned(), Palette::TEXT_FAINT)
-        };
+    if row.width() >= 520.0 {
         p.text(
-            open.right_top() + Vec2::new(-18.0, 52.0),
+            open.right_top() + Vec2::new(-18.0, 16.0),
             Align2::RIGHT_TOP,
-            tracked(&label),
-            text::label(),
-            colour,
+            format!("{:.0}%", stat.readiness * 100.0),
+            text::number(),
+            if stat.readiness > 0.6 {
+                Palette::CORRECT
+            } else {
+                Palette::TEXT_DIM
+            },
         );
+        if let Some(exam) = deck.exam_at {
+            let left = exam - now_ms();
+            let (label, colour) = if left > 0 {
+                (format!("exam in {}", fmt_span(left)), Palette::ACCENT)
+            } else {
+                ("exam passed".to_owned(), Palette::TEXT_FAINT)
+            };
+            p.text(
+                open.right_top() + Vec2::new(-18.0, 52.0),
+                Align2::RIGHT_TOP,
+                tracked(&label),
+                text::label(),
+                colour,
+            );
+        }
     }
     paint_dice(p, quick.shrink(25.0), quick_hot);
 
@@ -3323,16 +3554,31 @@ fn deck_row(
 }
 
 fn question_filter(ui: &mut egui::Ui, value: &mut bool, label: &str) {
-    ui.checkbox(
-        value,
-        egui::RichText::new(label.to_uppercase())
-            .font(text::label())
-            .color(if *value {
-                Palette::TEXT
-            } else {
-                Palette::TEXT_FAINT
-            }),
-    );
+    let label = tracked(label);
+    let width = ui
+        .painter()
+        .layout_no_wrap(label.clone(), text::label(), Palette::TEXT)
+        .rect
+        .width()
+        + 24.0;
+    if ui
+        .add_sized(
+            [width, 44.0],
+            egui::Button::new(
+                egui::RichText::new(label)
+                    .font(text::label())
+                    .color(if *value {
+                        Palette::TEXT
+                    } else {
+                        Palette::TEXT_FAINT
+                    }),
+            )
+            .selected(*value),
+        )
+        .clicked()
+    {
+        *value = !*value;
+    }
 }
 
 fn question_group_header(
@@ -3433,7 +3679,16 @@ fn lesson_heading(ui: &mut egui::Ui, heading: &str) {
 }
 
 fn lesson_row(ui: &mut egui::Ui, lesson: &Lesson, read: bool) -> bool {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 102.0), Sense::hover());
+    let width = ui.available_width();
+    let compact = width < 520.0;
+    let summary_width = if compact {
+        (width - 36.0).max(80.0)
+    } else {
+        (width - 170.0).max(80.0)
+    };
+    let summary = richtext::layout(ui.painter(), &lesson.summary, 12.5, summary_width);
+    let height = (summary.height() + 78.0).max(102.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
     let response = ui
         .push_id(("lesson-row", lesson.id), |ui| {
             ui.put(
@@ -3468,19 +3723,19 @@ fn lesson_row(ui: &mut egui::Ui, lesson: &Lesson, read: bool) -> bool {
         text::body(),
         if hot { Palette::ACCENT } else { Palette::TEXT },
     );
-    p.text(
-        rect.right_top() + Vec2::new(-16.0, 17.0),
-        Align2::RIGHT_TOP,
-        tracked(if read { "read" } else { "unread" }),
-        text::label(),
-        if read {
-            Palette::CORRECT
-        } else {
-            Palette::TEXT_FAINT
-        },
-    );
-    let summary_width = (rect.width() - 170.0).max(80.0);
-    let summary = richtext::layout(p, &lesson.summary, 12.5, summary_width);
+    if !compact {
+        p.text(
+            rect.right_top() + Vec2::new(-16.0, 17.0),
+            Align2::RIGHT_TOP,
+            tracked(if read { "read" } else { "unread" }),
+            text::label(),
+            if read {
+                Palette::CORRECT
+            } else {
+                Palette::TEXT_FAINT
+            },
+        );
+    }
     summary.paint(
         p,
         rect.left_top() + Vec2::new(18.0, 44.0),
@@ -3589,6 +3844,23 @@ fn lesson_text(lesson: &Lesson, facts: &Facts) -> String {
             }
         }
     }
+
+    let symbols = explain::lesson_symbols(lesson, facts);
+    if !symbols.is_empty() {
+        let mut glossary = String::from("Symbols");
+        for fact in symbols {
+            let _ = write!(glossary, "\n\n{}", fact.label.clone().unwrap_or_default());
+            if let Some(name) = &fact.name {
+                let _ = write!(glossary, " ({name})");
+            }
+            let body = content_transcript(&fact.body);
+            if !body.is_empty() {
+                let _ = write!(glossary, "\n{body}");
+            }
+        }
+        parts.push(glossary);
+    }
+
     parts.join("\n\n")
 }
 
@@ -3636,24 +3908,39 @@ fn navigation_row(
         text::label(),
         if hot { Palette::ACCENT } else { Palette::TEXT },
     );
-    p.text(
+    let description_width = if rect.width() < 380.0 {
+        rect.width() - 40.0
+    } else {
+        (rect.width() - 230.0).max(220.0)
+    };
+    let description = richtext::layout(p, description, 12.5, description_width);
+    description.paint(
+        p,
         rect.left_top() + Vec2::new(20.0, 44.0),
-        Align2::LEFT_TOP,
-        description,
-        text::small(),
         Palette::TEXT_DIM,
+        1.0,
     );
-    p.text(
-        rect.right_center() - Vec2::new(18.0, 0.0),
-        Align2::RIGHT_CENTER,
-        tracked(meta),
-        text::label(),
-        if hot {
-            Palette::ACCENT
-        } else {
-            Palette::TEXT_FAINT
-        },
-    );
+    if rect.width() >= 380.0 {
+        p.text(
+            if rect.width() < 520.0 {
+                rect.right_top() + Vec2::new(-18.0, 17.0)
+            } else {
+                rect.right_center() - Vec2::new(18.0, 0.0)
+            },
+            if rect.width() < 520.0 {
+                Align2::RIGHT_TOP
+            } else {
+                Align2::RIGHT_CENTER
+            },
+            tracked(meta),
+            text::label(),
+            if hot {
+                Palette::ACCENT
+            } else {
+                Palette::TEXT_FAINT
+            },
+        );
+    }
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     response.clicked()
 }
@@ -3743,7 +4030,7 @@ fn chrome_button(ui: &egui::Ui, right_top: Pos2, label: &str) -> bool {
         .rect
         .width()
         + 28.0;
-    let rect = Rect::from_min_size(right_top - Vec2::new(width, 0.0), Vec2::new(width, 30.0));
+    let rect = Rect::from_min_size(right_top - Vec2::new(width, 0.0), Vec2::new(width, 44.0));
     let response = ui.interact(rect, Id::new(("chrome-button", label)), Sense::click());
     let colour = if response.hovered() {
         Palette::ACCENT
@@ -3787,11 +4074,61 @@ fn fmt_ms(ms: i64) -> String {
 
 // ------------------------------------------------------------- card views --
 
-/// Left inset of an option note, chosen to line up with the option text
-/// rather than with the row edge or the index box.
-const NOTE_INDENT: f32 = 48.0;
-/// Air between an option row and the note hanging under it.
-const NOTE_GAP: f32 = 10.0;
+fn choice_option_row(
+    ui: &mut egui::Ui,
+    row: Rect,
+    question_id: i64,
+    index: usize,
+    doc: &richtext::Doc,
+    picked: bool,
+) -> bool {
+    let response = ui.interact(row, Id::new(("opt", question_id, index)), Sense::click());
+    let hot = response.hovered() || response.has_focus();
+    let hover = ui
+        .ctx()
+        .animate_bool(Id::new(("opt-hover", question_id, index)), hot);
+    let (border, fill, label_col) = if picked {
+        (
+            Palette::ACCENT,
+            Palette::ACCENT.gamma_multiply(0.10),
+            Palette::ACCENT,
+        )
+    } else if hot {
+        (Palette::LINE_BRIGHT, Palette::SURFACE, Palette::TEXT)
+    } else {
+        (Palette::LINE, Color32::TRANSPARENT, Palette::TEXT)
+    };
+
+    let painter = ui.painter();
+    if fill != Color32::TRANSPARENT {
+        painter.rect_filled(row, 0, fill);
+    }
+    painter.rect_stroke(
+        row,
+        0,
+        Stroke::new(1.0 + 0.7 * hover, border),
+        egui::StrokeKind::Inside,
+    );
+    let key_box = Rect::from_min_size(row.left_top(), Vec2::new(34.0, row.height()));
+    painter.line_segment(
+        [key_box.right_top(), key_box.right_bottom()],
+        Stroke::new(1.0, border),
+    );
+    painter.text(
+        key_box.center(),
+        Align2::CENTER_CENTER,
+        format!("{}", index + 1),
+        text::label(),
+        label_col,
+    );
+    doc.paint(
+        painter,
+        row.left_top() + Vec2::new(48.0, 11.0),
+        label_col,
+        1.0,
+    );
+    response.clicked()
+}
 
 impl App {
     fn true_false_card(
@@ -3800,19 +4137,38 @@ impl App {
         study: &mut Study,
         q: &Question,
         rect: Rect,
-        full: Rect,
+        controls: Rect,
     ) -> Action {
         let mut action = Action::None;
-        let mut primary_clicked = false;
-        let mut secondary_clicked = false;
+        let mut false_clicked = false;
+        let mut true_clicked = false;
+        let mut false_hot = false;
+        let mut true_hot = false;
         let interactive = study.feedback.is_none() && !study.motion.is_flying();
         let mut hovered = false;
 
         if interactive {
+            let false_button = Rect::from_min_max(
+                controls.left_top(),
+                Pos2::new(controls.center().x - 3.0, controls.bottom()),
+            );
+            let true_button = Rect::from_min_max(
+                Pos2::new(controls.center().x + 3.0, controls.top()),
+                controls.right_bottom(),
+            );
+            let false_response =
+                ui.interact(false_button, Id::new(("tf-false", q.id)), Sense::click());
+            let true_response =
+                ui.interact(true_button, Id::new(("tf-true", q.id)), Sense::click());
+            false_clicked = false_response.clicked();
+            true_clicked = true_response.clicked();
+            false_hot = false_response.hovered() || false_response.has_focus();
+            true_hot = true_response.hovered() || true_response.has_focus();
+
             let resp = ui.interact(
                 rect.translate(study.motion.offset),
                 Id::new(("tf", q.id)),
-                Sense::click_and_drag(),
+                Sense::drag(),
             );
             hovered = resp.hovered();
 
@@ -3845,14 +4201,6 @@ impl App {
                         );
                     }
                 }
-            }
-
-            // Mouse without dragging: left click = false, right click = true.
-            if resp.clicked() {
-                primary_clicked = true;
-            }
-            if resp.secondary_clicked() {
-                secondary_clicked = true;
             }
         }
 
@@ -3945,36 +4293,80 @@ impl App {
         };
         let prompt = blocks::layout(&p, &q.prompt, size, wrap);
         let content_top = drawn.top() + 52.0;
-        let content_bottom = drawn.bottom() - 58.0;
+        let content_bottom = drawn.bottom() - 28.0;
         let centered = drawn.center().y - prompt.height() / 2.0 - 6.0;
         let local_y = centered
             .max(content_top)
             .min((content_bottom - prompt.height()).max(content_top));
         let local = Pos2::new(drawn.left() + 28.0, local_y);
         prompt.paint_rotated(&p, local, pivot, angle, Palette::TEXT, opacity);
-        let plot_clicked =
-            prompt.interact_figures(ui, local, pivot, angle, Id::new(("tf-plot", q.id)));
+        prompt.interact_figures(ui, local, pivot, angle, Id::new(("tf-plot", q.id)));
 
-        if !plot_clicked && primary_clicked {
+        // The swipe directions are also explicit touch targets in their own
+        // row directly below the physical card.
+        let false_button = Rect::from_min_max(
+            controls.left_top(),
+            Pos2::new(controls.center().x - 3.0, controls.bottom()),
+        );
+        let true_button = Rect::from_min_max(
+            Pos2::new(controls.center().x + 3.0, controls.top()),
+            controls.right_bottom(),
+        );
+        for (button, colour, hot) in [
+            (false_button, Palette::VIOLET, false_hot),
+            (true_button, Palette::ACCENT, true_hot),
+        ] {
+            p.rect_filled(
+                button,
+                0,
+                colour
+                    .gamma_multiply(if hot { 0.18 } else { 0.08 })
+                    .gamma_multiply(opacity),
+            );
+            p.rect_stroke(
+                button,
+                0,
+                Stroke::new(
+                    if hot { 2.0 } else { 1.0 },
+                    colour
+                        .gamma_multiply(if hot { 1.0 } else { 0.72 })
+                        .gamma_multiply(opacity),
+                ),
+                egui::StrokeKind::Inside,
+            );
+        }
+        p.text(
+            false_button.center(),
+            Align2::CENTER_CENTER,
+            "◀  FALSE",
+            text::label(),
+            if false_hot {
+                Palette::VIOLET
+            } else {
+                Palette::TEXT_DIM
+            }
+            .gamma_multiply(opacity),
+        );
+        p.text(
+            true_button.center(),
+            Align2::CENTER_CENTER,
+            "TRUE  ▶",
+            text::label(),
+            if true_hot {
+                Palette::ACCENT
+            } else {
+                Palette::TEXT_DIM
+            }
+            .gamma_multiply(opacity),
+        );
+
+        if false_clicked {
             study.motion.launch(-1.0);
             action = Action::Answer(Response::TrueFalse { value: false }, Input::Click);
-        }
-        if !plot_clicked && secondary_clicked {
+        } else if true_clicked {
             study.motion.launch(1.0);
             action = Action::Answer(Response::TrueFalse { value: true }, Input::Click);
         }
-
-        // Footer rail with the two directions.
-        card::text_centered(
-            &p,
-            pivot,
-            angle,
-            drawn.center_bottom() - Vec2::new(0.0, 30.0),
-            "◀  FALSE          TRUE  ▶",
-            text::label(),
-            Palette::TEXT_FAINT.gamma_multiply(1.0 - progress.abs()),
-            opacity,
-        );
 
         card::stamp(
             &p,
@@ -3995,7 +4387,6 @@ impl App {
             progress.max(0.0),
         );
 
-        let _ = full;
         action
     }
 
@@ -4010,8 +4401,6 @@ impl App {
         stage: Rect,
     ) -> Action {
         let mut action = Action::None;
-        let revealed = study.feedback.is_some();
-
         let width = stage.width().min(660.0);
         let wrap = width - 48.0;
 
@@ -4022,45 +4411,12 @@ impl App {
             .iter()
             .map(|o| richtext::layout(ui.painter(), &o.text, 15.0, wrap - 54.0))
             .collect();
-
-        // A note diagnoses the option it sits under, so it is laid out with
-        // that row and grows the card, rather than being appended to the
-        // explanation panel — which says what is true, not what went wrong.
-        // Before the card is answered there is nothing to show: a note names a
-        // wrong option and would give the answer away.
-        let picked_options: Vec<usize> = match study
-            .feedback
-            .as_ref()
-            .and_then(|feedback| feedback.response.as_ref())
-        {
-            Some(Response::MultipleChoice { selected }) => selected.clone(),
-            _ => Vec::new(),
-        };
-        let note_docs: Vec<Option<_>> = explain::option_notes(
-            options,
-            &picked_options,
-            if revealed {
-                explain::NoteView::Picked
-            } else {
-                explain::NoteView::Hidden
-            },
-        )
-        .into_iter()
-        .map(|note| {
-            note.map(|note| richtext::layout(ui.painter(), note, 13.5, wrap - NOTE_INDENT - 12.0))
-        })
-        .collect();
-
         let options_h: f32 = option_docs
             .iter()
-            .zip(&note_docs)
-            .map(|(d, note)| {
-                (d.height() + 22.0).max(40.0)
-                    + 8.0
-                    + note.as_ref().map_or(0.0, |n| n.height() + NOTE_GAP)
-            })
+            .map(|doc| (doc.height() + 22.0).max(44.0) + 8.0)
             .sum();
         let content_h = 48.0 + prompt.height() + 22.0 + options_h + 20.0;
+        let needs_scroll = content_h > stage.height();
 
         let card_rect = Rect::from_center_size(
             stage.center(),
@@ -4068,7 +4424,7 @@ impl App {
         );
 
         let opacity = study.motion.opacity();
-        let p = ui.painter();
+        let p = ui.painter().clone();
         p.rect_filled(card_rect, 0, Palette::CARD.gamma_multiply(opacity));
         p.rect_stroke(
             card_rect,
@@ -4099,117 +4455,78 @@ impl App {
             );
         }
 
-        let prompt_h = prompt.height();
-        prompt.paint(
-            p,
-            card_rect.left_top() + Vec2::new(24.0, 48.0),
-            Palette::TEXT,
-            opacity,
-        );
-        prompt.interact_figures(
-            ui,
-            card_rect.left_top() + Vec2::new(24.0, 48.0),
-            card_rect.center(),
-            0.0,
-            Id::new(("choice-plot", q.id)),
-        );
-
-        let mut y = card_rect.top() + 48.0 + prompt_h + 22.0;
-
-        for (i, ((opt, og), note)) in options.iter().zip(option_docs).zip(&note_docs).enumerate() {
-            let h = (og.height() + 22.0).max(40.0);
-            let row = Rect::from_min_size(
-                Pos2::new(card_rect.left() + 24.0, y),
-                Vec2::new(card_rect.width() - 48.0, h),
+        if needs_scroll {
+            // Only cards that have exhausted the stage get an inner viewport.
+            // Keeping ordinary cards out of a ScrollArea avoids both phantom
+            // scroll bars and content moving under the fixed topic header.
+            let body_rect = Rect::from_min_max(
+                card_rect.left_top() + Vec2::new(18.0, 46.0),
+                card_rect.right_bottom() - Vec2::new(8.0, 10.0),
             );
-
-            let picked = study.selected.contains(&i);
-            let resp = if revealed {
-                None
-            } else {
-                Some(ui.interact(row, Id::new(("opt", q.id, i)), Sense::click()))
-            };
-            let hot = resp.as_ref().is_some_and(|r| r.hovered());
-            let hover = ui.ctx().animate_bool(Id::new(("opt-hover", q.id, i)), hot);
-
-            let (border, fill, label_col) = if revealed {
-                let chose = match study
-                    .feedback
-                    .as_ref()
-                    .and_then(|feedback| feedback.response.as_ref())
-                {
-                    Some(Response::MultipleChoice { selected }) => selected.contains(&i),
-                    _ => false,
-                };
-                if opt.correct {
-                    (
-                        Palette::CORRECT,
-                        Palette::CORRECT.gamma_multiply(0.12),
-                        Palette::CORRECT,
-                    )
-                } else if chose {
-                    (
-                        Palette::WRONG,
-                        Palette::WRONG.gamma_multiply(0.12),
-                        Palette::WRONG,
-                    )
-                } else {
-                    (Palette::LINE, Color32::TRANSPARENT, Palette::TEXT_DIM)
-                }
-            } else if picked {
-                (
-                    Palette::ACCENT,
-                    Palette::ACCENT.gamma_multiply(0.10),
-                    Palette::ACCENT,
-                )
-            } else if hot {
-                (Palette::LINE_BRIGHT, Palette::SURFACE, Palette::TEXT)
-            } else {
-                (Palette::LINE, Color32::TRANSPARENT, Palette::TEXT)
-            };
-
-            let p = ui.painter();
-            if fill != Color32::TRANSPARENT {
-                p.rect_filled(row, 0, fill);
-            }
-            p.rect_stroke(
-                row,
-                0,
-                Stroke::new(1.0 + 0.7 * hover, border),
-                egui::StrokeKind::Inside,
+            ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
+                ui.set_clip_rect(body_rect);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.spacing_mut().scroll.bar_width = 5.0;
+                ui.spacing_mut().scroll.floating = false;
+                egui::ScrollArea::vertical()
+                    .id_salt(("choice-card", q.id))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(body_rect.width() - 10.0);
+                        let (prompt_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), prompt.height()),
+                            Sense::hover(),
+                        );
+                        prompt.paint(&p, prompt_rect.left_top(), Palette::TEXT, opacity);
+                        prompt.interact_figures(
+                            ui,
+                            prompt_rect.left_top(),
+                            card_rect.center(),
+                            0.0,
+                            Id::new(("choice-plot", q.id)),
+                        );
+                        ui.add_space(22.0);
+                        for (index, doc) in option_docs.iter().enumerate() {
+                            let height = (doc.height() + 22.0).max(44.0);
+                            let (row, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), height),
+                                Sense::hover(),
+                            );
+                            if choice_option_row(
+                                ui,
+                                row,
+                                q.id,
+                                index,
+                                doc,
+                                study.selected.contains(&index),
+                            ) {
+                                action = Action::Pick(index, multi);
+                            }
+                            ui.add_space(8.0);
+                        }
+                    });
+            });
+        } else {
+            let prompt_pos = card_rect.left_top() + Vec2::new(24.0, 48.0);
+            prompt.paint(&p, prompt_pos, Palette::TEXT, opacity);
+            prompt.interact_figures(
+                ui,
+                prompt_pos,
+                card_rect.center(),
+                0.0,
+                Id::new(("choice-plot", q.id)),
             );
-
-            // Index box on the left, so 1-5 on the keyboard is discoverable.
-            let key_box = Rect::from_min_size(row.left_top(), Vec2::new(34.0, row.height()));
-            p.line_segment(
-                [key_box.right_top(), key_box.right_bottom()],
-                Stroke::new(1.0, border),
-            );
-            p.text(
-                key_box.center(),
-                Align2::CENTER_CENTER,
-                format!("{}", i + 1),
-                text::label(),
-                label_col,
-            );
-            og.paint(p, row.left_top() + Vec2::new(48.0, 11.0), label_col, 1.0);
-
-            if resp.is_some_and(|r| r.clicked()) {
-                action = Action::Pick(i, multi);
-            }
-            y += h + 8.0;
-
-            // Indented under the row it belongs to, in that row's verdict
-            // colour, so it reads as an annotation on the choice and not as a
-            // second explanation.
-            if let Some(note) = note {
-                note.paint(
-                    ui.painter(),
-                    Pos2::new(row.left() + NOTE_INDENT, y + NOTE_GAP - 8.0),
-                    label_col,
-                    1.0,
+            let mut y = prompt_pos.y + prompt.height() + 22.0;
+            for (index, doc) in option_docs.iter().enumerate() {
+                let height = (doc.height() + 22.0).max(44.0);
+                let row = Rect::from_min_size(
+                    Pos2::new(card_rect.left() + 24.0, y),
+                    Vec2::new(card_rect.width() - 48.0, height),
                 );
-                y += note.height() + NOTE_GAP;
+                if choice_option_row(ui, row, q.id, index, doc, study.selected.contains(&index)) {
+                    action = Action::Pick(index, multi);
+                }
+                y += height + 8.0;
             }
         }
 
@@ -4348,7 +4665,7 @@ impl App {
         });
 
         let side_y = panel.center().y - 8.0;
-        let side_offset = ACTION_FACE / 2.0 + 14.0;
+        let side_offset = ACTION_FACE / 2.0 + 8.0;
         if fb.grade.is_some()
             && action_button(
                 ui,
@@ -4655,8 +4972,16 @@ impl App {
             .and_then(|t| review.topics.get(&t))
             .cloned()
             .unwrap_or_default();
+        let compact_header = panel.width() < 560.0;
         p.text(
-            panel.left_top() + Vec2::new(24.0, 18.0),
+            Pos2::new(
+                if compact_header {
+                    header_left(full, panel)
+                } else {
+                    panel.left() + 24.0
+                },
+                panel.top() + 18.0,
+            ),
             Align2::LEFT_TOP,
             tracked(&format!(
                 "look back  {}/{}",
@@ -4666,24 +4991,29 @@ impl App {
             text::label(),
             Palette::TEXT_FAINT,
         );
-        p.text(
-            panel.center_top() + Vec2::new(0.0, 18.0),
-            Align2::CENTER_TOP,
-            tracked(&topic),
-            text::label(),
-            Palette::TEXT_FAINT,
-        );
-        p.text(
-            panel.right_top() + Vec2::new(-24.0, 18.0),
-            Align2::RIGHT_TOP,
-            tracked(match item.grade {
-                Some(g) if g.correct => "you were right",
-                Some(_) => "you were wrong",
-                None => "not answered yet",
-            }),
-            text::label(),
-            colour,
-        );
+        if !compact_header {
+            p.text(
+                panel.center_top() + Vec2::new(0.0, 18.0),
+                Align2::CENTER_TOP,
+                tracked(&topic),
+                text::label(),
+                Palette::TEXT_FAINT,
+            );
+            p.text(
+                Pos2::new(
+                    (panel.right() - 24.0).min(full.right() - 64.0),
+                    panel.top() + 18.0,
+                ),
+                Align2::RIGHT_TOP,
+                tracked(match item.grade {
+                    Some(g) if g.correct => "you were right",
+                    Some(_) => "you were wrong",
+                    None => "not answered yet",
+                }),
+                text::label(),
+                colour,
+            );
+        }
         p.line_segment(
             [
                 panel.left_top() + Vec2::new(0.0, 44.0),
@@ -4692,7 +5022,7 @@ impl App {
             Stroke::new(1.0, Palette::LINE),
         );
 
-        const FOOT: f32 = 34.0;
+        const FOOT: f32 = 72.0;
         let body_rect = Rect::from_min_max(
             panel.left_top() + Vec2::new(24.0, 56.0),
             panel.right_bottom() - Vec2::new(16.0, FOOT),
@@ -4718,41 +5048,52 @@ impl App {
             [footer.left_top(), footer.right_top()],
             Stroke::new(1.0, Palette::LINE),
         );
-        p.text(
-            footer.left_center() + Vec2::new(24.0, 0.0),
-            Align2::LEFT_CENTER,
-            tracked("← → other cards  ·  esc back"),
-            text::label(),
-            Palette::TEXT_FAINT,
+        let first_x = footer.center().x - 72.0;
+        let button_y = footer.top() + ACTION_FACE / 2.0;
+        let prev_touch = action_button(
+            ui,
+            Id::new("review-prev"),
+            Pos2::new(first_x, button_y),
+            "←",
+            "previous",
+            Palette::TEXT_DIM,
         );
-        p.text(
-            footer.right_center() - Vec2::new(24.0, 0.0),
-            Align2::RIGHT_CENTER,
-            tracked(depth.label()),
-            text::label(),
+        let deeper_touch = action_button(
+            ui,
+            Id::new("review-depth"),
+            Pos2::new(first_x + 72.0, button_y),
+            "≡",
+            match depth {
+                Depth::Short => "deeper",
+                Depth::Deep => "shorter",
+            },
             Palette::ACCENT,
         );
+        let next_touch = action_button(
+            ui,
+            Id::new("review-next"),
+            Pos2::new(first_x + 144.0, button_y),
+            "→",
+            "next",
+            Palette::TEXT_DIM,
+        );
 
-        let (back, prev, next, deeper) = ui.ctx().input(|i| {
+        let (prev, next, deeper) = ui.ctx().input(|i| {
             use egui::Key::*;
             (
-                i.key_pressed(Escape) || i.key_pressed(Space) || i.key_pressed(Enter),
                 i.key_pressed(ArrowLeft),
                 i.key_pressed(ArrowRight),
                 i.key_pressed(D),
             )
         });
-        if prev {
+        if prev || prev_touch {
             review.idx = review.idx.saturating_sub(1);
         }
-        if next {
+        if next || next_touch {
             review.idx = (review.idx + 1).min(review.items.len() - 1);
         }
-        if deeper {
+        if deeper || deeper_touch {
             review.depth = review.depth.toggled();
-        }
-        if back {
-            return Some(std::mem::replace(&mut review.back, Screen::Decks));
         }
         None
     }
@@ -4876,7 +5217,7 @@ impl App {
             },
         );
         p.text(
-            panel.right_top() + Vec2::new(0.0, 30.0),
+            Pos2::new(panel.right().min(full.right() - 64.0), panel.top() + 30.0),
             Align2::RIGHT_TOP,
             format!("{:.0}%", s.accuracy * 100.0),
             headline(),
@@ -4921,59 +5262,70 @@ impl App {
         // Each row opens the card. A list of things you got wrong that you
         // cannot then look at is a scolding, not a study aid.
         let mut open: Option<usize> = None;
-        let mut y = panel.top() + 156.0;
-        for (i, w) in sum.weakest.iter().take(7).enumerate() {
-            let row = Rect::from_min_size(
-                Pos2::new(panel.left(), y - 4.0),
-                Vec2::new(panel.width(), 26.0),
-            );
-            let resp = ui.interact(row, Id::new(("weak", w.question_id)), Sense::click());
-            let hot = resp.hovered();
-            if resp.clicked() {
-                open = Some(i);
-            }
-
-            let p = ui.painter();
-            if hot {
-                p.rect_filled(row, 0, Palette::CARD);
-                p.line_segment(
-                    [row.left_top(), row.left_bottom()],
-                    Stroke::new(2.0, Palette::ACCENT),
-                );
-            }
-            let short: String = w.prompt.chars().take(62).collect();
-            p.text(
-                Pos2::new(panel.left() + 52.0, y),
-                Align2::LEFT_TOP,
-                short,
-                text::small(),
-                if hot {
-                    Palette::TEXT
-                } else {
-                    Palette::TEXT_DIM
-                },
-            );
-            p.text(
-                Pos2::new(panel.left() + 8.0, y),
-                Align2::LEFT_TOP,
-                format!("{:>3.0}%", w.ema * 100.0),
-                text::small(),
-                if w.ema < 0.4 {
-                    Palette::WRONG
-                } else {
-                    Palette::TEXT_FAINT
-                },
-            );
-            y += 26.0;
-        }
+        let weak_body = Rect::from_min_max(
+            panel.left_top() + Vec2::new(0.0, 152.0),
+            panel.right_bottom() - Vec2::new(0.0, 64.0),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(weak_body), |ui| {
+            ui.set_clip_rect(weak_body);
+            egui::ScrollArea::vertical()
+                .id_salt("summary-weak")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(weak_body.width() - 8.0);
+                    for (i, w) in sum.weakest.iter().take(7).enumerate() {
+                        let response = ui.add_sized(
+                            [ui.available_width(), 44.0],
+                            egui::Button::new("").frame(false),
+                        );
+                        let hot = response.hovered() || response.has_focus();
+                        if response.clicked() {
+                            open = Some(i);
+                        }
+                        let p = ui.painter();
+                        if hot {
+                            p.rect_filled(response.rect, 0, Palette::CARD);
+                            p.line_segment(
+                                [response.rect.left_top(), response.rect.left_bottom()],
+                                Stroke::new(2.0, Palette::ACCENT),
+                            );
+                        }
+                        let short: String = w.prompt.chars().take(62).collect();
+                        p.text(
+                            response.rect.left_center() + Vec2::new(52.0, 0.0),
+                            Align2::LEFT_CENTER,
+                            short,
+                            text::small(),
+                            if hot {
+                                Palette::TEXT
+                            } else {
+                                Palette::TEXT_DIM
+                            },
+                        );
+                        p.text(
+                            response.rect.left_center() + Vec2::new(8.0, 0.0),
+                            Align2::LEFT_CENTER,
+                            format!("{:>3.0}%", w.ema * 100.0),
+                            text::small(),
+                            if w.ema < 0.4 {
+                                Palette::WRONG
+                            } else {
+                                Palette::TEXT_FAINT
+                            },
+                        );
+                    }
+                });
+        });
 
         if let Some(i) = open {
             self.open_weakest(sum, i);
         }
 
+        let gap = 12.0;
+        let button_width = (panel.width() - gap) / 2.0;
         let btn = Rect::from_min_size(
-            Pos2::new(panel.left(), panel.bottom() - 44.0),
-            Vec2::new(190.0, 38.0),
+            Pos2::new(panel.left(), panel.bottom() - 52.0),
+            Vec2::new(button_width, 44.0),
         );
         let resp = ui.interact(btn, Id::new("back"), Sense::click());
         let col = if resp.hovered() {
@@ -4992,8 +5344,8 @@ impl App {
         );
 
         let again = Rect::from_min_size(
-            Pos2::new(panel.left() + 206.0, panel.bottom() - 44.0),
-            Vec2::new(190.0, 38.0),
+            Pos2::new(panel.left() + button_width + gap, panel.bottom() - 52.0),
+            Vec2::new(button_width, 44.0),
         );
         let resp2 = ui.interact(again, Id::new("again"), Sense::click());
         let col2 = if resp2.hovered() {
@@ -5017,7 +5369,7 @@ impl App {
             return None;
         }
 
-        if resp.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if resp.clicked() {
             self.decks = self.store.decks().unwrap_or_default();
             return Some(Screen::Decks);
         }
@@ -5111,6 +5463,25 @@ mod tests {
         assert_eq!(fmt_ms(-1), "-");
         assert_eq!(fmt_ms(2500), "2.5s");
         assert_eq!(fmt_ms(65_000), "1m 5s");
+    }
+
+    #[test]
+    fn one_back_operation_serves_study_summary_and_decks() {
+        let (mut app, study) = begin_with_body(Body::TrueFalse { answer: true });
+        let mut screen = Screen::Study(study);
+        assert_eq!(screen_depth(&screen), 1);
+
+        assert!(app.back_once(&mut screen));
+        assert!(matches!(screen, Screen::Summary(_)));
+        assert_eq!(
+            screen_depth(&screen),
+            1,
+            "ending study replaces its history entry"
+        );
+
+        assert!(app.back_once(&mut screen));
+        assert!(matches!(screen, Screen::Decks));
+        assert_eq!(screen_depth(&screen), 0);
     }
 
     #[test]

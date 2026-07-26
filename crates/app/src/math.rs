@@ -135,6 +135,7 @@ pub fn parse(src: &str) -> Node {
 enum Stop {
     End,
     Brace,
+    Bracket,
     Right,
     EndEnv,
 }
@@ -208,6 +209,7 @@ impl<'a> Parser<'a> {
         match self.peek() {
             None => true,
             Some('}') if stop == Stop::Brace => true,
+            Some(']') if stop == Stop::Bracket => true,
             Some('&') => stop == Stop::EndEnv,
             Some('\\') => {
                 let rest: String = self.s[self.i..].iter().take(7).collect();
@@ -343,9 +345,12 @@ impl<'a> Parser<'a> {
             "sqrt" => {
                 self.skip_space();
                 let index = if self.eat('[') {
-                    let n = self.row(Stop::End);
-                    // `row` stops at `]` only by falling through to atom, so
-                    // consume up to it explicitly.
+                    // `Stop::Bracket` exists for this one place: `]` is an
+                    // ordinary symbol everywhere else, so only the root index
+                    // may end on it. Without it the index runs to the end of
+                    // the formula and swallows the radicand — `\sqrt[k]{|a_k|}`
+                    // then renders as script-sized nonsense with no body.
+                    let n = self.row(Stop::Bracket);
                     self.eat(']');
                     Some(Box::new(n))
                 } else {
@@ -1807,6 +1812,22 @@ mod tests {
             };
             assert_eq!(op, Big::Int(signs));
         }
+    }
+
+    #[test]
+    fn root_index_ends_at_its_closing_bracket() {
+        // The Wurzelkriterium is written `\sqrt[k]{|a_k|}`, and the index has
+        // to stop at `]` — otherwise it eats the radicand and everything after
+        // it, and the whole formula is set at index size with no body.
+        let Node::Row(items) = parse(r"\sqrt[k]{x} = 1") else {
+            panic!("expected a root followed by the rest of the row")
+        };
+        assert_eq!(items.len(), 3, "the row after the root must survive");
+        let Node::Sqrt { index, body } = &items[0] else {
+            panic!("expected a root")
+        };
+        assert_eq!(index.as_deref(), Some(&sym("k")));
+        assert_eq!(**body, sym("x"));
     }
 
     #[test]

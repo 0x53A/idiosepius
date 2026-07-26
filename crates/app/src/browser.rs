@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use anyhow::Result;
-use eframe::egui::{self, Align2, Id, Pos2, Rect, Sense, Stroke, Vec2};
+use eframe::egui::{self, Align2, Id, Rect, Sense, Stroke, Vec2};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
@@ -32,6 +32,9 @@ pub(crate) struct BrowserApp {
     error: Option<String>,
     last_saved_generation: u64,
     save_in_flight: bool,
+    /// A UI Back already changed the Rust screen; ignore the matching
+    /// asynchronous `popstate` when `history.go` catches up.
+    ignore_pop_to: Option<usize>,
 }
 
 pub(crate) struct InitialState {
@@ -64,6 +67,7 @@ impl BrowserApp {
     pub(crate) fn new(ctx: &egui::Context, initial: InitialState) -> Self {
         crate::theme::install(ctx);
         ctx.options_mut(|options| options.zoom_with_keyboard = true);
+        browser_history_init(0);
 
         let InitialState {
             database,
@@ -91,7 +95,40 @@ impl BrowserApp {
             error,
             last_saved_generation: 0,
             save_in_flight: false,
+            ignore_pop_to: None,
         }
+    }
+
+    fn poll_browser_history(&mut self) -> bool {
+        let mut handled = false;
+        let mut projected_depth = self.app.as_ref().map_or(0, App::navigation_depth);
+        loop {
+            let target = browser_take_history_depth();
+            if target < 0 {
+                break;
+            }
+            let target = target as usize;
+            if self.ignore_pop_to == Some(target) {
+                self.ignore_pop_to = None;
+                continue;
+            }
+            let Some(app) = &mut self.app else {
+                browser_replace_history(0);
+                continue;
+            };
+            if target < projected_depth {
+                app.request_back(projected_depth - target);
+                projected_depth = target;
+                handled = true;
+            } else if target > projected_depth {
+                // Screen state is deliberately not resurrected after leaving a
+                // session. Bounce an attempted Forward back to the live view
+                // instead of leaving a duplicate root entry behind.
+                self.ignore_pop_to = Some(projected_depth);
+                browser_go_history(-((target - projected_depth) as i32));
+            }
+        }
+        handled
     }
 
     fn open_database(&mut self, ctx: &egui::Context, database: Vec<u8>) {
@@ -260,49 +297,67 @@ impl BrowserApp {
             Stroke::new(1.0, Palette::LINE_BRIGHT),
             egui::StrokeKind::Inside,
         );
-        ui.painter().text(
-            panel.left_top() + Vec2::new(28.0, 28.0),
-            Align2::LEFT_TOP,
-            tracked("database"),
-            text::title(),
-            Palette::TEXT,
-        );
-        ui.painter().text(
-            panel.left_top() + Vec2::new(28.0, 74.0),
-            Align2::LEFT_TOP,
-            "No study database is stored in this browser yet.",
-            text::body(),
-            Palette::TEXT_DIM,
-        );
-
-        let mut x = panel.left() + 28.0;
-        if panel_button(ui, &mut x, panel.top() + 122.0, "create empty database") {
+        let inner = panel.shrink(28.0);
+        let mut create = false;
+        let mut import = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.set_clip_rect(inner);
+            egui::ScrollArea::vertical()
+                .id_salt("browser-setup")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(inner.width() - 8.0);
+                    ui.label(
+                        egui::RichText::new(tracked("database"))
+                            .font(text::title())
+                            .color(Palette::TEXT),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "No study database is stored in this browser yet.",
+                        )
+                        .font(text::body())
+                        .color(Palette::TEXT_DIM),
+                    );
+                    ui.add_space(16.0);
+                    let (create_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 44.0),
+                        Sense::hover(),
+                    );
+                    create = draw_button(ui, create_rect, "create empty database");
+                    ui.add_space(8.0);
+                    let (import_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 44.0),
+                        Sense::hover(),
+                    );
+                    import = draw_button(ui, import_rect, "import database");
+                    ui.add_space(18.0);
+                    ui.label(
+                        egui::RichText::new(self.error.as_deref().unwrap_or(
+                            "Stored automatically in this browser. Export creates a normal SQLite file.",
+                        ))
+                        .font(text::small())
+                        .color(if self.error.is_some() {
+                            Palette::WRONG
+                        } else {
+                            Palette::TEXT_FAINT
+                        }),
+                    );
+                });
+        });
+        if create {
             self.create_database(ui.ctx());
-        }
-        x = panel.left() + 28.0;
-        if panel_button(ui, &mut x, panel.top() + 174.0, "import database") {
+        } else if import {
             self.pick_database(ui.ctx());
         }
-
-        ui.painter().text(
-            panel.left_bottom() + Vec2::new(28.0, -28.0),
-            Align2::LEFT_BOTTOM,
-            self.error.as_deref().unwrap_or(
-                "Stored automatically in this browser. Export creates a normal SQLite file.",
-            ),
-            text::small(),
-            if self.error.is_some() {
-                Palette::WRONG
-            } else {
-                Palette::TEXT_FAINT
-            },
-        );
     }
 }
 
 impl eframe::App for BrowserApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll_events(ui.ctx());
+        let history_pop = self.poll_browser_history();
         ui.painter().rect_filled(ui.max_rect(), 0, Palette::BG);
 
         if self.app.is_some() {
@@ -314,12 +369,32 @@ impl eframe::App for BrowserApp {
                     .id_salt("browser-app")
                     .max_rect(ui.max_rect()),
             );
+            let depth_before = self.app.as_ref().map_or(0, App::navigation_depth);
             let request = if let Some(app) = &mut self.app {
                 eframe::App::ui(app, &mut body_ui, frame);
                 app.take_request()
             } else {
                 None
             };
+            let depth_after = self.app.as_ref().map_or(0, App::navigation_depth);
+            if history_pop {
+                let target = browser_current_history_depth();
+                if target >= 0 && depth_after > target as usize {
+                    // Some logical Back operations replace a screen instead of
+                    // reducing depth (study -> summary). Restore one app entry
+                    // so the next browser Back still reaches the root.
+                    browser_push_history(depth_after);
+                } else {
+                    browser_replace_history(depth_after);
+                }
+            } else if depth_after > depth_before {
+                browser_push_history(depth_after);
+            } else if depth_after < depth_before {
+                self.ignore_pop_to = Some(depth_after);
+                browser_go_history(-((depth_before - depth_after) as i32));
+            } else {
+                browser_replace_history(depth_after);
+            }
             match request {
                 Some(Request::ImportLocalDeck) => self.pick_decks(ui.ctx()),
                 Some(Request::ImportGithub(url)) => self.load_repository(ui.ctx(), url),
@@ -342,13 +417,6 @@ impl eframe::App for BrowserApp {
         }
         self.persist_if_changed(ui.ctx());
     }
-}
-
-fn panel_button(ui: &mut egui::Ui, x: &mut f32, y: f32, label: &str) -> bool {
-    let width = (tracked(label).chars().count() as f32 * 6.7 + 28.0).max(150.0);
-    let rect = Rect::from_min_size(Pos2::new(*x, y), Vec2::new(width, 38.0));
-    *x += width + 12.0;
-    draw_button(ui, rect, label)
 }
 
 fn draw_button(ui: &mut egui::Ui, rect: Rect, label: &str) -> bool {
@@ -417,6 +485,50 @@ fn display_js(value: JsValue) -> String {
 
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
 let saveQueue = Promise.resolve();
+let historyDepths = [];
+let currentHistoryDepth = 0;
+let historyInstalled = false;
+
+function appHistoryState(depth) {
+    const existing =
+        history.state && typeof history.state === "object" ? history.state : {};
+    return { ...existing, idiosepiusDepth: depth };
+}
+
+export function browser_history_init(depth) {
+    currentHistoryDepth = depth;
+    history.replaceState(appHistoryState(depth), "");
+    if (!historyInstalled) {
+        window.addEventListener("popstate", (event) => {
+            const value = event.state && event.state.idiosepiusDepth;
+            currentHistoryDepth = Number.isInteger(value) ? value : 0;
+            historyDepths.push(currentHistoryDepth);
+        });
+        historyInstalled = true;
+    }
+}
+
+export function browser_take_history_depth() {
+    return historyDepths.length ? historyDepths.shift() : -1;
+}
+
+export function browser_current_history_depth() {
+    return currentHistoryDepth;
+}
+
+export function browser_push_history(depth) {
+    currentHistoryDepth = depth;
+    history.pushState(appHistoryState(depth), "");
+}
+
+export function browser_replace_history(depth) {
+    currentHistoryDepth = depth;
+    history.replaceState(appHistoryState(depth), "");
+}
+
+export function browser_go_history(delta) {
+    history.go(delta);
+}
 
 async function opfsRead(name) {
     const root = await navigator.storage.getDirectory();
@@ -596,6 +708,12 @@ export function download_database(bytes) {
 }
 "#)]
 extern "C" {
+    fn browser_history_init(depth: usize);
+    fn browser_take_history_depth() -> i32;
+    fn browser_current_history_depth() -> i32;
+    fn browser_push_history(depth: usize);
+    fn browser_replace_history(depth: usize);
+    fn browser_go_history(delta: i32);
     fn browser_load_database() -> js_sys::Promise;
     fn browser_save_database(
         database: &js_sys::Uint8Array,

@@ -47,6 +47,14 @@ formula cited mid-derivation has to be readable at a glance, which it is not
 when it is buried in a sentence. No third rail colour was introduced for it —
 the palette says "shared fact", the display line says "formula".
 
+**Notation is named where it was used.** A deep explanation ends with the
+symbols the card actually contains, and a lesson ends with the same section:
+the glyphs its prose, its display maths or the formulas it quotes use, minus
+the ones it stopped to define itself. A reading uses more notation than any one
+card does, not less, so leaving it out is exactly where it would be missed. It
+sits under a faint `symbols` rule at the foot, before the source line — a place
+to look down at, never something interrupting the argument.
+
 ## Palette
 
 | role | colour | |
@@ -124,6 +132,15 @@ not sit in a half-empty box.
 
 ## Navigation
 
+A square Back control sits at the top right of every screen below the deck
+list. It is the pointer and touch route for the same operation as `Esc`: from a
+lesson it returns to the lesson list, from a one-card question it returns to
+the bank, and from scheduled study it ends the session and opens the summary.
+In the browser, each forward screen adds a History API entry and `popstate`
+calls that same operation, so the browser Back button and edge/back gesture do
+not invent a second navigation model. At the deck list, browser Back is left to
+the containing page.
+
 A deck row on the home screen is a split action. The broad left segment opens
 the deck: lessons, the complete question bank and progress live behind it. The
 square segment on the right is the quick route into shuffled study and is
@@ -156,9 +173,10 @@ the question into an attempt.
 ## Input
 
 Every action has a pointer route and a keyboard route, and touch works because
-egui treats it as a pointer. True/false additionally maps left-click to *false*
-and right-click to *true*, so the whole deck can be answered without moving the
-mouse.
+egui treats it as a pointer. A true/false card can be swiped, or answered with
+the explicit violet `FALSE` and cyan `TRUE` controls in a row directly below
+the card. Those controls are large enough to read as buttons and to hit with a
+thumb; tapping the prompt itself does not answer.
 
 Only the visible card, option, panel or button is clickable. Empty margin is a
 safe focus target: clicking it must never answer a question or advance the

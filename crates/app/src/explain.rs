@@ -7,12 +7,16 @@
 //!
 //! The deep reading also gets a glossary: every symbol fact whose glyph
 //! actually occurs in the question is appended, so `ζ` on the card is never
-//! left as a shape you are expected to already recognise.
+//! left as a shape you are expected to already recognise. A lesson gets the
+//! same glossary under its body, for the same reason — a reading uses more
+//! symbols than any one card does, not fewer.
 
 use std::collections::HashMap;
 
 use eframe::egui::{self, Align2, Color32, Pos2, Rect, Sense, Stroke, Ui, Vec2};
-use idiosepius_core::{Fact, FactKind, Id, Question, Seg, Store, content_text, content_transcript};
+use idiosepius_core::{
+    Fact, FactKind, Id, Lesson, LessonBlock, Question, Seg, Store, content_text, content_transcript,
+};
 
 use crate::blocks;
 use crate::richtext;
@@ -139,13 +143,6 @@ impl Depth {
             Depth::Deep => Depth::Short,
         }
     }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Depth::Short => "d  deeper",
-            Depth::Deep => "d  shorter",
-        }
-    }
 }
 
 /// Draw a block of prose, wrapped to the current column.
@@ -266,8 +263,14 @@ pub fn body(ui: &mut Ui, q: &Question, facts: &Facts, depth: Depth) -> bool {
 /// The glossary under a deep explanation: every symbol the question uses that
 /// its own text did not already stop to define.
 fn symbols(ui: &mut Ui, q: &Question, facts: &Facts, shown: &[Seg]) -> bool {
-    let found = used_symbols(q, facts, shown);
+    glossary(ui, &used_symbols(q, facts, shown))
+}
 
+/// A "symbols" section: the rule, then one symbol fact per line.
+///
+/// Shared by the deep reading and the lesson reader so the two cannot drift
+/// into two different-looking glossaries.
+pub fn glossary(ui: &mut Ui, found: &[&Fact]) -> bool {
     if found.is_empty() {
         return false;
     }
@@ -293,6 +296,50 @@ fn symbols(ui: &mut Ui, q: &Question, facts: &Facts, shown: &[Seg]) -> bool {
         fact_block(ui, f);
     }
     true
+}
+
+/// The symbols a lesson uses and does not itself stop to define.
+///
+/// The context is everything the reader can see: the prose, the display maths,
+/// and the facts the lesson quotes — most of a lesson's notation arrives
+/// inside a quoted formula rather than in its own sentences, so a glossary
+/// built from the prose alone would miss exactly the symbols worth naming.
+pub fn lesson_symbols<'a>(lesson: &Lesson, facts: &'a Facts) -> Vec<&'a Fact> {
+    let mut context = lesson.summary.clone();
+    let mut push = |s: &str| {
+        context.push(' ');
+        context.push_str(s);
+    };
+    for block in &lesson.body {
+        match block {
+            LessonBlock::Text(text) => push(text),
+            LessonBlock::Heading { heading } => push(heading),
+            LessonBlock::Math { math } => push(math),
+            LessonBlock::Figure { .. } => {}
+            LessonBlock::Fact { fact } => {
+                if let Some(f) = facts.get(fact) {
+                    if let Some(label) = &f.label {
+                        push(label);
+                    }
+                    push(&content_transcript(&f.body));
+                }
+            }
+        }
+    }
+
+    // Match on glyphs, whether the author wrote `ζ` or `\zeta`.
+    let context = crate::math::unicodify(&context);
+
+    let already: Vec<&str> = lesson
+        .body
+        .iter()
+        .filter_map(LessonBlock::fact_uid)
+        .collect();
+    facts
+        .symbols_in(&context)
+        .into_iter()
+        .filter(|f| !already.contains(&f.uid.as_str()))
+        .collect()
 }
 
 fn segments(q: &Question, depth: Depth) -> Vec<Seg> {
@@ -477,6 +524,93 @@ mod tests {
         assert_eq!(
             plain_text(&question, &facts, Depth::Short),
             "DC gain\nEvaluate $G(s)$ at $s=0$.\nSource: Lecture 2"
+        );
+    }
+
+    fn symbol(uid: &str, label: &str, name: &str) -> Fact {
+        Fact {
+            id: 1,
+            deck_id: Some(1),
+            uid: uid.into(),
+            kind: FactKind::Symbol,
+            label: Some(label.into()),
+            name: Some(name.into()),
+            title: None,
+            body: Vec::new(),
+            source: None,
+        }
+    }
+
+    fn lesson(body: Vec<LessonBlock>) -> Lesson {
+        Lesson {
+            id: 1,
+            deck_id: 1,
+            topic_id: 1,
+            uid: "les".into(),
+            ord: 1,
+            title: "A reading".into(),
+            summary: String::new(),
+            body,
+            practice: Vec::new(),
+            source: None,
+        }
+    }
+
+    #[test]
+    fn a_lesson_glossary_reaches_into_quoted_formulas_but_not_past_its_own_definitions() {
+        let zeta = symbol("sym-zeta", "ζ", "zeta");
+        let omega = symbol("sym-omega-0", "ω₀", "omega zero");
+        let formula = Fact {
+            id: 3,
+            deck_id: Some(1),
+            uid: "f-settling".into(),
+            kind: FactKind::Formula,
+            // The notation a reading uses mostly arrives inside a quoted
+            // formula, never in a sentence of its own.
+            label: Some(r"t_{se} \approx \frac{3}{\zeta\omega_0}".into()),
+            name: None,
+            title: Some("Settling time".into()),
+            body: Vec::new(),
+            source: None,
+        };
+        let facts = Facts {
+            by_uid: HashMap::from([
+                (zeta.uid.clone(), zeta.clone()),
+                (omega.uid.clone(), omega.clone()),
+                (formula.uid.clone(), formula.clone()),
+            ]),
+            symbols: vec![omega, zeta],
+        };
+
+        let found = lesson_symbols(
+            &lesson(vec![
+                LessonBlock::Text("Settling depends on the product.".into()),
+                LessonBlock::Fact {
+                    fact: "f-settling".into(),
+                },
+            ]),
+            &facts,
+        );
+        assert_eq!(
+            found.iter().map(|f| f.uid.as_str()).collect::<Vec<_>>(),
+            ["sym-omega-0", "sym-zeta"]
+        );
+
+        // A lesson that stops to define ζ itself must not define it twice.
+        let found = lesson_symbols(
+            &lesson(vec![
+                LessonBlock::Fact {
+                    fact: "f-settling".into(),
+                },
+                LessonBlock::Fact {
+                    fact: "sym-zeta".into(),
+                },
+            ]),
+            &facts,
+        );
+        assert_eq!(
+            found.iter().map(|f| f.uid.as_str()).collect::<Vec<_>>(),
+            ["sym-omega-0"]
         );
     }
 }

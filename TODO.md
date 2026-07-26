@@ -3,6 +3,15 @@
 Cross-cutting work that content authoring has run into. Each entry names what
 is missing, what it currently does instead, and where the fix goes.
 
+## End-to-end encrypted sync, after the exams
+
+The desired shape and the July 2026 Turso/Wasm investigation are recorded in
+[`SYNC.md`](SYNC.md). The short decision is to keep the study database local
+and synchronize application-owned encrypted envelopes into one provisioned
+Turso database per numeric account, rather than applying last-push-wins
+replication to the live SQLite file. Deliberately deferred until after the
+current exams.
+
 ## Reformat the packs through the surviving `packfmt.py`
 
 There were two `packfmt.py` — one here, one in the content repository — with

@@ -100,6 +100,8 @@ fn contents(
                 "Paste the URL of a public repository containing JSON packs.",
             ) {
                 ImportAction::Show(ImportView::Github)
+            } else if close_button(ui) {
+                ImportAction::Close
             } else {
                 ImportAction::None
             }
@@ -138,7 +140,8 @@ fn contents(
                     .id_salt("github-repository-url")
                     .font(text::small())
                     .hint_text("https://github.com/owner/repository")
-                    .desired_width(f32::INFINITY),
+                    .desired_width(f32::INFINITY)
+                    .min_size(Vec2::new(0.0, 44.0)),
             );
             if let Some(error) = import_error {
                 ui.add_space(4.0);
@@ -155,7 +158,7 @@ fn contents(
             let load = ui
                 .add_enabled(
                     !github_url.trim().is_empty(),
-                    egui::Button::new(tracked("load repository")),
+                    egui::Button::new(tracked("load repository")).min_size(Vec2::new(0.0, 44.0)),
                 )
                 .clicked();
             if load || enter {
@@ -217,5 +220,11 @@ fn import_choice(ui: &mut egui::Ui, label: &str, detail: &str) -> bool {
 }
 
 fn back_button(ui: &mut egui::Ui) -> bool {
-    ui.add(egui::Button::new(tracked("back"))).clicked()
+    ui.add(egui::Button::new(tracked("back")).min_size(Vec2::new(ui.available_width(), 44.0)))
+        .clicked()
+}
+
+fn close_button(ui: &mut egui::Ui) -> bool {
+    ui.add(egui::Button::new(tracked("close")).min_size(Vec2::new(ui.available_width(), 44.0)))
+        .clicked()
 }

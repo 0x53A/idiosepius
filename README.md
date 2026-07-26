@@ -81,12 +81,14 @@ as a download.
 
 Opening a deck leads to its ordered lessons, complete question bank and
 progress. A lesson can be marked read and ends with an authored practice
-sequence; lessons organise teaching but never lock the rest of the bank.
+sequence; lessons organise teaching but never lock the rest of the bank. Each
+reading closes with the symbols it used — the same glossary a deep explanation
+gets, including the notation that only appeared inside a quoted formula.
 
 | | |
 |---|---|
 | `←` `→` or drag | answer false / true |
-| left / right click | answer false / true |
+| tap/click `FALSE` or `TRUE` | answer with the explicit card controls |
 | `1`–`5` | pick a multiple-choice option |
 | `enter` | confirm a multi-select |
 | `s` | skip (recorded, not graded) |
@@ -98,13 +100,13 @@ sequence; lessons organise teaching but never lock the rest of the bank.
 | `ctrl/cmd` + `c` | copy the visible screen as readable text; formulas stay LaTeX |
 | `ctrl` + `+` / `−` | enlarge / shrink the whole interface |
 | `ctrl` + `0` | reset interface size |
-| `esc` | end the session, show the summary |
+| `esc` or top-right `←` | go back; during scheduled study, end the session and show the summary |
 
 True/false cards are swiped like a card game: drag past the threshold and the
-card tilts, stamps itself, and flies off. Multiple-choice cards are clicked or
-numbered. Only visible controls are active; empty margin is safe to click when
-bringing the window back into focus. Cards and options brighten continuously
-on hover.
+card tilts, stamps itself, and flies off. The violet `FALSE` and cyan `TRUE`
+controls are the tap/click route. Multiple-choice cards are clicked or numbered.
+Only visible controls are active; empty margin is safe to click when bringing
+the window back into focus. Cards and options brighten continuously on hover.
 
 ## Layout
 

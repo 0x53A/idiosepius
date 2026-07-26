@@ -34,6 +34,11 @@ cyan/violet for swipe direction, green/magenta (never red) for verdicts.
   same path put all four on the start screen with separate exam dates and
   schedules.
 
+  **Reimporting is a user operation, never an agent validation step.** Do not
+  run `reimport.sh` or update the user's study database after editing content.
+  Validate packs with `check-packs.py`, `packfmt.py --check`, and the relevant
+  tests; leave any reimport to the user.
+
 ## Things worth knowing
 
 **The database is the whole state.** No config file changes behaviour, and

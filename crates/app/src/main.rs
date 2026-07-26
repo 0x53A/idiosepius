@@ -27,7 +27,8 @@ USAGE
     idio [<study.db>] [--import <pack.json>…]
     idio <study.db> --shot <out.pam> [--screen <name>] [--card <uid>] [--drag <px>]
 
-    With no path, uses ~/idiosepius/study.db.
+    With no path, uses ~/idiosepius/study.db. On a lesson screen --card picks
+    the reading by uid and --drag scrolls it, in pixels.
 
 KEYS
     ← →   answer false / true        1-5    pick an option
@@ -69,7 +70,7 @@ fn main() -> Result<()> {
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([940.0, 720.0])
-        .with_min_inner_size([560.0, 480.0])
+        .with_min_inner_size([320.0, 360.0])
         .with_title("Idiosepius");
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(icon);

@@ -93,6 +93,10 @@ shoot decks     --screen decks
 shoot course    --screen course
 shoot lessons   --screen lessons
 shoot lesson    --screen lesson
+# The foot of a reading: the automatic symbol glossary, the read marker and the
+# practice row. `--card` pins a lesson by uid the way it pins a question, and
+# on a lesson `--drag` is a scroll offset, for a capture of a figure mid-body.
+shoot lesson-end --screen lesson-end
 shoot questions --screen questions
 shoot questions-scroll    --screen questions-scroll
 shoot questions-collapsed --screen questions-collapsed

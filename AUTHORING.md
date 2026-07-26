@@ -64,7 +64,7 @@ that describes more than one deck.
   "deck": {
     "slug": "<module-slug>",
     "title": "<Module Title>",
-    "description": "<Course, lecturer, institution. What it covers.>",
+    "description": "<Course. What it covers.>",
     "exam_at": "2026-07-27T11:00:00+02:00"
   },
   "topics": [
@@ -94,12 +94,16 @@ Everything below is run from the **application checkout's root**.
    — beyond that it stops being editable by hand.
 4. Write `content/<module-name>/CLAUDE.md` — see § 13.
 5. `python3 tools/check-packs.py content/<module-name>`
-6. `./reimport.sh -m <mod>` to build the database.
+6. `python3 tools/packfmt.py --check content/<module-name>/*.json`
 7. If the subject has formulas, add `<mod>-00-formulas.json` and run
    `./tools/build-sheet.sh <mod>`.
 
 Nothing else needs changing. The scripts discover modules by prefix, so no
 script has a list of modules to keep in step.
+
+Reimporting a deck into a personal study database is deliberately not an
+authoring or validation step. It changes user state and is left to the user;
+agents must not run `reimport.sh`.
 
 **Glob two digits.** Any script that finds packs must use
 `<mod>-[0-9][0-9]-*.json`, never `<mod>-0*.json`. The latter silently stops at
@@ -253,6 +257,45 @@ Keep it self-contained: no file paths or web URLs. Inline paths, shapes, text
 and data URLs travel with the pack; external image references are deliberately
 disabled. SVG is rasterised once and cached by content hash, then its textured
 rectangle tilts rigidly with a swiped card.
+
+**Do not hand-write a block diagram.** `tools/blockdiag.py` is the drawing kit:
+blocks, arrows, elbows, take-off dots, summing junctions, dashed hulls and a
+fraction block, in the palette from `theme.rs` and the rectangular language
+from `DESIGN.md` — cyan for the path that makes it a loop, everything else in
+line grey. `python3 tools/blockdiag.py --demo` renders a sheet of every
+element. A module's own diagrams are defined in a script in *its* repository
+that imports the kit and writes the figures into its packs; see
+`content/control-systems/cs-diagrams.py`, which is also the exception noted in
+§ 11 — a course's diagrams are not shared, so a second copy has nothing to
+drift from.
+
+**The same kit draws sketches**, for the figures a generated plot cannot be:
+`sketch_axes`, `curve`, `guide`, `cross`, `ring`, `arc` and `band` give an
+annotated step response, a pole in the $s$-plane, a tangent at an operating
+point. They are styled after `crates/app/src/plot.rs` — axes in line grey, the
+curve that carries the meaning in cyan, a second curve in violet, guides dashed
+and faint, a marked point as a pale cross — so an authored sketch and a
+generated `bode` sit on a page together. Compute the curve from the course's
+own formula rather than drawing it by eye: a sketch whose $t_p$ is where a
+sketching hand put it teaches a number that is not true.
+
+Two things decide whether an authored diagram is legible:
+
+- **Keep it wide.** A figure gets the column width and its height is clamped to
+  280 px, so a viewBox taller than about half its width is scaled down until
+  the labels cannot be read. Aim for an aspect ratio between 2.5 and 4.
+- **Type is in viewBox units.** At the usual 640-unit viewBox a 24-unit label
+  lands at roughly 21 px on screen. Change the viewBox width and the type sizes
+  have to move with it.
+
+Check a diagram by rasterising it the way the app will, rather than in a
+browser — the app renders with resvg and its own fonts:
+
+```
+python3 content/<module>/<mod>-diagrams.py --preview target/diagrams
+nix-shell -p resvg --run "resvg --background '#0B1216' -w 1120 \
+    target/diagrams/closed-loop.svg /tmp/check.png"
+```
 
 `tools/check-packs.py` validates figure kinds, finite coefficients, the
 denominator, step ranges and SVG XML along with the usual maths spans.
@@ -476,6 +519,20 @@ section, `{"math": …}` is a display equation as bare LaTeX with no `$` fences
 (like a formula fact's `label`), `{"fact": …}` quotes a shared fact, and
 `{"figure": {…}}` is the same figure object a prompt may contain.
 
+**A figure earns its place by carrying the argument.** A reading is the one
+place with room for one, so use it where the picture *is* the point — the
+response with its four characteristics marked, the pole pair with the angle
+that is its damping, the loop before and after the gain was raised — and put
+the reading of it in the sentence after it, with numbers that match the plot.
+Two step figures in a row are a comparison and read as one; three are a gallery.
+
+**The symbol glossary is automatic.** A reading ends with the symbol facts
+whose glyphs occur in its prose, its display maths or the formulas it quotes,
+minus any it stopped to define itself — the same section a deep explanation
+gets. So notation used only inside a quoted formula is still named at the foot,
+and a lesson that wants a symbol explained *in place* quotes its symbol fact
+where it is first used, which then drops out of the glossary.
+
 **`practice` is a list of question uids**, and it is what turns a lesson back
 into study: the questions that lesson has just made answerable. Order it as the
 lesson taught them. Import validates the list against the merged pack, so a
@@ -548,12 +605,14 @@ in a different repository goes stale silently.
 
 - `python3 tools/check-packs.py content/<module-name>` is clean (it exits
   non-zero if it is not).
-- `./reimport.sh -m <mod>` imports without error, and the reported topic and
-  question counts are what you expect.
+- `python3 tools/packfmt.py --check content/<module-name>/*.json` is clean.
 - Answer keys were checked against the course material, not from memory.
 - New formulas are in the formulas pack, and the sheet was rebuilt.
 - No LaTeX in fact titles; no plain-text maths outside prose quantities.
 - The module's own `CLAUDE.md` still describes what is actually there.
+
+Do not reimport as part of this checklist. Reimporting changes the user's study
+database and is a user operation.
 
 Remember that a module is its **own repository**: committing in the application
 checkout does not commit content, and vice versa.
