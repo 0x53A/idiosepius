@@ -1,7 +1,7 @@
 //! Read-only queries over the log, for the progress screen and for after the
 //! fact evaluation.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::db::Store;
@@ -159,9 +159,12 @@ pub fn weakest(store: &Store, deck_id: Id, limit: usize) -> Result<Vec<WeakQuest
          LIMIT ?2",
         params![deck_id, limit as i64],
         |r| {
+            let prompt: String = r.get(1)?;
+            let prompt: Vec<ContentBlock> =
+                serde_json::from_str(&prompt).context("weak-question prompt is not valid")?;
             Ok(WeakQuestion {
                 question_id: r.get(0)?,
-                prompt: r.get(1)?,
+                prompt: content_text(&prompt),
                 attempts: r.get(2)?,
                 correct: r.get(3)?,
                 lapses: r.get(4)?,
@@ -237,7 +240,7 @@ mod tests {
                         deck_id: deck,
                         topic_id: Some(topic),
                         uid: format!("q{i}"),
-                        prompt: format!("prompt {i}"),
+                        prompt: vec![ContentBlock::text(format!("prompt {i}"))],
                         body: Body::TrueFalse { answer: true },
                         explanation: None,
                         explain: Default::default(),

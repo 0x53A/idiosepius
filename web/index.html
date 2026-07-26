@@ -4,6 +4,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#060a0d">
+    <meta name="description" content="A study deck you swipe through.">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Idiosepius">
+    <link rel="manifest" href="./manifest.webmanifest">
+    <link rel="icon" href="./icons/icon-192.png" type="image/png">
+    <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
     <title>Idiosepius</title>
     <style>
       html,
@@ -22,13 +30,137 @@
         color: #d8e6ea;
         font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       }
+
+      .loading {
+        box-sizing: border-box;
+        display: grid;
+        width: 100%;
+        height: 100%;
+        place-content: center;
+        justify-items: center;
+        padding: 32px;
+      }
+
+      .loading__coin {
+        width: 112px;
+        height: 112px;
+        margin-bottom: 26px;
+        animation: coin-boot 0.95s cubic-bezier(0.2, 0.75, 0.22, 1);
+      }
+
+      .loading__title,
+      .loading__status,
+      .loading__detail {
+        text-transform: uppercase;
+        letter-spacing: 0.24em;
+      }
+
+      .loading__title {
+        margin: 0;
+        color: #d8e6ea;
+        font-size: 15px;
+        font-weight: 400;
+      }
+
+      .loading__meter {
+        width: min(320px, 72vw);
+        height: 2px;
+        margin: 24px 0 14px;
+        overflow: hidden;
+        background: #1e3037;
+      }
+
+      .loading__progress {
+        display: block;
+        width: 0;
+        height: 100%;
+        background: #2fe0c8;
+        transition: width 100ms linear;
+      }
+
+      .loading__meter--indeterminate .loading__progress {
+        width: 32%;
+        animation: progress-indeterminate 1.2s ease-in-out infinite alternate;
+      }
+
+      .loading__status,
+      .loading__detail {
+        margin: 0;
+        color: #74919a;
+        font-size: 10px;
+        font-weight: 400;
+        line-height: 1.6;
+        text-align: center;
+      }
+
+      .loading__detail {
+        min-height: 1.6em;
+        margin-top: 4px;
+        color: #465c64;
+        font-size: 9px;
+      }
+
+      .loading--error .loading__progress {
+        width: 100%;
+        background: #ec4aa0;
+      }
+
+      .loading--error .loading__status {
+        color: #ec4aa0;
+      }
+
+      @keyframes coin-boot {
+        0% { transform: scaleX(1); }
+        24% { transform: scaleX(0.06); }
+        50% { transform: scaleX(-1); }
+        76% { transform: scaleX(-0.06); }
+        100% { transform: scaleX(1); }
+      }
+
+      @keyframes progress-indeterminate {
+        from { transform: translateX(-105%); }
+        to { transform: translateX(318%); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .loading__coin,
+        .loading__meter--indeterminate .loading__progress {
+          animation: none;
+        }
+
+        .loading__meter--indeterminate .loading__progress {
+          transform: none;
+        }
+      }
     </style>
   </head>
   <body>
-    <idiosepius-app>Loading Idiosepius…</idiosepius-app>
-    <script type="module">
-      import init from "./pkg/idiosepius_app.js";
-      await init();
-    </script>
+    <idiosepius-app>
+      <main class="loading" id="loading">
+        <img
+          class="loading__coin"
+          src="./icons/icon-192.png"
+          alt=""
+          width="112"
+          height="112"
+        >
+        <h1 class="loading__title">Idiosepius</h1>
+        <div
+          class="loading__meter loading__meter--indeterminate"
+          id="loading-meter"
+          role="progressbar"
+          aria-label="Loading Idiosepius"
+        >
+          <span class="loading__progress" id="loading-progress"></span>
+        </div>
+        <p class="loading__status" id="loading-status" aria-live="polite">
+          Preparing
+        </p>
+        <p class="loading__detail" id="loading-detail">
+          First load prepares offline use
+        </p>
+      </main>
+    </idiosepius-app>
+    <script type="module" src="./bootstrap.js"></script>
   </body>
 </html>

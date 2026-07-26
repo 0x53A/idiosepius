@@ -12,8 +12,9 @@
 use std::collections::HashMap;
 
 use eframe::egui::{self, Align2, Color32, Pos2, Rect, Sense, Stroke, Ui, Vec2};
-use idiosepius_core::{Fact, FactKind, Id, Question, Seg, Store};
+use idiosepius_core::{Fact, FactKind, Id, Question, Seg, Store, content_text, content_transcript};
 
+use crate::blocks;
 use crate::richtext;
 use crate::theme::{Palette, text, tracked};
 
@@ -216,7 +217,7 @@ pub fn fact_block(ui: &mut Ui, fact: &Fact) {
                     }
                 }
             }
-            prose(ui, &fact.body, 14.5, Palette::TEXT);
+            blocks::show(ui, &fact.body, 14.5, Palette::TEXT);
             if let Some(src) = &fact.source {
                 prose(ui, src, 11.5, Palette::TEXT_FAINT);
             }
@@ -306,7 +307,7 @@ fn segments(q: &Question, depth: Depth) -> Vec<Seg> {
 }
 
 fn used_symbols<'a>(q: &Question, facts: &'a Facts, shown: &[Seg]) -> Vec<&'a Fact> {
-    let mut context = q.prompt.clone();
+    let mut context = content_text(&q.prompt);
     if let idiosepius_core::Body::MultipleChoice { options, .. } = &q.body {
         for o in options {
             context.push(' ');
@@ -391,8 +392,9 @@ fn fact_text(fact: &Fact) -> String {
     if !heading.trim().is_empty() {
         parts.push(heading);
     }
-    if !fact.body.trim().is_empty() {
-        parts.push(fact.body.trim().to_owned());
+    let body = content_transcript(&fact.body);
+    if !body.trim().is_empty() {
+        parts.push(body);
     }
     if let Some(source) = &fact.source
         && !source.trim().is_empty()
@@ -469,7 +471,9 @@ mod tests {
             label: None,
             name: None,
             title: Some("DC gain".into()),
-            body: r"Evaluate $G(s)$ at $s=0$.".into(),
+            body: vec![idiosepius_core::ContentBlock::text(
+                r"Evaluate $G(s)$ at $s=0$.",
+            )],
             source: Some("Lecture 2".into()),
         };
         let facts = Facts {
@@ -481,7 +485,7 @@ mod tests {
             deck_id: 1,
             topic_id: None,
             uid: "q".into(),
-            prompt: r"Find $G(0)$.".into(),
+            prompt: vec![idiosepius_core::ContentBlock::text(r"Find $G(0)$.")],
             body: Body::TrueFalse { answer: true },
             explanation: None,
             explain: Explain {

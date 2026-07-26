@@ -50,6 +50,13 @@ static HTTPS host. `run-web.sh` uses the fast development profile by default;
 pass `--release` for an optimized build. Other arguments are forwarded to
 `wasm-pack`, and `IDIOSEPIUS_WEB_PORT` selects a port other than 8000.
 
+The hosted app is installable as a PWA from the browser's install or
+Add to Home Screen action. Its application shell is cached after the first
+successful visit, so it can be launched and studied without a network
+connection; course data and study history remain in origin-private browser
+storage. Opening it while online refreshes the cached shell to the latest
+deployed build.
+
 The working database is saved automatically in origin-private browser storage.
 If none exists, the start screen can create an empty database or import an
 existing SQLite file. Afterwards the app owns the whole window: importing and

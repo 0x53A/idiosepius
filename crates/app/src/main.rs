@@ -3,11 +3,13 @@
 //! Single binary, no server: it opens the SQLite study file directly.
 
 mod app;
+mod blocks;
 mod card;
 mod coin;
 mod explain;
 mod import;
 mod math;
+mod plot;
 mod richtext;
 mod theme;
 

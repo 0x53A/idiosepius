@@ -10,7 +10,8 @@
 content that would in fact display correctly. That coupling is why the script
 lives in the application repository rather than beside the packs.
 """
-import json, re, sys, glob, os
+import json, re, sys, glob, os, math
+import xml.etree.ElementTree as ET
 
 SUPPORTED = set("""frac dfrac tfrac sqrt left right begin end
 text mathrm mathbf mathit mathsf mathcal mathbb operatorname
@@ -37,10 +38,28 @@ def walk(node, path, out):
         out.append((path, node))
     elif isinstance(node, dict):
         for k, v in node.items():
+            # SVG text is markup, not authored prose: dollar signs and
+            # backslashes inside it do not belong to the math renderer.
+            if node.get('kind') == 'svg' and k == 'src':
+                continue
             walk(v, f"{path}.{k}", out)
     elif isinstance(node, list):
         for i, v in enumerate(node):
             walk(v, f"{path}[{i}]", out)
+
+
+def walk_figures(node, path):
+    """Yield every figure block, wherever it occurs in authored content."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            here = f"{path}.{key}"
+            if key == 'figure':
+                yield here, value
+            else:
+                yield from walk_figures(value, here)
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            yield from walk_figures(value, f"{path}[{i}]")
 
 def packs(args):
     """Every pack named, expanding directories. No arguments: all modules."""
@@ -54,6 +73,69 @@ def packs(args):
     return out
 
 
+def validate_figure(figure, where):
+    """Return authoring problems for one inline figure specification."""
+    out = []
+    if not isinstance(figure, dict):
+        return [(where, 'FIGURE', 'figure must be an object')]
+    kind = figure.get('kind')
+    if kind not in {'bode', 'nyquist', 'step', 'svg'}:
+        return [(where, 'FIGURE', f'unknown figure kind {kind!r}')]
+
+    if kind == 'svg':
+        src = figure.get('src')
+        if not isinstance(src, str) or not src.strip():
+            return [(where, 'FIGURE', 'SVG src must be a non-empty string')]
+        try:
+            root = ET.fromstring(src)
+            if root.tag.rsplit('}', 1)[-1] != 'svg':
+                out.append((where, 'FIGURE', 'SVG src root element is not <svg>'))
+            for element in root.iter():
+                for attribute, value in element.attrib.items():
+                    if (attribute.rsplit('}', 1)[-1] == 'href'
+                            and not value.startswith(('data:', '#'))):
+                        out.append((where, 'FIGURE',
+                                    f'SVG external reference is not self-contained: {value!r}'))
+        except ET.ParseError as error:
+            out.append((where, 'FIGURE', f'invalid SVG XML: {error}'))
+        return out
+
+    arrays = {}
+    for name in ('num', 'den'):
+        values = figure.get(name)
+        if not isinstance(values, list) or not values:
+            out.append((where, 'FIGURE', f'{name} must be a non-empty array'))
+            continue
+        if any(isinstance(v, bool) or not isinstance(v, (int, float))
+               or not math.isfinite(v) for v in values):
+            out.append((where, 'FIGURE', f'{name} coefficients must be finite numbers'))
+            continue
+        arrays[name] = values
+
+    if 'den' in arrays and not any(abs(v) > 1e-12 for v in arrays['den']):
+        out.append((where, 'FIGURE', 'denominator must not be identically zero'))
+
+    if kind == 'bode' and 'phase' in figure and not isinstance(figure['phase'], bool):
+        out.append((where, 'FIGURE', 'phase must be true or false'))
+
+    if kind == 'step':
+        times = figure.get('t')
+        if (not isinstance(times, list) or len(times) != 2
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) for v in times)
+                or times[0] < 0 or times[1] <= times[0]):
+            out.append((where, 'FIGURE',
+                        't must be [start, end] with 0 <= start < end'))
+        if 'num' in arrays and 'den' in arrays:
+            degree = lambda a: len(a) - next(
+                (i for i, value in enumerate(a) if abs(value) > 1e-12),
+                len(a) - 1) - 1
+            if degree(arrays['num']) > degree(arrays['den']):
+                out.append((where, 'FIGURE',
+                            'step response requires a proper transfer function'))
+    return out
+
+
 files = packs(sys.argv[1:])
 if not files:
     print('no packs found', file=sys.stderr)
@@ -63,6 +145,9 @@ problems = []
 for f in files:
     doc = json.load(open(f))
     base = os.path.basename(f)
+    for where, figure in walk_figures(doc, ''):
+        for path, code, message in validate_figure(figure, where):
+            problems.append((base, path, code, message))
     strings = []
     walk(doc, '', strings)
     # A formula fact's label is maths without the fences, so check it as such.

@@ -363,7 +363,7 @@ mod tests {
                         deck_id: deck,
                         topic_id: None,
                         uid: format!("q{i}"),
-                        prompt: "?".into(),
+                        prompt: vec![ContentBlock::text("?")],
                         body: Body::TrueFalse { answer: true },
                         explanation: None,
                         explain: Default::default(),

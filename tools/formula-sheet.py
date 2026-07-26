@@ -67,6 +67,15 @@ def prose(src):
     return "".join(out)
 
 
+def content_text(content):
+    """Text from a shorthand string or ordered text/figure block array."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n\n".join(block for block in content if isinstance(block, str))
+    return ""
+
+
 PREAMBLE = r"""\documentclass[10pt,a4paper]{article}
 \usepackage{amsmath,amssymb,textcomp,xcolor,geometry,multicol,titlesec}
 \usepackage{fancyhdr,adjustbox,needspace}
@@ -125,8 +134,9 @@ def render(facts, terse):
             if f.get("title"):
                 body.append(f"\\entryname{{{text(f['title'])}}}")
             body.append(f"\\formula{{{math(f['label'])}}}")
-            if not terse and f.get("body"):
-                body.append(f"\\gloss{{{prose(f['body'])}}}")
+            gloss = content_text(f.get("body"))
+            if not terse and gloss:
+                body.append(f"\\gloss{{{prose(gloss)}}}")
             body.append(r"\end{entry}")
     return "\n".join(body)
 

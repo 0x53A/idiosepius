@@ -47,7 +47,7 @@ pub struct PackTopic {
     pub ord: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PackFact {
     pub uid: String,
     #[serde(default)]
@@ -61,7 +61,8 @@ pub struct PackFact {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    pub body: String,
+    #[serde(deserialize_with = "deserialize_content_blocks")]
+    pub body: Vec<ContentBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
@@ -71,7 +72,8 @@ pub struct PackQuestion {
     pub uid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
-    pub prompt: String,
+    #[serde(deserialize_with = "deserialize_content_blocks")]
+    pub prompt: Vec<ContentBlock>,
     /// `kind` plus its kind-specific fields, flattened into this object.
     #[serde(flatten)]
     pub body: Body,
@@ -92,6 +94,25 @@ pub struct PackQuestion {
 
 fn default_difficulty() -> u8 {
     2
+}
+
+/// Existing packs use a string when content is only prose. New content may
+/// use the full ordered array; serialisation always emits that canonical form.
+fn deserialize_content_blocks<'de, D>(deserializer: D) -> Result<Vec<ContentBlock>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Authored {
+        Text(String),
+        Blocks(Vec<ContentBlock>),
+    }
+
+    Ok(match Authored::deserialize(deserializer)? {
+        Authored::Text(text) => vec![ContentBlock::text(text)],
+        Authored::Blocks(blocks) => blocks,
+    })
 }
 
 /// Combine several packs that describe the same deck into one.
@@ -132,8 +153,8 @@ pub fn merge_packs(packs: Vec<Pack>) -> Result<Pack> {
             // mistake worth stopping for; the whole point of a fact is that
             // there is one wording of it.
             match merged.facts.iter().find(|e| e.uid == f.uid) {
-                Some(existing) if existing.body != f.body => {
-                    bail!("fact {:?} is defined twice, with different text", f.uid)
+                Some(existing) if existing != &f => {
+                    bail!("fact {:?} is defined twice, with different content", f.uid)
                 }
                 Some(_) => {}
                 None => merged.facts.push(f),
@@ -183,6 +204,13 @@ pub fn import_pack(store: &Store, pack: &Pack) -> Result<ImportReport> {
         if f.kind == FactKind::Formula && f.label.is_none() {
             bail!("formula fact {} has no label", f.uid);
         }
+        for block in &f.body {
+            if let ContentBlock::Figure { figure } = block {
+                figure
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("fact {}: {e}", f.uid))?;
+            }
+        }
     }
 
     let mut seen_uids = HashMap::new();
@@ -193,6 +221,13 @@ pub fn import_pack(store: &Store, pack: &Pack) -> Result<ImportReport> {
         q.body
             .validate()
             .map_err(|e| anyhow::anyhow!("question {}: {e}", q.uid))?;
+        for block in &q.prompt {
+            if let ContentBlock::Figure { figure } = block {
+                figure
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("question {}: {e}", q.uid))?;
+            }
+        }
         if let Some(t) = &q.topic
             && !pack.topics.iter().any(|pt| &pt.slug == t)
         {
@@ -339,9 +374,57 @@ mod tests {
     fn parses_the_flattened_authoring_format() {
         let p: Pack = serde_json::from_str(pack_json()).unwrap();
         assert_eq!(p.questions.len(), 2);
+        assert_eq!(
+            p.questions[0].prompt,
+            vec![ContentBlock::text(
+                "A BIBO-stable LTI system has all poles in the left half plane."
+            )],
+            "a string remains the convenient one-paragraph shorthand"
+        );
         assert_eq!(p.questions[0].body, Body::TrueFalse { answer: true });
         assert_eq!(p.questions[0].difficulty, 2, "difficulty defaults");
         assert!(matches!(p.questions[1].body, Body::MultipleChoice { .. }));
+    }
+
+    #[test]
+    fn parses_multiple_interspersed_figures_for_questions_and_facts() {
+        let source = r#"{
+          "deck": { "slug": "cs", "title": "Control Systems" },
+          "facts": [{
+            "uid": "comparison",
+            "body": [
+              "Frequency response:",
+              { "figure": { "kind": "nyquist", "num": [2], "den": [1, 4, 3] } },
+              "Time response:",
+              { "figure": { "kind": "step", "num": [4], "den": [1, 0.4, 4], "t": [0, 20] } }
+            ]
+          }],
+          "questions": [{
+            "uid": "cs-plots",
+            "prompt": [
+              "Inspect both views.",
+              { "figure": { "kind": "bode", "num": [1], "den": [1, 10, 0], "phase": true } },
+              "Then decide.",
+              { "figure": { "kind": "svg", "src": "<svg xmlns=\"http://www.w3.org/2000/svg\"/>" } }
+            ],
+            "kind": "true_false",
+            "answer": true
+          }]
+        }"#;
+
+        let pack: Pack = serde_json::from_str(source).unwrap();
+        assert_eq!(pack.questions[0].prompt.len(), 4);
+        assert_eq!(pack.facts[0].body.len(), 4);
+        assert!(matches!(
+            pack.questions[0].prompt[1],
+            ContentBlock::Figure {
+                figure: crate::Figure::Bode { .. }
+            }
+        ));
+
+        let canonical = serde_json::to_value(&pack).unwrap();
+        assert!(canonical["questions"][0]["prompt"].is_array());
+        assert!(canonical["facts"][0]["body"].is_array());
     }
 
     #[test]
@@ -393,7 +476,7 @@ mod tests {
         pack.questions.push(PackQuestion {
             uid: "cs-003".into(),
             topic: None,
-            prompt: "broken".into(),
+            prompt: vec![ContentBlock::text("broken")],
             body: Body::MultipleChoice {
                 options: vec![Choice::new("a", false), Choice::new("b", false)],
                 multi: false,
@@ -475,7 +558,10 @@ mod tests {
         }"#;
         let p: Pack = serde_json::from_str(src).unwrap();
         assert_eq!(p.facts[0].kind, FactKind::Formula);
-        assert_eq!(p.facts[0].label.as_deref(), Some("t_p = \\frac{\\pi}{\\omega_d}"));
+        assert_eq!(
+            p.facts[0].label.as_deref(),
+            Some("t_p = \\frac{\\pi}{\\omega_d}")
+        );
     }
 
     #[test]
@@ -537,7 +623,7 @@ mod tests {
     fn a_fact_defined_twice_with_different_wording_is_rejected() {
         let a: Pack = serde_json::from_str(FACT_PACK).unwrap();
         let mut b: Pack = serde_json::from_str(FACT_PACK).unwrap();
-        b.facts[0].body = "Something else entirely.".into();
+        b.facts[0].body = vec![ContentBlock::text("Something else entirely.")];
         let err = merge_packs(vec![a.clone(), b]).unwrap_err().to_string();
         assert!(err.contains("defined twice"), "{err}");
 
@@ -574,7 +660,9 @@ mod tests {
             questions: vec![PackQuestion {
                 uid: "cs-100".into(),
                 topic: Some("control".into()),
-                prompt: "A PI controller removes steady-state error.".into(),
+                prompt: vec![ContentBlock::text(
+                    "A PI controller removes steady-state error.",
+                )],
                 body: Body::TrueFalse { answer: true },
                 explanation: None,
                 explain: Default::default(),

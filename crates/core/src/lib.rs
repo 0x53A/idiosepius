@@ -30,6 +30,7 @@
 
 pub mod content;
 pub mod db;
+pub mod figure;
 pub mod model;
 pub mod scheduler;
 pub mod session;
@@ -40,7 +41,9 @@ pub mod stats;
 pub mod browser_io;
 
 pub use db::{NewFact, NewQuestion, Store};
+pub use figure::Figure;
 pub use model::{
-    Body, Choice, Explain, Fact, FactKind, Grade, Id, Kind, Millis, Question, Response, Seg, now_ms,
+    Body, Choice, ContentBlock, Explain, Fact, FactKind, Grade, Id, Kind, Millis, Question,
+    Response, Seg, content_text, content_transcript, now_ms,
 };
 pub use session::{Input, Mode, Session};

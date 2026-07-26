@@ -85,6 +85,8 @@ def question(q, indent):
             lines.append(f'{pad}  {enc(key)}: [\n{opts}\n{pad}  ]')
         elif key == "explain":
             lines.append(f'{pad}  {enc(key)}: {explain(value, indent + 2)}')
+        elif key == "prompt" and isinstance(value, list):
+            lines.append(f'{pad}  {enc(key)}: {segments(value, indent + 2)}')
         else:
             lines.append(f"{pad}  {enc(key)}: {enc(value)}")
     return "{\n" + ",\n".join(lines) + f"\n{pad}}}"
@@ -93,7 +95,11 @@ def question(q, indent):
 def fact(f, indent):
     pad = " " * indent
     order = [k for k in FACT_KEYS if k in f] + [k for k in f if k not in FACT_KEYS]
-    lines = [f"{pad}  {enc(k)}: {enc(f[k])}" for k in order]
+    lines = [
+        f"{pad}  {enc(k)}: "
+        + (segments(f[k], indent + 2) if k == "body" and isinstance(f[k], list) else enc(f[k]))
+        for k in order
+    ]
     return "{\n" + ",\n".join(lines) + f"\n{pad}}}"
 
 

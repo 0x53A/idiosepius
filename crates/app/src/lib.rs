@@ -7,6 +7,8 @@
 #[cfg(target_arch = "wasm32")]
 mod app;
 #[cfg(target_arch = "wasm32")]
+mod blocks;
+#[cfg(target_arch = "wasm32")]
 mod browser;
 #[cfg(target_arch = "wasm32")]
 mod card;
@@ -18,6 +20,8 @@ mod explain;
 mod import;
 #[cfg(target_arch = "wasm32")]
 mod math;
+#[cfg(target_arch = "wasm32")]
+mod plot;
 #[cfg(target_arch = "wasm32")]
 mod richtext;
 #[cfg(target_arch = "wasm32")]

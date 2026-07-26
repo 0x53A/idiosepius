@@ -2,7 +2,7 @@
 //! dump the log. The UI does not need this, but authoring and evaluation do.
 
 use anyhow::{Result, bail};
-use idiosepius_core::{Store, content, params, scheduler, stats};
+use idiosepius_core::{Store, content, content_text, params, scheduler, stats};
 
 const USAGE: &str = "\
 idiodb — inspect and load an idiosepius study database
@@ -126,7 +126,12 @@ fn main() -> Result<()> {
                     (None, _, Some(t)) => t.clone(),
                     _ => String::new(),
                 };
-                println!("  {:<18} {:<28} {}", f.uid, head, one_line(&f.body, 60));
+                println!(
+                    "  {:<18} {:<28} {}",
+                    f.uid,
+                    head,
+                    one_line(&content_text(&f.body), 60)
+                );
             }
         }
 

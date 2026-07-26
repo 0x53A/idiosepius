@@ -8,10 +8,8 @@ use crate::model::*;
 use crate::params;
 use crate::sql::{Conn, Row};
 
-/// Bumped whenever `schema.sql` changes in a way that needs a migration step.
-///
-/// v2 added the `fact` table and `question.explain`.
-const SCHEMA_VERSION: i64 = 2;
+/// Database format understood by this build.
+const SCHEMA_VERSION: i64 = 3;
 
 pub struct Store {
     conn: Conn,
@@ -87,29 +85,32 @@ impl Store {
     fn migrate(&mut self) -> Result<()> {
         let version = self.conn.pragma_int("user_version")?;
 
-        if version > SCHEMA_VERSION {
-            bail!(
-                "database was written by a newer version of idiosepius \
-                 (schema v{version}, this build understands v{SCHEMA_VERSION})"
-            );
+        match version {
+            0 => {
+                self.conn.execute_batch(include_str!("schema.sql"))?;
+                self.conn.pragma_set("user_version", SCHEMA_VERSION)?;
+            }
+            1 => {
+                // v1 predates structured explanations and the fact table.
+                // Bring its table set to v2 first, then apply the content-block
+                // rewrite below. Keeping this hop costs very little and avoids
+                // regressing the migration the previous release already had.
+                self.conn.execute_batch(include_str!("schema.sql"))?;
+                self.add_column_if_missing("question", "explain", "TEXT")?;
+                self.migrate_v2_to_v3()?;
+            }
+            2 => self.migrate_v2_to_v3()?,
+            SCHEMA_VERSION => {}
+            _ => {
+                bail!(
+                    "database schema v{version} is not supported by this build \
+                     (expected v{SCHEMA_VERSION})"
+                );
+            }
         }
-
-        // `schema.sql` is all `CREATE … IF NOT EXISTS`, so it brings a new file
-        // up to date and leaves an existing one alone. Only columns added to a
-        // table that already exists need a step of their own.
-        self.conn.execute_batch(include_str!("schema.sql"))?;
-        if version < 2 {
-            self.add_column_if_missing("question", "explain", "TEXT")?;
-        }
-        self.conn.pragma_set("user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
-    /// `ALTER TABLE … ADD COLUMN`, skipped when the column is already there.
-    ///
-    /// Probing with a `SELECT` rather than `PRAGMA table_info` keeps this
-    /// working on any driver that speaks SQL, which matters while the engine
-    /// underneath is still a pre-release.
     fn add_column_if_missing(&self, table: &str, column: &str, decl: &str) -> Result<()> {
         if self
             .conn
@@ -128,6 +129,42 @@ impl Store {
                 params![],
             )
             .with_context(|| format!("adding column {table}.{column}"))?;
+        Ok(())
+    }
+
+    /// v3 turns question prompts and fact bodies from raw prose into ordered
+    /// `ContentBlock` arrays. No identity, history or scheduler row changes.
+    fn migrate_v2_to_v3(&self) -> Result<()> {
+        let tx = self.conn.transaction()?;
+
+        let questions: Vec<(Id, String)> =
+            tx.query_all("SELECT id, prompt FROM question", params![], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        for (id, text) in questions {
+            let blocks = serde_json::to_string(&vec![ContentBlock::text(text)])?;
+            tx.execute(
+                "UPDATE question SET prompt = ?2 WHERE id = ?1",
+                params![id, blocks],
+            )
+            .with_context(|| format!("migrating prompt of question {id}"))?;
+        }
+
+        let facts: Vec<(Id, String)> =
+            tx.query_all("SELECT id, body FROM fact", params![], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        for (id, text) in facts {
+            let blocks = serde_json::to_string(&vec![ContentBlock::text(text)])?;
+            tx.execute(
+                "UPDATE fact SET body = ?2 WHERE id = ?1",
+                params![id, blocks],
+            )
+            .with_context(|| format!("migrating body of fact {id}"))?;
+        }
+
+        tx.pragma_set("user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -223,7 +260,15 @@ impl Store {
         q.body
             .validate()
             .map_err(|e| anyhow::anyhow!("question {}: {e}", q.uid))?;
+        for block in &q.prompt {
+            if let ContentBlock::Figure { figure } = block {
+                figure
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("question {}: {e}", q.uid))?;
+            }
+        }
 
+        let prompt = serde_json::to_string(&q.prompt)?;
         let payload = serde_json::to_string(&q.body)?;
         let tags = serde_json::to_string(&q.tags)?;
         let explain = if q.explain.is_empty() {
@@ -256,7 +301,7 @@ impl Store {
                 q.topic_id,
                 q.uid,
                 q.body.kind().as_str(),
-                q.prompt,
+                prompt,
                 payload,
                 q.explanation,
                 explain,
@@ -335,6 +380,14 @@ impl Store {
     /// and editing the wording of one must not orphan the questions that cite
     /// it.
     pub fn upsert_fact(&self, f: &NewFact) -> Result<Id> {
+        for block in &f.body {
+            if let ContentBlock::Figure { figure } = block {
+                figure
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("fact {}: {e}", f.uid))?;
+            }
+        }
+        let body = serde_json::to_string(&f.body)?;
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO fact
@@ -357,7 +410,7 @@ impl Store {
                 f.label,
                 f.name,
                 f.title,
-                f.body,
+                body,
                 f.source,
                 now,
             ],
@@ -402,7 +455,7 @@ pub struct NewQuestion {
     pub deck_id: Id,
     pub topic_id: Option<Id>,
     pub uid: String,
-    pub prompt: String,
+    pub prompt: Vec<ContentBlock>,
     pub body: Body,
     pub explanation: Option<String>,
     pub explain: Explain,
@@ -420,7 +473,7 @@ pub struct NewFact {
     pub label: Option<String>,
     pub name: Option<String>,
     pub title: Option<String>,
-    pub body: String,
+    pub body: Vec<ContentBlock>,
     pub source: Option<String>,
 }
 
@@ -440,19 +493,23 @@ const QUESTION_COLUMNS: &str = "id, deck_id, topic_id, uid, prompt, payload, \
                                 explanation, explain, difficulty, source, tags";
 
 fn question_from_row(r: &Row) -> Result<Question> {
+    let id: Id = r.get(0)?;
+    let prompt: String = r.get(4)?;
     let payload: String = r.get(5)?;
+    let prompt: Vec<ContentBlock> = serde_json::from_str(&prompt)
+        .with_context(|| format!("prompt of question {id} is not valid"))?;
+    let body: Body = serde_json::from_str(&payload)
+        .with_context(|| format!("payload of question {id} is not valid"))?;
     let explain: Option<String> = r.get(7)?;
     let tags: String = r.get(10)?;
-    let id: Id = r.get(0)?;
 
     Ok(Question {
         id,
         deck_id: r.get(1)?,
         topic_id: r.get(2)?,
         uid: r.get(3)?,
-        prompt: r.get(4)?,
-        body: serde_json::from_str(&payload)
-            .with_context(|| format!("payload of question {id} is not valid"))?,
+        prompt,
+        body,
         explanation: r.get(6)?,
         // A malformed explanation must not make a card unanswerable: the
         // question is still perfectly usable without its notes.
@@ -466,16 +523,20 @@ fn question_from_row(r: &Row) -> Result<Question> {
 }
 
 fn fact_from_row(r: &Row) -> Result<Fact> {
+    let uid: String = r.get(2)?;
     let kind: String = r.get(3)?;
+    let body: String = r.get(7)?;
+    let body: Vec<ContentBlock> = serde_json::from_str(&body)
+        .with_context(|| format!("body of fact {uid:?} is not valid"))?;
     Ok(Fact {
         id: r.get(0)?,
         deck_id: r.get(1)?,
-        uid: r.get(2)?,
+        uid,
         kind: FactKind::parse(&kind),
         label: r.get(4)?,
         name: r.get(5)?,
         title: r.get(6)?,
-        body: r.get(7)?,
+        body,
         source: r.get(8)?,
     })
 }
@@ -483,6 +544,7 @@ fn fact_from_row(r: &Row) -> Result<Fact> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Figure;
 
     fn store_with_deck() -> (Store, Id) {
         let s = Store::open_in_memory().unwrap();
@@ -495,7 +557,7 @@ mod tests {
             deck_id,
             topic_id: None,
             uid: uid.into(),
-            prompt: "Is this a test?".into(),
+            prompt: vec![ContentBlock::text("Is this a test?")],
             body: Body::TrueFalse { answer: true },
             explanation: None,
             explain: Default::default(),
@@ -514,6 +576,44 @@ mod tests {
         assert_eq!(got.uid, "u1");
         assert_eq!(got.body, Body::TrueFalse { answer: true });
         assert_eq!(got.tags, vec!["tag".to_string()]);
+    }
+
+    #[test]
+    fn question_and_fact_content_blocks_round_trip_in_order() {
+        let (s, deck) = store_with_deck();
+        let bode = Figure::Bode {
+            num: vec![1.0],
+            den: vec![1.0, 10.0, 0.0],
+            phase: true,
+        };
+        let step = Figure::Step {
+            num: vec![4.0],
+            den: vec![1.0, 0.4, 4.0],
+            t: [0.0, 20.0],
+        };
+        let mut authored = q(deck, "with-figure");
+        authored.prompt = vec![
+            ContentBlock::text("Read the frequency response."),
+            ContentBlock::figure(bode.clone()),
+            ContentBlock::text("Now compare its transient response."),
+            ContentBlock::figure(step.clone()),
+        ];
+        let id = s.upsert_question(&authored).unwrap();
+        assert_eq!(s.question(id).unwrap().unwrap().prompt, authored.prompt);
+
+        let mut authored_fact = fact("step-shape", "A lightly damped response.");
+        authored_fact.deck_id = Some(deck);
+        authored_fact.body = vec![
+            ContentBlock::text("Frequency domain:"),
+            ContentBlock::figure(bode),
+            ContentBlock::text("Time domain:"),
+            ContentBlock::figure(step),
+        ];
+        s.upsert_fact(&authored_fact).unwrap();
+        assert_eq!(
+            s.fact("step-shape").unwrap().unwrap().body,
+            authored_fact.body
+        );
     }
 
     /// An export has to be a file another copy of the app can open, which
@@ -557,7 +657,7 @@ mod tests {
         let first = s.upsert_question(&q(deck, "u1")).unwrap();
 
         let mut edited = q(deck, "u1");
-        edited.prompt = "Fixed typo?".into();
+        edited.prompt = vec![ContentBlock::text("Fixed typo?")];
         let second = s.upsert_question(&edited).unwrap();
 
         assert_eq!(
@@ -565,7 +665,10 @@ mod tests {
             "uid must pin the row identity across imports"
         );
         assert_eq!(s.question_count(deck).unwrap(), 1);
-        assert_eq!(s.question(first).unwrap().unwrap().prompt, "Fixed typo?");
+        assert_eq!(
+            s.question(first).unwrap().unwrap().prompt_text(),
+            "Fixed typo?"
+        );
     }
 
     #[test]
@@ -622,7 +725,7 @@ mod tests {
             label: Some("ζ".into()),
             name: Some("zeta".into()),
             title: None,
-            body: body.into(),
+            body: vec![ContentBlock::text(body)],
             source: None,
         }
     }
@@ -638,7 +741,7 @@ mod tests {
         assert_eq!(first, second, "editing a fact must not fork it");
         assert_eq!(s.fact_count().unwrap(), 1);
         assert_eq!(
-            s.fact("sym-zeta").unwrap().unwrap().body,
+            content_text(&s.fact("sym-zeta").unwrap().unwrap().body),
             "the damping ratio, dimensionless"
         );
     }
@@ -685,11 +788,11 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_schema_is_refused_rather_than_downgraded() {
+    fn a_different_schema_version_is_refused() {
         let mut s = Store::open_in_memory().unwrap();
         s.conn().pragma_set("user_version", 99).unwrap();
         let err = s.migrate().unwrap_err().to_string();
-        assert!(err.contains("newer version"), "{err}");
+        assert!(err.contains("not supported"), "{err}");
     }
 
     #[test]

@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 anyhow.workspace = true
 idiosepius-core = { version = "0.1.0", path = "../core" }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+resvg = { version = "0.45.1", default-features = false, features = ["text"] }
 serde_json.workspace = true
 web-time = "1.1.0"
 zip = { version = "4", default-features = false, features = ["deflate"] }

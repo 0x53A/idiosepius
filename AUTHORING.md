@@ -191,6 +191,49 @@ question faster to guess. Do not pad to five options with filler.
 Keep option lengths comparable — the longest option being the answer is the
 oldest tell in multiple choice.
 
+### Figures
+
+A question's `prompt` and a fact's `body` are ordered content. A plain string
+is shorthand for one text block. Use an array when text and figures need to be
+interspersed; it may contain any number of either:
+
+```json
+"prompt": [
+  "First inspect the open-loop response.",
+  { "figure": { "kind": "bode", "num": [1], "den": [1, 10, 0], "phase": true } },
+  "Which closed-loop response is consistent with it?",
+  { "figure": { "kind": "step", "num": [4], "den": [1, 0.4, 4], "t": [0, 20] } }
+]
+```
+
+The same array shape is valid for a fact's `body`. Transfer functions use
+coefficient arrays in descending powers of $s$, exactly like MATLAB's
+`tf(num, den)`. Do not write an expression string: arrays have no parsing
+ambiguity and represent complex poles without special syntax.
+
+Frequency bounds and ticks are chosen from the polynomial coefficients. A
+Bode figure draws magnitude and, when `phase` is true, a second phase panel.
+A step response needs a proper transfer function and a finite time interval
+with `0 <= start < end`.
+
+For a block diagram or another figure that is not a transfer-function plot,
+store the complete SVG inline:
+
+```json
+{ "figure": {
+    "kind": "svg",
+    "src": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 400 120\">...</svg>"
+} }
+```
+
+Keep it self-contained: no file paths or web URLs. Inline paths, shapes, text
+and data URLs travel with the pack; external image references are deliberately
+disabled. SVG is rasterised once and cached by content hash, then its textured
+rectangle tilts rigidly with a swiped card.
+
+`tools/check-packs.py` validates figure kinds, finite coefficients, the
+denominator, step ranges and SVG XML along with the usual maths spans.
+
 ---
 
 ## 5. `note`: per-option feedback

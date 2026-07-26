@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use crate::figure::Figure;
+
 pub type Id = i64;
 /// Milliseconds since the Unix epoch, UTC.
 pub type Millis = i64;
@@ -154,8 +156,8 @@ pub struct Question {
     pub deck_id: Id,
     pub topic_id: Option<Id>,
     pub uid: String,
-    /// Prose; `$...$` spans are LaTeX and rendered as such by the UI.
-    pub prompt: String,
+    /// Ordered prose and figures. Text blocks use `$...$` for LaTeX.
+    pub prompt: Vec<ContentBlock>,
     pub body: Body,
     /// Plain-text short explanation. Kept for content that predates
     /// [`Explain`], and as the fallback when `explain.short` is empty.
@@ -169,6 +171,11 @@ pub struct Question {
 }
 
 impl Question {
+    /// Text-only projection used by stats, transcripts and symbol discovery.
+    pub fn prompt_text(&self) -> String {
+        content_text(&self.prompt)
+    }
+
     /// What to show immediately after answering: the authored short reading,
     /// or the legacy plain-text explanation if there is no structured one.
     pub fn short(&self) -> Vec<Seg> {
@@ -189,6 +196,56 @@ impl Question {
 }
 
 // ------------------------------------------------------------------ facts --
+
+/// One ordered block in a question prompt or shared fact body.
+///
+/// A bare string is prose; a figure uses
+/// `{"figure": {"kind": "bode", ...}}`. Both forms live in one list so an
+/// author can place any number of plots between explanatory steps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContentBlock {
+    Text(String),
+    Figure { figure: Figure },
+}
+
+impl ContentBlock {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+
+    pub fn figure(figure: Figure) -> Self {
+        Self::Figure { figure }
+    }
+}
+
+/// Join prose blocks while omitting visual figures.
+pub fn content_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) if !text.trim().is_empty() => Some(text.trim()),
+            ContentBlock::Text(_) | ContentBlock::Figure { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Plain-text rendering used by exports and clipboard transcripts.
+///
+/// Figures retain their position as a short marker rather than disappearing,
+/// which makes a prompt with text after a plot intelligible when pasted.
+pub fn content_transcript(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) if text.trim().is_empty() => None,
+            ContentBlock::Text(text) => Some(text.trim().to_owned()),
+            ContentBlock::Figure { figure } => Some(format!("[{}]", figure.kind_name())),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
 
 /// A piece of an explanation: either literal prose or a reference to a
 /// [`Fact`] by uid.
@@ -297,8 +354,8 @@ pub struct Fact {
     pub name: Option<String>,
     /// Headline for a note.
     pub title: Option<String>,
-    /// The prose. `$...$` spans are LaTeX, as everywhere else.
-    pub body: String,
+    /// Ordered prose and figures quoted as this shared fact.
+    pub body: Vec<ContentBlock>,
     pub source: Option<String>,
 }
 

@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS question (
     -- duplicates, and the history in `attempt` survives content edits.
     uid         TEXT NOT NULL UNIQUE,
     kind        TEXT NOT NULL,
+    -- Ordered `ContentBlock` JSON: prose and any number of figures.
     prompt      TEXT NOT NULL,
     -- Kind-specific JSON (the `Body` enum). Kept as a blob so new question
     -- kinds do not need a schema migration.
@@ -77,6 +78,7 @@ CREATE TABLE IF NOT EXISTS fact (
     label      TEXT,
     name       TEXT,
     title      TEXT,
+    -- Ordered `ContentBlock` JSON: prose and any number of figures.
     body       TEXT NOT NULL,
     source     TEXT,
     created_at INTEGER NOT NULL,

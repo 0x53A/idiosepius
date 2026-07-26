@@ -10,9 +10,11 @@ use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, Sense, Shape, Stroke, 
 use idiosepius_core::model::{Deck, Topic};
 use idiosepius_core::session::{Event, Outcome};
 use idiosepius_core::{
-    Body, Grade, Input, Mode, Question, Response, Session, Store, now_ms, scheduler, stats,
+    Body, Grade, Input, Mode, Question, Response, Session, Store, content_transcript, now_ms,
+    scheduler, stats,
 };
 
+use crate::blocks;
 use crate::card::{self, Motion};
 use crate::coin::CoinAnimation;
 use crate::explain::{self, Depth, Facts};
@@ -1098,12 +1100,21 @@ impl App {
 
         match study.current.clone() {
             Some(q) => {
+                let card_width = stage.width().min(560.0) - 40.0;
+                let text_size = if q.prompt_text().chars().count() > 180 {
+                    16.5
+                } else {
+                    19.0
+                };
+                let prompt_height =
+                    blocks::layout(ui.painter(), &q.prompt, text_size, card_width - 56.0).height();
+                // The footer and top chrome need about 120 points around the
+                // content. Measuring the actual sequence lets a second plot
+                // grow the card just as another paragraph does.
+                let card_height = (prompt_height + 120.0).max(400.0);
                 let card_rect = Rect::from_center_size(
                     stage.center(),
-                    Vec2::new(
-                        stage.width().min(560.0) - 40.0,
-                        stage.height().min(420.0) - 20.0,
-                    ),
+                    Vec2::new(card_width, stage.height().min(card_height + 20.0) - 20.0),
                 );
                 match &q.body {
                     Body::TrueFalse { .. } => {
@@ -1403,7 +1414,7 @@ fn card_text(
     if let Some(topic) = topic.filter(|topic| !topic.trim().is_empty()) {
         let _ = writeln!(out, "{topic}\n");
     }
-    let _ = write!(out, "Question\n{}", question.prompt.trim());
+    let _ = write!(out, "Question\n{}", content_transcript(&question.prompt));
 
     match &question.body {
         Body::TrueFalse { answer } => {
@@ -1855,17 +1866,20 @@ impl App {
         // Prompt, wrapped and vertically centred. Formulas in it are laid out
         // by `math` and tilt with the card like any other ink on its face.
         let wrap = drawn.width() - 56.0;
-        let size = if q.prompt.chars().count() > 180 {
+        let size = if q.prompt_text().chars().count() > 180 {
             16.5
         } else {
             19.0
         };
-        let doc = richtext::layout(p, &q.prompt, size, wrap);
-        let local = Pos2::new(
-            drawn.left() + 28.0,
-            drawn.center().y - doc.height() / 2.0 - 6.0,
-        );
-        doc.paint_rotated(p, local, pivot, angle, Palette::TEXT, opacity);
+        let prompt = blocks::layout(p, &q.prompt, size, wrap);
+        let content_top = drawn.top() + 52.0;
+        let content_bottom = drawn.bottom() - 58.0;
+        let centered = drawn.center().y - prompt.height() / 2.0 - 6.0;
+        let local_y = centered
+            .max(content_top)
+            .min((content_bottom - prompt.height()).max(content_top));
+        let local = Pos2::new(drawn.left() + 28.0, local_y);
+        prompt.paint_rotated(p, local, pivot, angle, Palette::TEXT, opacity);
 
         // Footer rail with the two directions.
         card::text_centered(
@@ -1920,7 +1934,7 @@ impl App {
 
         // Measure first: the card is sized to its content, so a two-line
         // question does not sit in a half-empty box.
-        let prompt_doc = richtext::layout(ui.painter(), &q.prompt, 17.5, wrap);
+        let prompt = blocks::layout(ui.painter(), &q.prompt, 17.5, wrap);
         let option_docs: Vec<_> = options
             .iter()
             .map(|o| richtext::layout(ui.painter(), &o.text, 15.0, wrap - 54.0))
@@ -1964,7 +1978,7 @@ impl App {
             })
             .sum();
         let content_h =
-            48.0 + prompt_doc.height() + 22.0 + options_h + if multi { 50.0 } else { 0.0 } + 20.0;
+            48.0 + prompt.height() + 22.0 + options_h + if multi { 50.0 } else { 0.0 } + 20.0;
 
         let card_rect = Rect::from_center_size(
             stage.center(),
@@ -2003,8 +2017,8 @@ impl App {
             );
         }
 
-        let prompt_h = prompt_doc.height();
-        prompt_doc.paint(
+        let prompt_h = prompt.height();
+        prompt.paint(
             p,
             card_rect.left_top() + Vec2::new(24.0, 48.0),
             Palette::TEXT,
@@ -2528,7 +2542,7 @@ impl App {
         let facts = review.facts.clone();
         let depth = review.depth;
         explain::scroll_column(ui, body_rect, "review", |ui| {
-            explain::prose(ui, &q.prompt, 18.0, Palette::TEXT);
+            blocks::show(ui, &q.prompt, 18.0, Palette::TEXT);
             ui.add_space(4.0);
             answer_summary(ui, &item);
             ui.add_space(6.0);
@@ -2864,6 +2878,7 @@ fn headline() -> egui::FontId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use idiosepius_core::ContentBlock;
 
     fn clipboard_question() -> Question {
         Question {
@@ -2871,7 +2886,9 @@ mod tests {
             deck_id: 1,
             topic_id: None,
             uid: "clipboard".into(),
-            prompt: r"Which value follows from $G(s)=\frac{1}{s+1}$?".into(),
+            prompt: vec![ContentBlock::text(
+                r"Which value follows from $G(s)=\frac{1}{s+1}$?",
+            )],
             body: Body::MultipleChoice {
                 options: vec![
                     idiosepius_core::Choice::new(r"$G(0)=1$", true)
@@ -3034,7 +3051,7 @@ mod tests {
                 deck_id,
                 topic_id: None,
                 uid: "explain".into(),
-                prompt: "The statement is true.".into(),
+                prompt: vec![ContentBlock::text("The statement is true.")],
                 body: Body::TrueFalse { answer: true },
                 explanation: Some("Because it is.".into()),
                 explain: Default::default(),
