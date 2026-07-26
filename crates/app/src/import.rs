@@ -9,8 +9,16 @@ use std::io::{Cursor, Read};
 use anyhow::{Context, Result, bail};
 use idiosepius_core::content::{Pack, merge_packs};
 
-const MAX_JSON_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_JSON_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+
+pub const EXAMPLE_REPOSITORIES: [(&str, &str); 2] = [
+    (
+        "control systems",
+        "https://github.com/0x53A/idiosepius-control-systems",
+    ),
+    ("maths 2", "https://github.com/0x53A/idiosepius-math-2"),
+];
 
 pub struct PickedFile {
     pub name: String,

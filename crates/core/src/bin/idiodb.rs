@@ -39,8 +39,9 @@ fn main() -> Result<()> {
             let pack = content::merge_packs(packs)?;
             let report = content::import_pack(&mut store, &pack)?;
             println!(
-                "imported {} questions in {} topics, {} facts, into '{}'{}",
+                "imported {} questions and {} lessons in {} topics, {} facts, into '{}'{}",
                 report.questions,
+                report.lessons,
                 report.topics,
                 report.facts,
                 pack.deck.slug,
@@ -137,7 +138,7 @@ fn main() -> Result<()> {
 
         "events" => {
             let rows = store.conn().query_all(
-                "SELECT session_id, ts, mono_ms, question_id, kind, data
+                "SELECT session_id, ts, mono_ms, question_id, lesson_id, kind, data
                  FROM event ORDER BY id",
                 params![],
                 |r| {
@@ -146,8 +147,9 @@ fn main() -> Result<()> {
                         "ts": r.get::<i64>(1)?,
                         "mono_ms": r.get::<i64>(2)?,
                         "question": r.get::<Option<i64>>(3)?,
-                        "kind": r.get::<String>(4)?,
-                        "data": r.get::<Option<String>>(5)?
+                        "lesson": r.get::<Option<i64>>(4)?,
+                        "kind": r.get::<String>(5)?,
+                        "data": r.get::<Option<String>>(6)?
                             .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok()),
                     }))
                 },

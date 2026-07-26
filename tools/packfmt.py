@@ -36,6 +36,8 @@ QUESTION_KEYS = [
 
 FACT_KEYS = ["uid", "kind", "label", "name", "title", "body", "source"]
 
+LESSON_KEYS = ["uid", "topic", "ord", "title", "summary", "body", "practice", "source"]
+
 
 def enc(value):
     """One value, on one line."""
@@ -103,6 +105,18 @@ def fact(f, indent):
     return "{\n" + ",\n".join(lines) + f"\n{pad}}}"
 
 
+def lesson(l, indent):
+    """One lesson: a header block, then one body block per line."""
+    pad = " " * indent
+    order = [k for k in LESSON_KEYS if k in l] + [k for k in l if k not in LESSON_KEYS]
+    lines = [
+        f"{pad}  {enc(k)}: "
+        + (segments(l[k], indent + 2) if k == "body" else enc(l[k]))
+        for k in order
+    ]
+    return "{\n" + ",\n".join(lines) + f"\n{pad}}}"
+
+
 def format_pack(pack):
     out = ["{"]
     out.append('  "deck": {')
@@ -123,6 +137,11 @@ def format_pack(pack):
     if pack.get("facts"):
         out.append('  "facts": [')
         out.append(",\n".join("    " + fact(f, 4) for f in pack["facts"]))
+        out.append("  ],")
+
+    if pack.get("lessons"):
+        out.append('  "lessons": [')
+        out.append(",\n".join("    " + lesson(l, 4) for l in pack["lessons"]))
         out.append("  ],")
 
     out.append('  "questions": [')

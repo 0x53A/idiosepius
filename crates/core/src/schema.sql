@@ -87,6 +87,28 @@ CREATE TABLE IF NOT EXISTS fact (
 
 CREATE INDEX IF NOT EXISTS fact_deck_idx ON fact(deck_id);
 
+-- Ordered course readings. They organise teaching but do not gate questions.
+CREATE TABLE IF NOT EXISTS lesson (
+    id         INTEGER PRIMARY KEY,
+    deck_id    INTEGER NOT NULL REFERENCES deck(id) ON DELETE CASCADE,
+    topic_id   INTEGER NOT NULL REFERENCES topic(id) ON DELETE CASCADE,
+    uid        TEXT NOT NULL UNIQUE,
+    ord        INTEGER NOT NULL DEFAULT 0,
+    title      TEXT NOT NULL,
+    summary    TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    -- Ordered stable question uids. Retiring a question does not rewrite a
+    -- lesson; inactive or missing entries are simply omitted when practising.
+    practice   TEXT NOT NULL DEFAULT '[]',
+    source     TEXT,
+    active     INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS lesson_deck_idx  ON lesson(deck_id, active);
+CREATE INDEX IF NOT EXISTS lesson_topic_idx ON lesson(topic_id, ord);
+
 -- ------------------------------------------------------------------- log --
 
 CREATE TABLE IF NOT EXISTS session (
@@ -109,12 +131,14 @@ CREATE TABLE IF NOT EXISTS event (
     -- wall clock being changed mid-session.
     mono_ms     INTEGER NOT NULL,
     question_id INTEGER REFERENCES question(id) ON DELETE SET NULL,
+    lesson_id   INTEGER REFERENCES lesson(id) ON DELETE SET NULL,
     kind        TEXT NOT NULL,
     data        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS event_session_idx  ON event(session_id, id);
 CREATE INDEX IF NOT EXISTS event_question_idx ON event(question_id);
+CREATE INDEX IF NOT EXISTS event_lesson_idx   ON event(lesson_id);
 
 -- One row per committed answer. Derivable from `event`, but materialised
 -- because every stats query and the scheduler want it.

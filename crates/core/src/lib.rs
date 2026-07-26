@@ -40,10 +40,10 @@ pub mod stats;
 #[cfg(target_arch = "wasm32")]
 pub mod browser_io;
 
-pub use db::{NewFact, NewQuestion, Store};
+pub use db::{NewFact, NewLesson, NewQuestion, Store};
 pub use figure::Figure;
 pub use model::{
-    Body, Choice, ContentBlock, Explain, Fact, FactKind, Grade, Id, Kind, Millis, Question,
-    Response, Seg, content_text, content_transcript, now_ms,
+    Body, Choice, ContentBlock, Explain, Fact, FactKind, Grade, Id, Kind, Lesson, LessonBlock,
+    Millis, Question, Response, Seg, content_text, content_transcript, lesson_transcript, now_ms,
 };
 pub use session::{Input, Mode, Session};

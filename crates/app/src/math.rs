@@ -65,6 +65,13 @@ pub enum Big {
     Oint,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnAlign {
+    Left,
+    Center,
+    Right,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
     Row(Vec<Node>),
@@ -106,6 +113,12 @@ pub enum Node {
         right: Option<char>,
         /// `cases` aligns left; every other environment centres.
         align_left: bool,
+        /// Explicit `array` column spec; empty for the matrix environments.
+        column_align: Vec<ColumnAlign>,
+        /// Column-boundary indices carrying a vertical rule.
+        vertical_rules: Vec<usize>,
+        /// Row-boundary indices carrying a horizontal `\hline`.
+        horizontal_rules: Vec<usize>,
     },
     /// Explicit space, in multiples of the current font size.
     Space(f32),
@@ -200,7 +213,11 @@ impl<'a> Parser<'a> {
                 let rest: String = self.s[self.i..].iter().take(7).collect();
                 match stop {
                     Stop::Right => rest.starts_with("\\right"),
-                    Stop::EndEnv => rest.starts_with("\\end") || rest.starts_with("\\\\"),
+                    Stop::EndEnv => {
+                        rest.starts_with("\\end")
+                            || rest.starts_with("\\\\")
+                            || rest.starts_with("\\hline")
+                    }
                     _ => false,
                 }
             }
@@ -494,8 +511,14 @@ impl<'a> Parser<'a> {
             "cases" => (Some('{'), None, true),
             _ => (None, None, false),
         };
+        let (column_align, vertical_rules) = if env == "array" {
+            self.array_spec()
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         let mut rows: Vec<Vec<Node>> = vec![Vec::new()];
+        let mut horizontal_rules = Vec::new();
         loop {
             self.skip_space();
             if self.peek().is_none() {
@@ -511,6 +534,15 @@ impl<'a> Parser<'a> {
             if rest.starts_with("\\\\") {
                 self.i += 2;
                 rows.push(Vec::new());
+                continue;
+            }
+            let rest: String = self.s[self.i..].iter().take(6).collect();
+            if rest.starts_with("\\hline") {
+                self.i += 6;
+                let boundary = rows.len().saturating_sub(1);
+                if !horizontal_rules.contains(&boundary) {
+                    horizontal_rules.push(boundary);
+                }
                 continue;
             }
             if self.eat('&') {
@@ -533,7 +565,35 @@ impl<'a> Parser<'a> {
             left,
             right,
             align_left,
+            column_align,
+            vertical_rules,
+            horizontal_rules,
         }
+    }
+
+    /// Parse the `{l|cr}` immediately following `\begin{array}`. Unsupported
+    /// TeX column modifiers stay visible as empty columns are avoided; the
+    /// course only needs alignment letters and vertical rules for Routh
+    /// tables.
+    fn array_spec(&mut self) -> (Vec<ColumnAlign>, Vec<usize>) {
+        let spec = self.braced_word();
+        let mut columns = Vec::new();
+        let mut rules = Vec::new();
+        for c in spec.chars().filter(|c| !c.is_whitespace()) {
+            match c {
+                'l' => columns.push(ColumnAlign::Left),
+                'c' => columns.push(ColumnAlign::Center),
+                'r' => columns.push(ColumnAlign::Right),
+                '|' => {
+                    let boundary = columns.len();
+                    if !rules.contains(&boundary) {
+                        rules.push(boundary);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (columns, rules)
     }
 }
 
@@ -1008,7 +1068,20 @@ fn layout_node(painter: &Painter, node: &Node, size: f32) -> Bx {
             left,
             right,
             align_left,
-        } => layout_matrix(painter, rows, *left, *right, *align_left, size),
+            column_align,
+            vertical_rules,
+            horizontal_rules,
+        } => layout_matrix(
+            painter,
+            rows,
+            *left,
+            *right,
+            *align_left,
+            column_align,
+            vertical_rules,
+            horizontal_rules,
+            size,
+        ),
     }
 }
 
@@ -1514,6 +1587,9 @@ fn layout_matrix(
     left: Option<char>,
     right: Option<char>,
     align_left: bool,
+    column_align: &[ColumnAlign],
+    vertical_rules: &[usize],
+    horizontal_rules: &[usize],
     size: f32,
 ) -> Bx {
     let cells: Vec<Vec<Bx>> = rows
@@ -1536,24 +1612,59 @@ fn layout_matrix(
     // Stack the rows, then centre the whole grid on the axis.
     let mut items = Vec::new();
     let mut y = 0.0f32;
-    let mut heights = Vec::new();
+    let mut row_boundaries = vec![0.0];
     for row in &cells {
         let asc = row.iter().map(|c| c.ascent).fold(size * 0.5, f32::max);
         let des = row.iter().map(|c| c.descent).fold(size * 0.2, f32::max);
-        heights.push((asc, des));
         let mut x = 0.0f32;
         for (i, c) in row.iter().enumerate() {
-            let dx = if align_left {
-                0.0
+            let alignment = column_align.get(i).copied().unwrap_or(if align_left {
+                ColumnAlign::Left
             } else {
-                (col_w[i] - c.width) / 2.0
+                ColumnAlign::Center
+            });
+            let dx = match alignment {
+                ColumnAlign::Left => 0.0,
+                ColumnAlign::Center => (col_w[i] - c.width) / 2.0,
+                ColumnAlign::Right => col_w[i] - c.width,
             };
             items.extend(c.clone().shift(Vec2::new(x + dx, y + asc)).items);
             x += col_w[i] + col_gap;
         }
         y += asc + des + row_gap;
+        row_boundaries.push(y - row_gap / 2.0);
     }
     let total_h = (y - row_gap).max(0.0);
+    if let Some(last) = row_boundaries.last_mut() {
+        *last = total_h;
+    }
+
+    let rule = rule_width(size);
+    for &boundary in vertical_rules {
+        if boundary > cols {
+            continue;
+        }
+        let x = if boundary == 0 {
+            0.0
+        } else if boundary == cols {
+            total_w
+        } else {
+            col_w[..boundary].iter().sum::<f32>() + col_gap * (boundary as f32 - 0.5)
+        };
+        items.push(Item::Rule(Rect::from_min_size(
+            Pos2::new(x - rule / 2.0, 0.0),
+            Vec2::new(rule, total_h),
+        )));
+    }
+    for &boundary in horizontal_rules {
+        let Some(&y) = row_boundaries.get(boundary) else {
+            continue;
+        };
+        items.push(Item::Rule(Rect::from_min_size(
+            Pos2::new(0.0, y - rule / 2.0),
+            Vec2::new(total_w, rule),
+        )));
+    }
 
     let mut grid = Bx {
         items,
@@ -1733,6 +1844,28 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].len(), 2);
         assert_eq!(rows[1][1], sym("d"));
+    }
+
+    #[test]
+    fn an_array_keeps_column_alignment_and_rules() {
+        let n = parse(r"\begin{array}{r|cc} s^3 & 1 & 3 \\ \hline s^2 & 2 & 4 \end{array}");
+        let Node::Matrix {
+            rows,
+            column_align,
+            vertical_rules,
+            horizontal_rules,
+            ..
+        } = n
+        else {
+            panic!("expected an array")
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            column_align,
+            vec![ColumnAlign::Right, ColumnAlign::Center, ColumnAlign::Center]
+        );
+        assert_eq!(vertical_rules, vec![1]);
+        assert_eq!(horizontal_rules, vec![1]);
     }
 
     #[test]

@@ -19,6 +19,8 @@ mod explain;
 #[cfg(target_arch = "wasm32")]
 mod import;
 #[cfg(target_arch = "wasm32")]
+mod import_dialog;
+#[cfg(target_arch = "wasm32")]
 mod math;
 #[cfg(target_arch = "wasm32")]
 mod plot;

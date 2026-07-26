@@ -64,14 +64,24 @@ exporting are on the deck screen, exactly as they are on the desktop, and the
 only browser-specific chrome left is the word in the bottom corner saying
 whether storage is up to date. There is no prompt to export when leaving.
 
-**Import deck** — the dashed row below the last deck, on both the desktop and
-the web — accepts one or more flat JSON pack files, a ZIP containing any
-number of JSON packs, or a mixture of the two; the packs are merged before the
-UID-aware import runs. **Export database**, at the bottom of the same screen,
-writes an ordinary checkpointed SQLite file: on the desktop to a path you
-choose, in the browser as a download.
+**Import deck** sits in the dashed row below the last deck. On both the desktop
+and the web it offers three sources: local files, a short list of example
+course repositories, or the URL of any public GitHub repository. Local import
+accepts one or more flat JSON pack files, a ZIP containing any number of JSON
+packs, or a mixture of the two. A GitHub import finds every `.json` file in the
+repository recursively and merges the packs before the UID-aware import runs.
+It expects the repository's main URL
+(`https://github.com/owner/repository`), not a file, branch or directory URL.
+
+**Export database**, at the bottom of the same screen, writes an ordinary
+checkpointed SQLite file: on the desktop to a path you choose, in the browser
+as a download.
 
 ## Studying
+
+Opening a deck leads to its ordered lessons, complete question bank and
+progress. A lesson can be marked read and ends with an authored practice
+sequence; lessons organise teaching but never lock the rest of the bank.
 
 | | |
 |---|---|
@@ -81,7 +91,8 @@ choose, in the browser as a download.
 | `enter` | confirm a multi-select |
 | `s` | skip (recorded, not graded) |
 | `e` | show the answer and explanation (recorded as a skip) |
-| `u` | undo the last answer |
+| `u` | undo the answer currently showing |
+| `n`, `enter` or `space` | continue from an answer |
 | `r` | look back through answered cards |
 | `d` | switch between short and deep explanations |
 | `ctrl/cmd` + `c` | copy the visible screen as readable text; formulas stay LaTeX |
@@ -152,7 +163,7 @@ Systems deck is one file per topic.
 ```
 
 `kind` is `true_false` (with `answer`) or `multiple_choice` (with `options`,
-and `multi: true` when several are correct). Maths goes in `$…$` and is laid
+and `multi: true` when any number may be correct, including none). Maths goes in `$…$` and is laid
 out with fractions, roots, scripts, matrices and the other constructs the
 course uses. Bare quantities in running prose — "about 70°", "−20 dB/decade",
 "16 %" — stay plain text; the fences are for expressions, not for units.

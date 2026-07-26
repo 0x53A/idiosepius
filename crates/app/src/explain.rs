@@ -404,29 +404,6 @@ fn fact_text(fact: &Fact) -> String {
     parts.join("\n")
 }
 
-/// How tall the explanation would be in a column `width` wide.
-///
-/// Measured by laying it out for real into a clipped-away column rather than
-/// by adding up estimates: the panel has to be sized before it is drawn, and
-/// an estimate that drifts from the renderer shows up as a scrollbar on a
-/// two-line explanation.
-pub fn measure(ui: &mut Ui, width: f32, q: &Question, facts: &Facts, depth: Depth) -> f32 {
-    let ghost = Rect::from_min_size(Pos2::new(-20_000.0, -20_000.0), Vec2::new(width, 20_000.0));
-    let mut height = 0.0;
-    ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(ghost)
-            .id_salt("explain-measure"),
-        |ui| {
-            ui.set_clip_rect(Rect::NOTHING);
-            ui.spacing_mut().item_spacing.y = 8.0;
-            body(ui, q, facts, depth);
-            height = ui.min_rect().height();
-        },
-    );
-    height
-}
-
 /// Run `add` inside a scrolling column clipped to `rect`.
 ///
 /// A deep explanation with a glossary is routinely taller than the panel it

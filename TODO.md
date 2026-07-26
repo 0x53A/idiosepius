@@ -26,6 +26,29 @@ well as a `git mv`. Left alone deliberately; recorded in `AUTHORING.md` § 1.
 
 ## Done
 
+- **Plot questions were unreadable, and now they exist.** Reading a criterion
+  off a figure needs the line the criterion is stated against: Bode panels
+  carry 0 dB and $-180°$ rules, Nyquist marks $-1 + j0$ and the direction of
+  increasing $\omega$, and frequency padding is one decade rather than two.
+  A forced reference tick now displaces the regular tick that would print on
+  top of its label, and a magnitude curve that never rises above 0 dB gets no
+  second tick above it — both were making an axis unreadable. `\begin{array}`
+  with column specs, `|` and `\hline` came in at the same time, so a Routh
+  table can be shown rather than described. Five cards that had been drafted
+  and dropped are in: `cs-sta-043` (Bode, which line the curve crosses first),
+  `cs-sta-044` and `cs-sta-045` (Nyquist verdict and gain margin), `cs-sta-046`
+  (Routh in $\lambda$, exam 2023 problem 3) and `cs-ctl-028` (placing
+  $\omega_c$ for a required phase margin, exam 2023 problem 4.1).
+  What *coefficients* make a reading legible is now in `AUTHORING.md` § 4,
+  because it is not obvious and cost a full round of drafting to learn.
+- **Lessons are a complete vertical slice.** `Lesson` and `LessonBlock` live
+  beside the other authored content, schema v4 stores UID-stable readings,
+  merged-pack import validates topics, facts and practice uids, and removed
+  lessons retire without losing progress. The UI groups readings by authored
+  topic order, renders prose, quoted facts, figures, tracked headings and
+  centred display maths, and runs each practice list exactly in authored
+  order. Explicit read marks are append-only `lesson_read` events. Lessons
+  still do not gate the scheduler or question bank.
 - **Where the shared content tooling lives** — *settled*: this repository's
   `tools/`. `check-packs.py` is a mirror of `math.rs`'s `SUPPORTED` set and a
   mirror in another repository goes stale silently; the duplicate `packfmt.py`

@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 SUPPORTED = set("""frac dfrac tfrac sqrt left right begin end
 text mathrm mathbf mathit mathsf mathcal mathbb operatorname
 dot ddot hat widehat bar overline vec tilde widetilde
-sum prod int iint iiint oint quad qquad
+sum prod int iint iiint oint quad qquad hline
 alpha beta gamma delta epsilon varepsilon zeta eta theta vartheta iota kappa
 lambda mu nu xi pi rho sigma tau upsilon phi varphi chi psi omega
 Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega
@@ -154,6 +154,13 @@ for f in files:
     for fa in doc.get('facts', []):
         if fa.get('kind') == 'formula':
             strings.append((f".formula[{fa['uid']}]", '$' + fa['label'] + '$'))
+    # A lesson's display equation is maths without the fences, for the same
+    # reason: it is always set as maths.
+    for le in doc.get('lessons', []):
+        for i, block in enumerate(le.get('body', [])):
+            if isinstance(block, dict) and 'math' in block:
+                strings.append((f".lesson[{le['uid']}].body[{i}]",
+                                '$' + block['math'] + '$'))
     for path, s in strings:
         if s.count('$') % 2:
             problems.append((base, path, 'ODD-DOLLAR', s[:110]))

@@ -15,12 +15,13 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::app::{App, Request};
-use crate::import::{PickedFile, decode_packs};
+use crate::import::PickedFile;
 use crate::theme::{Palette, text, tracked};
 
 enum Event {
     DatabasePicked(Result<Option<Vec<u8>>, String>),
     DecksPicked(Result<Option<Vec<PickedFile>>, String>),
+    RepositoryLoaded(Result<Vec<PickedFile>, String>),
     Saved(Result<(), String>),
 }
 
@@ -141,6 +142,17 @@ impl BrowserApp {
         });
     }
 
+    fn load_repository(&mut self, ctx: &egui::Context, url: String) {
+        let promise = browser_load_github_repository(&url);
+        let events = self.events.clone();
+        let ctx = ctx.clone();
+        spawn_local(async move {
+            let result = picked_files(promise).await.map_err(display_js);
+            events.borrow_mut().push(Event::RepositoryLoaded(result));
+            ctx.request_repaint();
+        });
+    }
+
     fn export_database(&mut self) {
         let Some(app) = &mut self.app else { return };
         match app.export_database() {
@@ -163,17 +175,14 @@ impl BrowserApp {
                 Event::DatabasePicked(Err(error)) | Event::DecksPicked(Err(error)) => {
                     self.error = Some(error);
                 }
-                Event::DecksPicked(Ok(Some(files))) => {
-                    let Some(app) = &mut self.app else { continue };
-                    match decode_packs(files).and_then(|pack| app.import_pack(&pack)) {
-                        Ok(report) => {
-                            app.notify(format!("imported {} questions", report.questions));
-                            self.status = Some(format!(
-                                "Imported {} questions, {} topics, {} facts",
-                                report.questions, report.topics, report.facts
-                            ));
-                        }
-                        Err(error) => app.report_error(format!("deck import failed: {error:#}")),
+                Event::DecksPicked(Ok(Some(files))) | Event::RepositoryLoaded(Ok(files)) => {
+                    if let Some(app) = &mut self.app {
+                        app.import_picked_files(files);
+                    }
+                }
+                Event::RepositoryLoaded(Err(error)) => {
+                    if let Some(app) = &mut self.app {
+                        app.repository_import_failed(error);
                     }
                 }
                 Event::Saved(Ok(())) => {
@@ -312,7 +321,8 @@ impl eframe::App for BrowserApp {
                 None
             };
             match request {
-                Some(Request::ImportDeck) => self.pick_decks(ui.ctx()),
+                Some(Request::ImportLocalDeck) => self.pick_decks(ui.ctx()),
+                Some(Request::ImportGithub(url)) => self.load_repository(ui.ctx(), url),
                 Some(Request::ExportDatabase) => self.export_database(),
                 None => {}
             }
@@ -395,7 +405,14 @@ async fn picked_files(promise: js_sys::Promise) -> Result<Vec<PickedFile>, JsVal
 }
 
 fn display_js(value: JsValue) -> String {
-    value.as_string().unwrap_or_else(|| format!("{value:?}"))
+    value
+        .as_string()
+        .or_else(|| {
+            js_sys::Reflect::get(&value, &JsValue::from_str("message"))
+                .ok()?
+                .as_string()
+        })
+        .unwrap_or_else(|| format!("{value:?}"))
 }
 
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
@@ -464,6 +481,107 @@ export function browser_pick_files(accept, multiple) {
     });
 }
 
+export async function browser_load_github_repository(repositoryUrl) {
+    let parsed;
+    try {
+        parsed = new URL(repositoryUrl.trim());
+    } catch {
+        throw new Error("Enter a complete GitHub URL, for example https://github.com/owner/repository.");
+    }
+    const host = parsed.hostname.toLowerCase();
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    if (
+        parsed.protocol !== "https:" ||
+        (host !== "github.com" && host !== "www.github.com") ||
+        parts.length !== 2
+    ) {
+        throw new Error("Use the main URL of a public GitHub repository: https://github.com/owner/repository.");
+    }
+
+    const owner = parts[0];
+    const repository = parts[1].replace(/\.git$/i, "");
+    if (!owner || !repository) {
+        throw new Error("The GitHub URL must include both an owner and a repository.");
+    }
+
+    const apiUrl =
+        `https://api.github.com/repos/${encodeURIComponent(owner)}/` +
+        `${encodeURIComponent(repository)}/git/trees/HEAD?recursive=1`;
+    const treeResponse = await fetch(apiUrl, {
+        headers: {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    });
+    if (!treeResponse.ok) {
+        if (treeResponse.status === 404) {
+            throw new Error("Repository not found. Check the URL and make sure the repository is public.");
+        }
+        if (treeResponse.status === 403) {
+            throw new Error("GitHub refused the request, possibly because its anonymous API limit was reached. Try again later.");
+        }
+        throw new Error(`GitHub returned ${treeResponse.status} ${treeResponse.statusText}.`);
+    }
+
+    const tree = await treeResponse.json();
+    if (tree.truncated) {
+        throw new Error("This repository is too large for GitHub to return its complete file list.");
+    }
+    const jsonEntries = (tree.tree || []).filter(
+        (entry) =>
+            entry.type === "blob" &&
+            typeof entry.path === "string" &&
+            entry.path.toLowerCase().endsWith(".json"),
+    );
+    if (jsonEntries.length === 0) {
+        throw new Error("The repository contains no JSON files.");
+    }
+    if (jsonEntries.length > 256) {
+        throw new Error("The repository contains more than 256 JSON files.");
+    }
+
+    const maxFileBytes = 32 * 1024 * 1024;
+    const maxTotalBytes = 128 * 1024 * 1024;
+    let declaredTotal = 0;
+    for (const entry of jsonEntries) {
+        const size = Number(entry.size) || 0;
+        if (size > maxFileBytes) {
+            throw new Error(`${entry.path} is larger than 32 MiB.`);
+        }
+        declaredTotal += size;
+    }
+    if (declaredTotal > maxTotalBytes) {
+        throw new Error("The repository's JSON files are larger than 128 MiB in total.");
+    }
+
+    const commit = tree.sha;
+    const files = await Promise.all(jsonEntries.map(async (entry) => {
+        const path = entry.path.split("/").map(encodeURIComponent).join("/");
+        const rawUrl =
+            `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/` +
+            `${encodeURIComponent(repository)}/${encodeURIComponent(commit)}/${path}`;
+        const response = await fetch(rawUrl);
+        if (!response.ok) {
+            throw new Error(`Could not load ${entry.path}: ${response.status} ${response.statusText}.`);
+        }
+        return [entry.path, new Uint8Array(await response.arrayBuffer())];
+    }));
+
+    let actualTotal = 0;
+    const result = [];
+    for (const [name, bytes] of files) {
+        actualTotal += bytes.byteLength;
+        if (bytes.byteLength > maxFileBytes) {
+            throw new Error(`${name} is larger than 32 MiB.`);
+        }
+        if (actualTotal > maxTotalBytes) {
+            throw new Error("The repository's JSON files are larger than 128 MiB in total.");
+        }
+        result.push(name, bytes);
+    }
+    return result;
+}
+
 export function download_database(bytes) {
     const blob = new Blob([new Uint8Array(bytes)], { type: "application/vnd.sqlite3" });
     const url = URL.createObjectURL(blob);
@@ -484,5 +602,6 @@ extern "C" {
         wal: &js_sys::Uint8Array,
     ) -> js_sys::Promise;
     fn browser_pick_files(accept: &str, multiple: bool) -> js_sys::Promise;
+    fn browser_load_github_repository(repository_url: &str) -> js_sys::Promise;
     fn download_database(bytes: &[u8]);
 }

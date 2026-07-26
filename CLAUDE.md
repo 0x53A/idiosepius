@@ -20,8 +20,9 @@ cyan/violet for swipe direction, green/magenta (never red) for verdicts.
 - `content/` — one directory per module, each a separately versioned Git
   repository holding question packs: one JSON file per topic plus shared
   facts, merged on import. Currently `control-systems/` (deck `control-systems`,
-  prefix `cs`), `maths-2/` (deck `maths-2`, prefix `ma`, German) and
-  `automotive-mechatronics/` (deck `automotive-mechatronics`, prefix `atm`).
+  prefix `cs`), `maths-2/` (deck `maths-2`, prefix `ma`, German),
+  `automotive-mechatronics/` (deck `automotive-mechatronics`, prefix `atm`) and
+  `systemtheorie/` (deck `systemtheorie`, prefix `st`, German).
   The application repository ignores `content/`; do not assume one repository's
   staging or commit operation includes another's. **Each module has its own
   `CLAUDE.md`** with its course conventions — read it before editing a pack,
@@ -29,8 +30,9 @@ cyan/violet for swipe direction, green/magenta (never red) for verdicts.
   in this repository so there is one copy of it rather than one per course.
 
   One import invocation covers one deck, but one database holds as many decks
-  as you like: `./reimport.sh -m cs`, `-m ma` and `-m atm` against the same
-  path put all three on the start screen with separate exam dates and schedules.
+  as you like: `./reimport.sh -m cs`, `-m ma`, `-m atm` and `-m st` against the
+  same path put all four on the start screen with separate exam dates and
+  schedules.
 
 ## Things worth knowing
 

@@ -1,6 +1,7 @@
 //! Database handle, migrations, and content access.
 
 use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
@@ -9,7 +10,7 @@ use crate::params;
 use crate::sql::{Conn, Row};
 
 /// Database format understood by this build.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub struct Store {
     conn: Conn,
@@ -98,8 +99,13 @@ impl Store {
                 self.conn.execute_batch(include_str!("schema.sql"))?;
                 self.add_column_if_missing("question", "explain", "TEXT")?;
                 self.migrate_v2_to_v3()?;
+                self.migrate_v3_to_v4()?;
             }
-            2 => self.migrate_v2_to_v3()?,
+            2 => {
+                self.migrate_v2_to_v3()?;
+                self.migrate_v3_to_v4()?;
+            }
+            3 => self.migrate_v3_to_v4()?,
             SCHEMA_VERSION => {}
             _ => {
                 bail!(
@@ -163,8 +169,44 @@ impl Store {
             .with_context(|| format!("migrating body of fact {id}"))?;
         }
 
-        tx.pragma_set("user_version", SCHEMA_VERSION)?;
+        tx.pragma_set("user_version", 3)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// v4 adds authored lessons and lets append-only events refer to one.
+    fn migrate_v3_to_v4(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS lesson (
+                id INTEGER PRIMARY KEY,
+                deck_id INTEGER NOT NULL REFERENCES deck(id) ON DELETE CASCADE,
+                topic_id INTEGER NOT NULL REFERENCES topic(id) ON DELETE CASCADE,
+                uid TEXT NOT NULL UNIQUE,
+                ord INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                body TEXT NOT NULL,
+                practice TEXT NOT NULL DEFAULT '[]',
+                source TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS lesson_deck_idx
+                 ON lesson(deck_id, active);
+             CREATE INDEX IF NOT EXISTS lesson_topic_idx
+                 ON lesson(topic_id, ord);",
+        )?;
+        self.add_column_if_missing(
+            "event",
+            "lesson_id",
+            "INTEGER REFERENCES lesson(id) ON DELETE SET NULL",
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS event_lesson_idx ON event(lesson_id)",
+            params![],
+        )?;
+        self.conn.pragma_set("user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -248,6 +290,128 @@ impl Store {
                 })
             },
         )
+    }
+
+    // ---------------------------------------------------------- lessons --
+
+    /// Insert or update a lesson by its stable authored uid.
+    pub fn upsert_lesson(&self, lesson: &NewLesson) -> Result<Id> {
+        for block in &lesson.body {
+            if let LessonBlock::Figure { figure } = block {
+                figure
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("lesson {}: {e}", lesson.uid))?;
+            }
+        }
+        let body = serde_json::to_string(&lesson.body)?;
+        let practice = serde_json::to_string(&lesson.practice)?;
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO lesson
+                 (deck_id, topic_id, uid, ord, title, summary, body, practice,
+                  source, active, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)
+             ON CONFLICT(uid) DO UPDATE SET
+                 deck_id = excluded.deck_id,
+                 topic_id = excluded.topic_id,
+                 ord = excluded.ord,
+                 title = excluded.title,
+                 summary = excluded.summary,
+                 body = excluded.body,
+                 practice = excluded.practice,
+                 source = excluded.source,
+                 active = 1,
+                 updated_at = excluded.updated_at",
+            params![
+                lesson.deck_id,
+                lesson.topic_id,
+                lesson.uid,
+                lesson.ord,
+                lesson.title,
+                lesson.summary,
+                body,
+                practice,
+                lesson.source,
+                now,
+            ],
+        )?;
+        self.conn.query_row(
+            "SELECT id FROM lesson WHERE uid = ?1",
+            params![&lesson.uid],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn lessons(&self, deck_id: Id) -> Result<Vec<Lesson>> {
+        self.conn.query_all(
+            &format!(
+                "SELECT {LESSON_COLUMNS} FROM lesson
+                 WHERE deck_id = ?1 AND active = 1
+                 ORDER BY (
+                     SELECT ord FROM topic WHERE topic.id = lesson.topic_id
+                 ), ord, id"
+            ),
+            params![deck_id],
+            lesson_from_row,
+        )
+    }
+
+    pub fn lesson(&self, id: Id) -> Result<Option<Lesson>> {
+        self.conn.query_row_opt(
+            &format!("SELECT {LESSON_COLUMNS} FROM lesson WHERE id = ?1"),
+            params![id],
+            lesson_from_row,
+        )
+    }
+
+    pub fn lesson_count(&self, deck_id: Id) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM lesson WHERE deck_id = ?1 AND active = 1",
+            params![deck_id],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn deactivate_deck_lessons(&self, deck_id: Id) -> Result<usize> {
+        self.conn.execute(
+            "UPDATE lesson SET active = 0 WHERE deck_id = ?1",
+            params![deck_id],
+        )
+    }
+
+    /// Questions named by stable uid, preserving the authored order.
+    ///
+    /// Missing and retired questions are omitted. This keeps an old lesson
+    /// usable after a card is retired without ever broadening practice beyond
+    /// the lesson's explicit list.
+    pub fn questions_by_uids(&self, deck_id: Id, uids: &[String]) -> Result<Vec<Question>> {
+        let mut questions = Vec::with_capacity(uids.len());
+        for uid in uids {
+            if let Some(question) = self.conn.query_row_opt(
+                &format!(
+                    "SELECT {QUESTION_COLUMNS} FROM question
+                     WHERE uid = ?1 AND deck_id = ?2 AND active = 1"
+                ),
+                params![uid, deck_id],
+                question_from_row,
+            )? {
+                questions.push(question);
+            }
+        }
+        Ok(questions)
+    }
+
+    /// Lesson ids with at least one append-only `lesson_read` event.
+    pub fn read_lesson_ids(&self, deck_id: Id) -> Result<std::collections::HashSet<Id>> {
+        let ids: Vec<Id> = self.conn.query_all(
+            "SELECT DISTINCT e.lesson_id
+             FROM event e
+             JOIN lesson l ON l.id = e.lesson_id
+             WHERE l.deck_id = ?1 AND e.kind = 'lesson_read'",
+            params![deck_id],
+            |row| row.get(0),
+        )?;
+        Ok(ids.into_iter().collect())
     }
 
     // --------------------------------------------------------- questions --
@@ -349,11 +513,38 @@ impl Store {
         self.conn.query_all(
             &format!(
                 "SELECT {QUESTION_COLUMNS} FROM question
-                 WHERE deck_id = ?1 AND active = 1 ORDER BY id"
+                 WHERE deck_id = ?1 AND active = 1
+                 ORDER BY COALESCE(
+                     (SELECT ord FROM topic WHERE topic.id = question.topic_id),
+                     9223372036854775807
+                 ),
+                 topic_id,
+                 id"
             ),
             params![deck_id],
             question_from_row,
         )
+    }
+
+    /// The latest recorded verdict for each attempted question in a deck.
+    ///
+    /// Questions absent from the map have never been answered. A reveal or
+    /// skip is deliberately absent too: neither creates an attempt.
+    pub fn latest_question_results(&self, deck_id: Id) -> Result<HashMap<Id, bool>> {
+        let rows: Vec<(Id, bool)> = self.conn.query_all(
+            "SELECT a.question_id, a.correct
+             FROM attempt a
+             JOIN question q ON q.id = a.question_id
+             WHERE q.deck_id = ?1
+               AND a.id = (
+                   SELECT MAX(latest.id)
+                   FROM attempt latest
+                   WHERE latest.question_id = a.question_id
+               )",
+            params![deck_id],
+            |r| Ok((r.get(0)?, r.get::<i64>(1)? != 0)),
+        )?;
+        Ok(rows.into_iter().collect())
     }
 
     pub fn question_count(&self, deck_id: Id) -> Result<i64> {
@@ -464,6 +655,20 @@ pub struct NewQuestion {
     pub tags: Vec<String>,
 }
 
+/// A lesson as authored, before it has a database id.
+#[derive(Debug, Clone)]
+pub struct NewLesson {
+    pub deck_id: Id,
+    pub topic_id: Id,
+    pub uid: String,
+    pub ord: i64,
+    pub title: String,
+    pub summary: String,
+    pub body: Vec<LessonBlock>,
+    pub practice: Vec<String>,
+    pub source: Option<String>,
+}
+
 /// A fact as authored, before it has an id.
 #[derive(Debug, Clone)]
 pub struct NewFact {
@@ -491,6 +696,29 @@ fn deck_from_row(r: &Row) -> Result<Deck> {
 /// queries that read a question cannot drift apart.
 const QUESTION_COLUMNS: &str = "id, deck_id, topic_id, uid, prompt, payload, \
                                 explanation, explain, difficulty, source, tags";
+
+const LESSON_COLUMNS: &str =
+    "id, deck_id, topic_id, uid, ord, title, summary, body, practice, source";
+
+fn lesson_from_row(r: &Row) -> Result<Lesson> {
+    let uid: String = r.get(3)?;
+    let body: String = r.get(7)?;
+    let practice: String = r.get(8)?;
+    Ok(Lesson {
+        id: r.get(0)?,
+        deck_id: r.get(1)?,
+        topic_id: r.get(2)?,
+        uid: uid.clone(),
+        ord: r.get(4)?,
+        title: r.get(5)?,
+        summary: r.get(6)?,
+        body: serde_json::from_str(&body)
+            .with_context(|| format!("body of lesson {uid:?} is not valid"))?,
+        practice: serde_json::from_str(&practice)
+            .with_context(|| format!("practice list of lesson {uid:?} is not valid"))?,
+        source: r.get(9)?,
+    })
+}
 
 fn question_from_row(r: &Row) -> Result<Question> {
     let id: Id = r.get(0)?;
@@ -545,6 +773,8 @@ fn fact_from_row(r: &Row) -> Result<Fact> {
 mod tests {
     use super::*;
     use crate::Figure;
+    use crate::session::{Input, Mode, Session};
+    use std::rc::Rc;
 
     fn store_with_deck() -> (Store, Id) {
         let s = Store::open_in_memory().unwrap();
@@ -818,5 +1048,64 @@ mod tests {
         // Re-importing brings it back, same row.
         s.upsert_question(&q(deck, "u1")).unwrap();
         assert_eq!(s.question_count(deck).unwrap(), 1);
+    }
+
+    #[test]
+    fn questions_follow_topic_order_and_latest_results_ignore_unattempted_cards() {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let deck = store.upsert_deck("test", "Test", None, None).unwrap();
+        let later = store.upsert_topic(deck, "later", "Later", 2).unwrap();
+        let earlier = store.upsert_topic(deck, "earlier", "Earlier", 1).unwrap();
+
+        let mut later_question = q(deck, "later-question");
+        later_question.topic_id = Some(later);
+        let later_id = store.upsert_question(&later_question).unwrap();
+
+        let mut earlier_question = q(deck, "earlier-question");
+        earlier_question.topic_id = Some(earlier);
+        let earlier_id = store.upsert_question(&earlier_question).unwrap();
+
+        let mut unattempted = q(deck, "unattempted");
+        unattempted.topic_id = Some(earlier);
+        let unattempted_id = store.upsert_question(&unattempted).unwrap();
+
+        let ordered: Vec<_> = store
+            .questions(deck)
+            .unwrap()
+            .into_iter()
+            .map(|question| question.id)
+            .collect();
+        assert_eq!(ordered, vec![earlier_id, unattempted_id, later_id]);
+
+        let mut session = Session::start(store.clone(), deck, Mode::Practice).unwrap();
+        let earlier_question = store.question(earlier_id).unwrap().unwrap();
+        session
+            .answer(
+                &earlier_question,
+                &Response::TrueFalse { value: true },
+                Input::Click,
+            )
+            .unwrap();
+        session
+            .answer(
+                &earlier_question,
+                &Response::TrueFalse { value: false },
+                Input::Click,
+            )
+            .unwrap();
+        let later_question = store.question(later_id).unwrap().unwrap();
+        session
+            .answer(
+                &later_question,
+                &Response::TrueFalse { value: true },
+                Input::Click,
+            )
+            .unwrap();
+        session.skip(unattempted_id);
+
+        let results = store.latest_question_results(deck).unwrap();
+        assert_eq!(results.get(&earlier_id), Some(&false));
+        assert_eq!(results.get(&later_id), Some(&true));
+        assert!(!results.contains_key(&unattempted_id));
     }
 }

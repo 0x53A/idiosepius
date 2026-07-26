@@ -8,7 +8,10 @@ mod card;
 mod coin;
 mod explain;
 mod import;
+mod import_dialog;
 mod math;
+#[cfg(not(target_arch = "wasm32"))]
+mod native_github;
 mod plot;
 mod richtext;
 mod theme;
@@ -29,8 +32,8 @@ USAGE
 KEYS
     ← →   answer false / true        1-5    pick an option
     e     explain (counts as skip)   s      skip
-    d     short/deep explanation     r      review answered cards
-    u     undo the last answer       enter  confirm / continue
+    d     short/deep explanation     u      undo the shown answer
+    n/enter  confirm / continue
     Ctrl/Cmd+C  copy visible text    Ctrl/Cmd+±  scale interface
     esc   end the session
 ";
@@ -59,8 +62,8 @@ fn main() -> Result<()> {
         let pack = content::merge_packs(packs)?;
         let report = content::import_pack(&mut store, &pack)?;
         println!(
-            "imported {} questions into '{}'",
-            report.questions, pack.deck.slug
+            "imported {} questions and {} lessons into '{}'",
+            report.questions, report.lessons, pack.deck.slug
         );
     }
 

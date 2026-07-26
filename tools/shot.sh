@@ -87,7 +87,16 @@ shoot() {
 }
 
 shoot math      --screen math
+shoot plots     --screen plots
+shoot plot-zoom --screen plot-zoom
 shoot decks     --screen decks
+shoot course    --screen course
+shoot lessons   --screen lessons
+shoot lesson    --screen lesson
+shoot questions --screen questions
+shoot questions-scroll    --screen questions-scroll
+shoot questions-collapsed --screen questions-collapsed
+shoot progress  --screen progress
 shoot choice    --screen study --card "$choice"
 shoot truefalse --screen study --card "$truefalse"
 shoot hover     --screen hover --card "$truefalse"
@@ -103,5 +112,21 @@ shoot review    --screen review --card "$truefalse"
 # and the same card in review, where every note is shown.
 shoot notes-picked --screen feedback --card "$choice"
 shoot notes-all    --screen review --card "$choice"
+
+# A short viewport with enough decks to force the home list to scroll. Add
+# these only after every content-specific capture, so the first deck selected
+# by the screenshot routes stays the real imported module.
+for n in 2 3 4 5 6; do
+  sqlite3 "$db" \
+    "INSERT INTO deck (slug, title, description, exam_at, created_at)
+     VALUES ('shot-$n', 'Screenshot Deck $n', NULL, NULL, $n)"
+done
+env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 620x420x24" \
+  env LIBGL_ALWAYS_SOFTWARE=1 \
+  ./target/debug/idiosepius-app "$db" --shot "$out/decks-small.pam" --screen decks 2>/dev/null
+if command -v magick >/dev/null; then
+  magick "$out/decks-small.pam" "$out/decks-small.png" && rm -f "$out/decks-small.pam"
+  echo "  $out/decks-small.png"
+fi
 
 echo "done"

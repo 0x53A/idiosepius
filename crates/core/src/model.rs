@@ -36,6 +36,65 @@ pub struct Topic {
     pub ord: i64,
 }
 
+// ---------------------------------------------------------------- lessons --
+
+/// A course reading. Lessons organise authored teaching but never affect
+/// whether a question is available to the scheduler.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lesson {
+    pub id: Id,
+    pub deck_id: Id,
+    pub topic_id: Id,
+    pub uid: String,
+    pub ord: i64,
+    pub title: String,
+    pub summary: String,
+    pub body: Vec<LessonBlock>,
+    /// Stable question uids, in the order the reading taught them.
+    pub practice: Vec<String>,
+    pub source: Option<String>,
+}
+
+/// One ordered block in a lesson body.
+///
+/// This is deliberately separate from [`ContentBlock`]: prompts and facts may
+/// contain prose and figures, but a lesson additionally quotes facts and owns
+/// section headings and display-maths steps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LessonBlock {
+    Text(String),
+    Heading { heading: String },
+    Math { math: String },
+    Fact { fact: String },
+    Figure { figure: Figure },
+}
+
+impl LessonBlock {
+    pub fn fact_uid(&self) -> Option<&str> {
+        match self {
+            LessonBlock::Fact { fact } => Some(fact),
+            _ => None,
+        }
+    }
+}
+
+/// Plain-text projection used by clipboard transcripts.
+pub fn lesson_transcript(blocks: &[LessonBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            LessonBlock::Text(text) if text.trim().is_empty() => None,
+            LessonBlock::Text(text) => Some(text.trim().to_owned()),
+            LessonBlock::Heading { heading } => Some(heading.trim().to_owned()),
+            LessonBlock::Math { math } => Some(format!("$${}$$", math.trim())),
+            LessonBlock::Fact { fact } => Some(format!("[fact: {fact}]")),
+            LessonBlock::Figure { figure } => Some(format!("[{}]", figure.kind_name())),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 // -------------------------------------------------------------- questions --
 
 /// The kind-specific half of a question. Serialised into `question.payload`,
@@ -45,10 +104,11 @@ pub struct Topic {
 pub enum Body {
     /// Swipe left / right. `answer` is what a "true" swipe should mean.
     TrueFalse { answer: bool },
-    /// One or more correct options out of several.
+    /// Zero or more correct options out of several.
     MultipleChoice {
         options: Vec<Choice>,
-        /// More than one option may be correct, and the user must find all.
+        /// Any number of options may be correct, and the user must find all.
+        /// An empty selection is therefore a valid answer when none apply.
         #[serde(default)]
         multi: bool,
     },
@@ -101,9 +161,7 @@ impl Body {
         }
     }
 
-    /// Reject content that would render as an unanswerable card. Worth doing
-    /// at import time: a multiple-choice question with no correct option is a
-    /// typo that would otherwise silently mark every answer wrong.
+    /// Reject content that would render as an unanswerable card.
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Body::TrueFalse { .. } => Ok(()),
@@ -112,7 +170,7 @@ impl Body {
                     return Err(format!("needs at least 2 options, has {}", options.len()));
                 }
                 let n_correct = options.iter().filter(|c| c.correct).count();
-                if n_correct == 0 {
+                if !multi && n_correct == 0 {
                     return Err("no option is marked correct".into());
                 }
                 if !multi && n_correct > 1 {
@@ -472,7 +530,13 @@ impl Body {
             (Body::MultipleChoice { options, .. }, Response::MultipleChoice { selected }) => {
                 let n_correct = options.iter().filter(|c| c.correct).count();
                 if n_correct == 0 {
-                    return Grade::WRONG; // Malformed content; validate() catches it at import.
+                    // A multi-select may deliberately have no applicable
+                    // options. Any selected option makes that answer wrong.
+                    return if selected.is_empty() {
+                        Grade::RIGHT
+                    } else {
+                        Grade::WRONG
+                    };
                 }
 
                 let mut hits = 0usize;
@@ -566,6 +630,22 @@ mod tests {
     }
 
     #[test]
+    fn multi_choice_can_have_an_empty_correct_set() {
+        let b = mc(&[false, false, false], true);
+        assert!(b.validate().is_ok());
+        assert!(
+            b.grade(&Response::MultipleChoice {
+                selected: Vec::new()
+            })
+            .correct
+        );
+        assert!(
+            !b.grade(&Response::MultipleChoice { selected: vec![0] })
+                .correct
+        );
+    }
+
+    #[test]
     fn duplicate_selection_cannot_inflate_score() {
         let b = mc(&[true, true, false], true);
         let g = b.grade(&Response::MultipleChoice {
@@ -586,6 +666,7 @@ mod tests {
     fn validation_catches_broken_content() {
         assert!(mc(&[true, false], false).validate().is_ok());
         assert!(mc(&[false, false], false).validate().is_err());
+        assert!(mc(&[false, false], true).validate().is_ok());
         assert!(mc(&[true, true], false).validate().is_err());
         assert!(mc(&[true, true], true).validate().is_ok());
         assert!(mc(&[true], false).validate().is_err());

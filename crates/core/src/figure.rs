@@ -105,6 +105,10 @@ pub struct Panel {
     pub x: Axis,
     pub y: Axis,
     pub lines: Vec<Polyline>,
+    /// Reference values used to read the plot, such as 0 dB and -180 degrees.
+    pub guides: Vec<Guide>,
+    pub markers: Vec<Marker>,
+    pub arrows: Vec<Arrow>,
     /// Bare LaTeX, passed to the app's math renderer.
     pub x_label: &'static str,
     /// Bare LaTeX, passed to the app's math renderer.
@@ -127,6 +131,25 @@ pub struct Tick {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Polyline {
     pub points: Vec<[f64; 2]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Guide {
+    Horizontal(f64),
+    Vertical(f64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Marker {
+    pub point: [f64; 2],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Arrow {
+    /// Arrow tip in data coordinates.
+    pub at: [f64; 2],
+    /// A second point in the direction of increasing parameter.
+    pub toward: [f64; 2],
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -205,21 +228,52 @@ fn bode(num: &[f64], den: &[f64], phase: bool) -> Plot {
     }
 
     let x_axis = log_frequency_axis(lo, hi);
-    let (mag_min, mag_max) = bounds(magnitude.iter().map(|p| p[1]), true, false);
+    let observed_mag_max = magnitude
+        .iter()
+        .map(|point| point[1])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let (mag_min, mag_max) = bounds(
+        magnitude.iter().map(|p| p[1]).chain(std::iter::once(0.0)),
+        true,
+        false,
+    );
+    let mut mag_axis = linear_axis(mag_min, mag_max);
+    ensure_tick(&mut mag_axis, 0.0);
+    // A curve that rises above 0 dB needs a labelled tick above it, or the DC
+    // gain is read against nothing. One that never does already has 0 dB as
+    // its top reference, and a second tick at the axis maximum would only
+    // crowd the label beside it.
+    if observed_mag_max > 0.0 {
+        let upper_tick = nice_upper_tick(observed_mag_max);
+        mag_axis.max = mag_axis.max.max(upper_tick);
+        ensure_tick(&mut mag_axis, upper_tick);
+    }
     let mut panels = vec![Panel {
         x: x_axis.clone(),
-        y: linear_axis(mag_min, mag_max),
+        y: mag_axis,
         lines: vec![Polyline { points: magnitude }],
+        guides: vec![Guide::Horizontal(0.0)],
+        markers: Vec::new(),
+        arrows: Vec::new(),
         x_label: r"\omega",
         y_label: r"|H|_{\mathrm{dB}}",
     }];
 
     if phase {
-        let (phase_min, phase_max) = bounds(angles.iter().map(|p| p[1]), true, false);
+        let (phase_min, phase_max) = bounds(
+            angles.iter().map(|p| p[1]).chain(std::iter::once(-180.0)),
+            true,
+            false,
+        );
+        let mut phase_axis = linear_axis(phase_min, phase_max);
+        ensure_tick(&mut phase_axis, -180.0);
         panels.push(Panel {
             x: x_axis,
-            y: linear_axis(phase_min, phase_max),
+            y: phase_axis,
             lines: vec![Polyline { points: angles }],
+            guides: vec![Guide::Horizontal(-180.0)],
+            markers: Vec::new(),
+            arrows: Vec::new(),
             x_label: r"\omega",
             y_label: r"\varphi\ [^\circ]",
         });
@@ -238,23 +292,28 @@ fn nyquist(num: &[f64], den: &[f64]) -> Plot {
         }
     }
     let mut points: Vec<[f64; 2]> = positive.iter().rev().map(|p| [p[0], -p[1]]).collect();
-    points.extend(positive);
+    points.extend(positive.iter().copied());
 
-    let (x_min, x_max) = bounds(
-        points.iter().map(|p| p[0]).chain(std::iter::once(0.0)),
-        false,
-        true,
-    );
+    let (x_min, x_max) = bounds(points.iter().map(|p| p[0]).chain([0.0, -1.0]), false, true);
     let (y_min, y_max) = bounds(
         points.iter().map(|p| p[1]).chain(std::iter::once(0.0)),
         false,
         true,
     );
+    let mut x_axis = linear_axis(x_min, x_max);
+    ensure_tick(&mut x_axis, -1.0);
+    let y_axis = linear_axis(y_min, y_max);
+    let arrow = direction_arrow(&positive, &x_axis, &y_axis)
+        .into_iter()
+        .collect();
     Plot {
         panels: vec![Panel {
-            x: linear_axis(x_min, x_max),
-            y: linear_axis(y_min, y_max),
+            x: x_axis,
+            y: y_axis,
             lines: vec![Polyline { points }],
+            guides: Vec::new(),
+            markers: vec![Marker { point: [-1.0, 0.0] }],
+            arrows: arrow,
             x_label: r"\operatorname{Re}",
             y_label: r"\operatorname{Im}",
         }],
@@ -314,6 +373,9 @@ fn step(num: &[f64], den: &[f64], t: [f64; 2]) -> Plot {
             x: linear_axis(t[0], t[1]),
             y: linear_axis(y_min, y_max),
             lines: vec![Polyline { points }],
+            guides: Vec::new(),
+            markers: Vec::new(),
+            arrows: Vec::new(),
             x_label: "t",
             y_label: "y(t)",
         }],
@@ -392,9 +454,109 @@ fn frequency_range(num: &[f64], den: &[f64]) -> (f64, f64) {
     }
     let smallest = scales.iter().copied().fold(f64::INFINITY, f64::min);
     let largest = scales.iter().copied().fold(0.0, f64::max);
-    let lo = (smallest.log10().floor() - 2.0).clamp(-8.0, 6.0);
-    let hi = (largest.log10().ceil() + 2.0).clamp(-6.0, 8.0);
+    let lo = (smallest.log10().floor() - 1.0).clamp(-8.0, 6.0);
+    let hi = (largest.log10().ceil() + 1.0).clamp(-6.0, 8.0);
     if hi > lo { (lo, hi) } else { (-2.0, 2.0) }
+}
+
+fn ensure_tick(axis: &mut Axis, value: f64) {
+    if value < axis.min || value > axis.max {
+        return;
+    }
+    let tolerance = (axis.max - axis.min).abs() * 1.0e-9;
+    if axis
+        .ticks
+        .iter()
+        .any(|tick| (tick.value - value).abs() <= tolerance)
+    {
+        return;
+    }
+    let step = axis
+        .ticks
+        .windows(2)
+        .next()
+        .map(|pair| (pair[1].value - pair[0].value).abs())
+        .unwrap_or_else(|| (axis.max - axis.min).abs().max(1.0));
+    // A forced tick carries a meaning — 0 dB, −180°, the critical point — so
+    // it wins over a regular one that would land on top of its label. Without
+    // this, a phase axis stepping by 50 prints “−150” and “−180” one on top of
+    // the other and neither can be read. Only the nearest neighbour gives way,
+    // and only while enough of the grid survives to read a value against.
+    if axis.ticks.len() > 2 {
+        let crowded = axis
+            .ticks
+            .iter()
+            .enumerate()
+            .filter(|(_, tick)| (tick.value - value).abs() < step * 0.65)
+            .min_by(|(_, a), (_, b)| {
+                (a.value - value)
+                    .abs()
+                    .total_cmp(&(b.value - value).abs())
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = crowded {
+            axis.ticks.remove(index);
+        }
+    }
+    axis.ticks.push(Tick {
+        value,
+        label: format_tick(value, step),
+    });
+    axis.ticks.sort_by(|a, b| a.value.total_cmp(&b.value));
+}
+
+fn nice_upper_tick(value: f64) -> f64 {
+    let power = 10.0_f64.powf(value.abs().max(EPS).log10().floor());
+    let fraction = value / power;
+    let nice = if fraction <= 1.0 + 1.0e-9 {
+        1.0
+    } else if fraction <= 2.0 + 1.0e-9 {
+        2.0
+    } else if fraction <= 5.0 + 1.0e-9 {
+        5.0
+    } else {
+        10.0
+    };
+    nice * power
+}
+
+/// Put a fixed-size arrowhead on a visually useful part of the positive
+/// Nyquist branch. Distances are measured in normalized panel coordinates so
+/// a large real range cannot force the marker into a nearly stationary tail.
+fn direction_arrow(points: &[[f64; 2]], x: &Axis, y: &Axis) -> Option<Arrow> {
+    if points.len() < 2 {
+        return None;
+    }
+    let normalized = |point: [f64; 2]| {
+        [
+            (point[0] - x.min) / (x.max - x.min).max(EPS),
+            (point[1] - y.min) / (y.max - y.min).max(EPS),
+        ]
+    };
+    let lengths: Vec<f64> = points
+        .windows(2)
+        .map(|pair| {
+            let a = normalized(pair[0]);
+            let b = normalized(pair[1]);
+            (b[0] - a[0]).hypot(b[1] - a[1])
+        })
+        .collect();
+    let total: f64 = lengths.iter().sum();
+    if total <= EPS {
+        return None;
+    }
+    let target = total * 0.55;
+    let mut walked = 0.0;
+    for (i, length) in lengths.iter().enumerate() {
+        walked += length;
+        if walked >= target && *length > EPS {
+            return Some(Arrow {
+                at: points[i],
+                toward: points[i + 1],
+            });
+        }
+    }
+    None
 }
 
 fn log_frequency_axis(lo: f64, hi: f64) -> Axis {
@@ -522,6 +684,76 @@ mod tests {
             den: vec![0.0, 0.0],
         };
         assert!(bad.validate().unwrap_err().contains("identically zero"));
+    }
+
+    #[test]
+    fn bode_has_course_reference_lines_and_readable_headroom() {
+        let figure = Figure::Bode {
+            num: vec![20.0],
+            den: vec![1.0, 3.0, 2.0],
+            phase: true,
+        };
+        let plot = figure.plot().unwrap().unwrap();
+        assert!(plot.panels[0].guides.contains(&Guide::Horizontal(0.0)));
+        assert!(plot.panels[0].y.ticks.iter().any(|tick| tick.value > 0.0));
+        assert!(plot.panels[1].guides.contains(&Guide::Horizontal(-180.0)));
+        assert!(
+            plot.panels[1]
+                .y
+                .ticks
+                .iter()
+                .any(|tick| tick.value == -180.0)
+        );
+    }
+
+    #[test]
+    fn nyquist_marks_the_critical_point_and_frequency_direction() {
+        let figure = Figure::Nyquist {
+            num: vec![120.0],
+            den: vec![1.0, 6.0, 11.0, 6.0],
+        };
+        let plot = figure.plot().unwrap().unwrap();
+        let panel = &plot.panels[0];
+        assert!(panel.x.min < -1.0 && panel.x.max > -1.0);
+        assert!(panel.x.ticks.iter().any(|tick| tick.value == -1.0));
+        assert_eq!(panel.markers, vec![Marker { point: [-1.0, 0.0] }]);
+        assert_eq!(panel.arrows.len(), 1);
+    }
+
+    /// The reference ticks are the ones the course reads, so a regular tick a
+    /// few degrees away has to give way rather than print over the label. A
+    /// plant that stays below 0 dB gets no second tick above it either.
+    #[test]
+    fn reference_ticks_are_not_crowded_by_their_neighbours() {
+        let figure = Figure::Bode {
+            num: vec![1.0],
+            den: vec![1.0, 4.0, 3.0],
+            phase: true,
+        };
+        let plot = figure.plot().unwrap().unwrap();
+        let magnitude = &plot.panels[0].y;
+        assert!(magnitude.ticks.iter().any(|tick| tick.value == 0.0));
+        assert!(
+            !magnitude.ticks.iter().any(|tick| tick.value > 0.0),
+            "the curve never rises above 0 dB, so nothing needs a tick above it"
+        );
+        let phase = &plot.panels[1].y;
+        let spacing = phase
+            .ticks
+            .windows(2)
+            .map(|pair| (pair[1].value - pair[0].value).abs())
+            .fold(f64::INFINITY, f64::min);
+        assert!(phase.ticks.iter().any(|tick| tick.value == -180.0));
+        assert!(
+            spacing >= 40.0,
+            "phase ticks {:?} crowd the -180 degree reference",
+            phase.ticks.iter().map(|t| t.value).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn frequency_range_uses_one_decade_of_padding() {
+        assert_eq!(frequency_range(&[1.0], &[1.0, 3.0, 2.0]), (-2.0, 2.0));
     }
 
     #[test]

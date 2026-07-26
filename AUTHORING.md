@@ -2,7 +2,7 @@
 
 How to write a module for Idiosepius. **Nothing here is specific to any one
 course** — this is the shared guide, and it applies to every module unchanged.
-The per-course conventions live in that module's own `CLAUDE.md`; see § 12.
+The per-course conventions live in that module's own `CLAUDE.md`; see § 13.
 
 Examples below are drawn from whichever module illustrates the point best.
 They are illustrations, not a description of any particular deck.
@@ -36,7 +36,7 @@ ignores `content/`, so no repository's commits include another's — staging or
 committing in one does nothing for the rest.
 
 This guide, and all the tooling, live in the **application** repository. A
-content checkout holds content only; see § 10.
+content checkout holds content only; see § 11.
 
 Within a module, files are flat and prefixed with a short module code:
 
@@ -45,8 +45,14 @@ Within a module, files are flat and prefixed with a short module code:
 <mod>-00-formulas.json    shared facts: the formula sheet          (optional)
 <mod>-01-<topic>.json     questions, one file per topic
 <mod>-02-<topic>.json
+<mod>-11-lessons-<topic>.json   lessons for topic 01               (optional)
+<mod>-12-lessons-<topic>.json   lessons for topic 02
 <mod>-formula-sheet.pdf   generated — never hand-edited
 ```
+
+Lessons (§ 10) are kept in files of their own, numbered `1n` against the topic
+file `0n` they teach, because a topic's prose and its forty questions are not
+comfortable to edit in one file.
 
 The prefix is what the tooling globs on, so it must be short, lowercase and
 unique across modules. Every file of a module carries the **same `deck`
@@ -86,7 +92,7 @@ Everything below is run from the **application checkout's root**.
    empty `questions: []`.
 3. Write the topic files. Keep a file to one topic and roughly 20–35 questions
    — beyond that it stops being editable by hand.
-4. Write `content/<module-name>/CLAUDE.md` — see § 12.
+4. Write `content/<module-name>/CLAUDE.md` — see § 13.
 5. `python3 tools/check-packs.py content/<module-name>`
 6. `./reimport.sh -m <mod>` to build the database.
 7. If the subject has formulas, add `<mod>-00-formulas.json` and run
@@ -178,9 +184,11 @@ it.
 claim someone might plausibly believe. Avoid negations — "an open loop cannot
 not correct a disturbance" is a reading test, not a test of the subject.
 
-**`multiple_choice`** takes `options`, and `multi: true` when more than one is
-correct. Four or five options. Import rejects a question with fewer than two
-options, none marked correct, or several correct without `multi`.
+**`multiple_choice`** takes `options`, and `multi: true` when any number may be
+correct. Four or five options. For a multi-select, none may apply; the learner
+confirms that answer with no boxes checked. Import rejects a question with
+fewer than two options, a single-choice card with none marked correct, or
+several correct without `multi`.
 
 **Distractors must be wrong for a reason.** The best ones are the results of
 specific, common mistakes: the inverted fraction, the missing factor of 2, the
@@ -214,7 +222,22 @@ ambiguity and represent complex poles without special syntax.
 Frequency bounds and ticks are chosen from the polynomial coefficients. A
 Bode figure draws magnitude and, when `phase` is true, a second phase panel.
 A step response needs a proper transfer function and a finite time interval
-with `0 <= start < end`.
+with `0 <= start < end`. Every inline figure can be clicked or tapped for an
+enlarged view; do not compensate for card size by putting tiny labels into an
+SVG.
+
+**The reference each criterion is read against is drawn for you**, and a
+question may rely on it: a Bode magnitude panel carries a 0 dB rule, its phase
+panel a $-180°$ rule, and a Nyquist panel marks $-1 + j0$ with a cross and the
+direction of increasing $\omega$ with an arrow. Those ticks win over the
+regular grid when the two would collide, so the labels stay readable.
+
+What is *not* guaranteed is that a particular value can be read off. Only the
+labelled grid is legible at card size, and the axis range follows the
+coefficients — so choose them so the reading the question asks for lands on or
+near a tick, and check the card with `tools/shot.sh` before trusting it. A
+plant whose gain crossover sits a tenth of a decade from its phase crossover
+renders as one crossing, whatever the arithmetic says.
 
 For a block diagram or another figure that is not a transfer-function plot,
 store the complete SVG inline:
@@ -291,7 +314,10 @@ hand-written subset, not LaTeX. It shows an unknown command as its own source
 text rather than swallowing it, which is a visible defect on a card. It covers
 fractions, radicals, scripts, sized fences, sums and integrals (`\int`,
 `\iint`, `\iiint`, `\oint`), matrices, accents, blackboard bold (`\mathbb`),
-Greek and the usual relations. It does **not** cover the long tail:
+Greek and the usual relations. Routh tables can use
+`\begin{array}{r|ccc} ... \\ \hline ... \end{array}`: `l`, `c` and `r` set
+column alignment, `|` draws a column rule, and `\hline` draws a row rule. It
+does **not** cover the long tail:
 `\iff`, `\substack`, `\xrightarrow`, most of `amssymb`. Run
 `tools/check-packs.py` after editing; it validates every span against the
 renderer's actual command set.
@@ -407,7 +433,67 @@ threads a topic split cannot express — `laplace`, `routh`, `bode`, `design`.
 
 ---
 
-## 10. Tooling
+## 10. Lessons
+
+A deck may carry **lessons** as well as questions: the course read in order,
+rather than sampled at random. They live in a pack-level `lessons` array,
+alongside `facts` and `questions`, and they are merged by deck slug like
+everything else.
+
+```json
+{
+  "uid": "cs-les-009",
+  "topic": "stability",
+  "ord": 2,
+  "title": "Routh–Hurwitz: deciding without solving",
+  "summary": "One sentence, shown in the lesson list.",
+  "body": [
+    "Prose. Same notation rules as everywhere else: $...$ and *emphasis*.",
+    { "heading": "Necessary, and not sufficient" },
+    { "fact": "f-routh-necessary" },
+    { "math": "a_2a_1 > a_3a_0" },
+    { "figure": { "kind": "bode", "num": [10], "den": [1, 10, 0], "phase": true } }
+  ],
+  "practice": ["cs-sta-007", "cs-sta-008"],
+  "source": "Stability, Course Book §4.2.2"
+}
+```
+
+**A lesson is a reading, not a chapter of a textbook.** It is the connective
+tissue between facts that already exist: what the chapter is *for*, in what
+order its results arrive, and which of them the exam actually turns on. Keep it
+to what one sitting can absorb — the packs above run 15–25 body blocks each.
+
+**Quote facts, do not restate them.** A `{"fact": …}` reference renders the
+shared fact, so a lesson that retypes a formula has created a second copy to
+keep in step. If a lesson needs a formula the sheet does not have, the formula
+belongs in the formulas pack, not in the prose. The exception is a display line
+that is a *step of an argument* rather than a result to be remembered — a
+substitution, an intermediate — and that is what `{"math": …}` is for.
+
+**Body block kinds.** A bare string is prose. `{"heading": …}` starts a
+section, `{"math": …}` is a display equation as bare LaTeX with no `$` fences
+(like a formula fact's `label`), `{"fact": …}` quotes a shared fact, and
+`{"figure": {…}}` is the same figure object a prompt may contain.
+
+**`practice` is a list of question uids**, and it is what turns a lesson back
+into study: the questions that lesson has just made answerable. Order it as the
+lesson taught them. Import validates the list against the merged pack, so a
+renamed or removed uid is an authoring error instead of silently shortening the
+practice session. At runtime a question retired after that import is omitted,
+so an existing database never leaves a lesson unusable.
+
+**`uid` is the lesson's identity**, exactly as for a question, because progress
+through the course hangs off it. Use `<mod>-les-<nnn>`. `ord` orders lessons
+within a topic; the topics' own `ord` orders the course.
+
+Lessons **do not gate practice**. A newly imported deck has its whole active
+question bank available whether or not anyone has read a lesson, and a deck
+with no lessons at all is a perfectly ordinary deck.
+
+---
+
+## 11. Tooling
 
 **The tooling lives in the application repository, and there is one copy of
 it.** Every script is generic — none of them knows about any particular course
@@ -458,7 +544,7 @@ in a different repository goes stale silently.
 
 ---
 
-## 11. Before committing
+## 12. Before committing
 
 - `python3 tools/check-packs.py content/<module-name>` is clean (it exits
   non-zero if it is not).
@@ -474,7 +560,7 @@ checkout does not commit content, and vice versa.
 
 ---
 
-## 12. The module's `CLAUDE.md`
+## 13. The module's `CLAUDE.md`
 
 Every module carries a `CLAUDE.md` at the root of its own repository. This
 guide holds everything general; that file holds **only what a person or an

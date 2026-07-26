@@ -30,6 +30,8 @@ pub enum Mode {
     Exam,
     /// Ignore spacing, hammer the weakest cards.
     Cram,
+    /// Reading authored course material. It never invokes the scheduler.
+    Lesson,
 }
 
 impl Mode {
@@ -38,6 +40,7 @@ impl Mode {
             Mode::Practice => "practice",
             Mode::Exam => "exam",
             Mode::Cram => "cram",
+            Mode::Lesson => "lesson",
         }
     }
 }
@@ -82,6 +85,7 @@ pub enum Event {
     DeckSwitched,
     Paused,
     Resumed,
+    LessonRead,
     Other(&'static str),
 }
 
@@ -100,6 +104,7 @@ impl Event {
             Event::DeckSwitched => "deck_switched",
             Event::Paused => "paused",
             Event::Resumed => "resumed",
+            Event::LessonRead => "lesson_read",
             Event::Other(s) => s,
         }
     }
@@ -215,6 +220,25 @@ impl Session {
     pub fn show(&mut self, question_id: Id) {
         self.shown = Some((question_id, Instant::now()));
         self.log(Event::CardShown, Some(question_id), serde_json::Value::Null);
+    }
+
+    /// Mark an authored lesson as read in the append-only event log.
+    pub fn read_lesson(&mut self, lesson_id: Id) {
+        let res = self.store.conn().execute(
+            "INSERT INTO event
+                 (session_id, ts, mono_ms, lesson_id, kind, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            params![
+                self.id,
+                now_ms(),
+                self.elapsed_ms(),
+                lesson_id,
+                Event::LessonRead.as_str(),
+            ],
+        );
+        if let Err(e) = res {
+            self.errors.push(format!("event log write failed: {e}"));
+        }
     }
 
     /// Milliseconds the current card has been on screen, if any.
@@ -346,7 +370,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::NewQuestion;
+    use crate::db::{NewLesson, NewQuestion};
 
     fn setup() -> (Rc<Store>, Id, Question) {
         let store = Rc::new(Store::open_in_memory().unwrap());
@@ -394,6 +418,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(shown, 1);
+    }
+
+    #[test]
+    fn reading_a_lesson_is_an_append_only_event() {
+        let (store, deck, _) = setup();
+        let topic = store.upsert_topic(deck, "topic", "Topic", 1).unwrap();
+        let lesson = store
+            .upsert_lesson(&NewLesson {
+                deck_id: deck,
+                topic_id: topic,
+                uid: "les-1".into(),
+                ord: 1,
+                title: "Lesson".into(),
+                summary: "Summary".into(),
+                body: vec![LessonBlock::Text("Read me.".into())],
+                practice: vec![],
+                source: None,
+            })
+            .unwrap();
+        let mut session = Session::start(store.clone(), deck, Mode::Lesson).unwrap();
+        session.read_lesson(lesson);
+        assert!(session.take_errors().is_empty());
+
+        let events: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM event
+                 WHERE lesson_id = ?1 AND kind = 'lesson_read'",
+                params![lesson],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+        assert!(store.read_lesson_ids(deck).unwrap().contains(&lesson));
     }
 
     #[test]

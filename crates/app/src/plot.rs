@@ -13,7 +13,7 @@ use eframe::egui::{
 };
 use eframe::epaint::{Galley, Mesh, Shape, TextShape};
 use idiosepius_core::Figure;
-use idiosepius_core::figure::{Axis, Panel};
+use idiosepius_core::figure::{Axis, Guide, Panel};
 
 use crate::card::rotate;
 use crate::math::{self, Formula};
@@ -115,19 +115,41 @@ impl Plot {
 
 /// Lay out one authored figure at a card-local width.
 pub fn layout(painter: &Painter, spec: &Figure, width: f32) -> Plot {
+    layout_with_height(painter, spec, width, None)
+}
+
+/// Lay out an enlarged figure for the plot modal.
+pub fn layout_large(painter: &Painter, spec: &Figure, width: f32, height: f32) -> Plot {
+    layout_with_height(painter, spec, width, Some(height))
+}
+
+fn layout_with_height(painter: &Painter, spec: &Figure, width: f32, height: Option<f32>) -> Plot {
     match spec {
-        Figure::Svg { src } => layout_svg(painter, src, width),
+        Figure::Svg { src } => layout_svg(painter, src, width, height),
         _ => spec
             .plot()
             .ok()
             .flatten()
-            .map(|data| layout_vector(painter, &data.panels, width))
+            .map(|data| layout_vector(painter, &data.panels, width, height))
             .unwrap_or_else(|| error_plot(painter, width, "invalid figure")),
     }
 }
 
-fn layout_vector(painter: &Painter, panels: &[Panel], width: f32) -> Plot {
-    let panel_height = if panels.len() > 1 { 124.0 } else { 188.0 };
+fn layout_vector(
+    painter: &Painter,
+    panels: &[Panel],
+    width: f32,
+    available_height: Option<f32>,
+) -> Plot {
+    let panel_height = available_height.map_or_else(
+        || if panels.len() > 1 { 124.0 } else { 188.0 },
+        |height| {
+            (height / panels.len().max(1) as f32).clamp(
+                if panels.len() > 1 { 150.0 } else { 220.0 },
+                if panels.len() > 1 { 300.0 } else { 520.0 },
+            )
+        },
+    );
     let mut shapes = Vec::new();
     for (index, panel) in panels.iter().enumerate() {
         layout_panel(painter, panel, index, width, panel_height, &mut shapes);
@@ -176,6 +198,23 @@ fn layout_panel(
             pos: Pos2::new(graph.left() - label.size.x - 6.0, y - label.size.y / 2.0),
             formula: label,
             color: Palette::TEXT_FAINT,
+        });
+    }
+
+    for guide in &panel.guides {
+        let points = match *guide {
+            Guide::Horizontal(value) => {
+                let y = map_y(value, &panel.y, graph.top(), graph.bottom());
+                vec![Pos2::new(graph.left(), y), Pos2::new(graph.right(), y)]
+            }
+            Guide::Vertical(value) => {
+                let x = map(value, &panel.x, graph.left(), graph.right());
+                vec![Pos2::new(x, graph.top()), Pos2::new(x, graph.bottom())]
+            }
+        };
+        shapes.push(PlotShape::Line {
+            points,
+            stroke: Stroke::new(1.2, Palette::LINE_BRIGHT),
         });
     }
 
@@ -230,6 +269,57 @@ fn layout_panel(
         }
     }
 
+    for marker in &panel.markers {
+        let at = Pos2::new(
+            map(marker.point[0], &panel.x, graph.left(), graph.right()),
+            map_y(marker.point[1], &panel.y, graph.top(), graph.bottom()),
+        );
+        let radius = 5.0;
+        shapes.push(PlotShape::Line {
+            points: vec![
+                at + Vec2::new(-radius, -radius),
+                at + Vec2::new(radius, radius),
+            ],
+            stroke: Stroke::new(1.7, Palette::TEXT),
+        });
+        shapes.push(PlotShape::Line {
+            points: vec![
+                at + Vec2::new(-radius, radius),
+                at + Vec2::new(radius, -radius),
+            ],
+            stroke: Stroke::new(1.7, Palette::TEXT),
+        });
+    }
+
+    for arrow in &panel.arrows {
+        let tip = Pos2::new(
+            map(arrow.at[0], &panel.x, graph.left(), graph.right()),
+            map_y(arrow.at[1], &panel.y, graph.top(), graph.bottom()),
+        );
+        let toward = Pos2::new(
+            map(arrow.toward[0], &panel.x, graph.left(), graph.right()),
+            map_y(arrow.toward[1], &panel.y, graph.top(), graph.bottom()),
+        );
+        let direction = toward - tip;
+        if direction.length_sq() > 0.01 {
+            let direction = direction.normalized();
+            let normal = Vec2::new(-direction.y, direction.x);
+            let tail = tip - direction * 14.0;
+            shapes.push(PlotShape::Line {
+                points: vec![tail, tip],
+                stroke: Stroke::new(1.9, line_color),
+            });
+            shapes.push(PlotShape::Line {
+                points: vec![
+                    tip - direction * 6.0 + normal * 4.0,
+                    tip,
+                    tip - direction * 6.0 - normal * 4.0,
+                ],
+                stroke: Stroke::new(1.9, line_color),
+            });
+        }
+    }
+
     let x_label = math::layout(painter, panel.x_label, 11.0);
     shapes.push(PlotShape::Formula {
         pos: Pos2::new(
@@ -262,7 +352,7 @@ struct CachedSvg {
     aspect: f32,
 }
 
-fn layout_svg(painter: &Painter, src: &str, width: f32) -> Plot {
+fn layout_svg(painter: &Painter, src: &str, width: f32, max_height: Option<f32>) -> Plot {
     let mut hasher = DefaultHasher::new();
     src.hash(&mut hasher);
     let hash = hasher.finish();
@@ -282,7 +372,7 @@ fn layout_svg(painter: &Painter, src: &str, width: f32) -> Plot {
         },
     };
 
-    let height = (width / cached.aspect).clamp(80.0, 280.0);
+    let height = (width / cached.aspect).clamp(80.0, max_height.unwrap_or(280.0));
     Plot {
         size: Vec2::new(width, height),
         shapes: vec![PlotShape::Image {

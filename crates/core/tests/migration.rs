@@ -40,7 +40,7 @@ impl Drop for TempDb {
 }
 
 #[test]
-fn the_existing_v1_upgrade_still_reaches_v3() {
+fn the_existing_v1_upgrade_still_reaches_v4() {
     let db = TempDb::new("v1");
     let conn = Conn::open(&db.0).unwrap();
     conn.execute_batch(V1_SCHEMA).unwrap();
@@ -87,7 +87,7 @@ fn the_existing_v1_upgrade_still_reaches_v3() {
         .unwrap();
     assert_eq!(seen, 7);
     assert_eq!(store.fact_count().unwrap(), 0);
-    assert_eq!(store.conn().pragma_int("user_version").unwrap(), 3);
+    assert_eq!(store.conn().pragma_int("user_version").unwrap(), 4);
 }
 
 #[test]
@@ -165,7 +165,7 @@ fn v2_is_migrated_without_losing_history_or_identity() {
     drop(conn);
 
     let store = Store::open(&db.0).unwrap();
-    assert_eq!(store.conn().pragma_int("user_version").unwrap(), 3);
+    assert_eq!(store.conn().pragma_int("user_version").unwrap(), 4);
 
     let question = store.question_by_uid("cs-041").unwrap().unwrap();
     assert_eq!(question.id, 41);
@@ -213,5 +213,5 @@ fn reopening_a_current_database_is_a_no_op() {
     };
     let store = Store::open(&db.0).unwrap();
     assert_eq!(store.deck_id("cs").unwrap(), Some(deck));
-    assert_eq!(store.conn().pragma_int("user_version").unwrap(), 3);
+    assert_eq!(store.conn().pragma_int("user_version").unwrap(), 4);
 }

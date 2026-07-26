@@ -11,7 +11,7 @@ use std::path::Path;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::db::{NewFact, NewQuestion, Store};
+use crate::db::{NewFact, NewLesson, NewQuestion, Store};
 use crate::model::*;
 use crate::params;
 
@@ -26,6 +26,8 @@ pub struct Pack {
     pub facts: Vec<PackFact>,
     #[serde(default)]
     pub questions: Vec<PackQuestion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lessons: Vec<PackLesson>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +92,21 @@ pub struct PackQuestion {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackLesson {
+    pub uid: String,
+    pub topic: String,
+    #[serde(default)]
+    pub ord: i64,
+    pub title: String,
+    pub summary: String,
+    pub body: Vec<LessonBlock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub practice: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 fn default_difficulty() -> u8 {
@@ -161,6 +178,7 @@ pub fn merge_packs(packs: Vec<Pack>) -> Result<Pack> {
             }
         }
         merged.questions.extend(pack.questions);
+        merged.lessons.extend(pack.lessons);
     }
 
     Ok(merged)
@@ -172,7 +190,9 @@ pub struct ImportReport {
     pub topics: usize,
     pub facts: usize,
     pub questions: usize,
+    pub lessons: usize,
     pub retired: usize,
+    pub retired_lessons: usize,
 }
 
 pub fn load_pack(path: impl AsRef<Path>) -> Result<Pack> {
@@ -242,6 +262,43 @@ pub fn import_pack(store: &Store, pack: &Pack) -> Result<ImportReport> {
         }
     }
 
+    let question_uids: HashSet<&str> = pack.questions.iter().map(|q| q.uid.as_str()).collect();
+    let mut seen_lessons = HashSet::new();
+    for lesson in &pack.lessons {
+        if !seen_lessons.insert(lesson.uid.as_str()) {
+            bail!("duplicate lesson uid {:?} in pack", lesson.uid);
+        }
+        if !pack.topics.iter().any(|topic| topic.slug == lesson.topic) {
+            bail!(
+                "lesson {} references unknown topic {:?}",
+                lesson.uid,
+                lesson.topic
+            );
+        }
+        for block in &lesson.body {
+            match block {
+                LessonBlock::Fact { fact } => {
+                    if !seen_facts.contains(fact.as_str()) && store.fact(fact)?.is_none() {
+                        bail!("lesson {} references unknown fact {:?}", lesson.uid, fact);
+                    }
+                }
+                LessonBlock::Figure { figure } => figure
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("lesson {}: {e}", lesson.uid))?,
+                LessonBlock::Text(_) | LessonBlock::Heading { .. } | LessonBlock::Math { .. } => {}
+            }
+        }
+        for uid in &lesson.practice {
+            if !question_uids.contains(uid.as_str()) {
+                bail!(
+                    "lesson {} references unknown practice question {:?}",
+                    lesson.uid,
+                    uid
+                );
+            }
+        }
+    }
+
     let exam_at = match &pack.deck.exam_at {
         Some(s) => Some(parse_rfc3339_ms(s)?),
         None => None,
@@ -298,6 +355,7 @@ pub fn import_pack(store: &Store, pack: &Pack) -> Result<ImportReport> {
     }
 
     let retired = store.deactivate_deck_questions(deck_id)?;
+    let retired_lessons = store.deactivate_deck_lessons(deck_id)?;
 
     for q in &pack.questions {
         store.upsert_question(&NewQuestion {
@@ -314,12 +372,32 @@ pub fn import_pack(store: &Store, pack: &Pack) -> Result<ImportReport> {
         })?;
     }
 
+    for lesson in &pack.lessons {
+        let topic_id = topic_ids
+            .get(&lesson.topic)
+            .copied()
+            .with_context(|| format!("topic {:?} vanished during import", lesson.topic))?;
+        store.upsert_lesson(&NewLesson {
+            deck_id,
+            topic_id,
+            uid: lesson.uid.clone(),
+            ord: lesson.ord,
+            title: lesson.title.clone(),
+            summary: lesson.summary.clone(),
+            body: lesson.body.clone(),
+            practice: lesson.practice.clone(),
+            source: lesson.source.clone(),
+        })?;
+    }
+
     Ok(ImportReport {
         deck_id,
         topics: pack.topics.len(),
         facts: pack.facts.len(),
         questions: pack.questions.len(),
+        lessons: pack.lessons.len(),
         retired: retired.saturating_sub(pack.questions.len()),
+        retired_lessons: retired_lessons.saturating_sub(pack.lessons.len()),
     })
 }
 
@@ -534,6 +612,32 @@ mod tests {
       ]
     }"#;
 
+    const LESSON_PACK: &str = r#"{
+      "deck": { "slug": "cs", "title": "Control Systems" },
+      "topics": [{ "slug": "modeling", "title": "Modeling", "ord": 1 }],
+      "facts": [{
+        "uid": "f-loop", "kind": "formula", "title": "Closed loop",
+        "label": "H_C = \\frac{H_O}{1 + H_O}", "body": "Unity feedback."
+      }],
+      "questions": [{
+        "uid": "cs-mod-001", "topic": "modeling", "prompt": "Feedback moves poles.",
+        "kind": "true_false", "answer": true
+      }],
+      "lessons": [{
+        "uid": "cs-les-001", "topic": "modeling", "ord": 1,
+        "title": "The loop", "summary": "Why feedback changes the plant.",
+        "body": [
+          "Start with the structure.",
+          { "heading": "Closing it" },
+          { "fact": "f-loop" },
+          { "math": "1 + H_O(s) = 0" },
+          { "figure": { "kind": "step", "num": [1], "den": [1, 1], "t": [0, 5] } }
+        ],
+        "practice": ["cs-mod-001"],
+        "source": "Lecture 1"
+      }]
+    }"#;
+
     #[test]
     fn parses_facts_and_the_two_readings() {
         let p: Pack = serde_json::from_str(FACT_PACK).unwrap();
@@ -594,6 +698,92 @@ mod tests {
 
         let q = store.question_by_uid("cs-900").unwrap().unwrap();
         assert_eq!(q.deep().len(), 5);
+    }
+
+    #[test]
+    fn parses_and_imports_all_lesson_block_kinds() {
+        let pack: Pack = serde_json::from_str(LESSON_PACK).unwrap();
+        let body = &pack.lessons[0].body;
+        assert!(matches!(body[0], LessonBlock::Text(_)));
+        assert!(matches!(body[1], LessonBlock::Heading { .. }));
+        assert!(matches!(body[2], LessonBlock::Fact { .. }));
+        assert!(matches!(body[3], LessonBlock::Math { .. }));
+        assert!(matches!(body[4], LessonBlock::Figure { .. }));
+
+        let store = Store::open_in_memory().unwrap();
+        let report = import_pack(&store, &pack).unwrap();
+        assert_eq!(report.lessons, 1);
+        let lesson = store.lessons(report.deck_id).unwrap().pop().unwrap();
+        assert_eq!(lesson.uid, "cs-les-001");
+        assert_eq!(lesson.practice, vec!["cs-mod-001"]);
+        assert_eq!(
+            store
+                .questions_by_uids(report.deck_id, &lesson.practice)
+                .unwrap()[0]
+                .uid,
+            "cs-mod-001"
+        );
+    }
+
+    #[test]
+    fn lesson_references_are_validated_before_import() {
+        let store = Store::open_in_memory().unwrap();
+
+        let mut bad_topic: Pack = serde_json::from_str(LESSON_PACK).unwrap();
+        bad_topic.lessons[0].topic = "missing".into();
+        assert!(
+            import_pack(&store, &bad_topic)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown topic")
+        );
+
+        let mut bad_fact: Pack = serde_json::from_str(LESSON_PACK).unwrap();
+        bad_fact.lessons[0].body[2] = LessonBlock::Fact {
+            fact: "missing".into(),
+        };
+        assert!(
+            import_pack(&store, &bad_fact)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown fact")
+        );
+
+        let mut bad_practice: Pack = serde_json::from_str(LESSON_PACK).unwrap();
+        bad_practice.lessons[0].practice = vec!["missing".into()];
+        assert!(
+            import_pack(&store, &bad_practice)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown practice question")
+        );
+        assert_eq!(store.decks().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn reimport_updates_lessons_by_uid_and_retires_removed_ones() {
+        let store = Store::open_in_memory().unwrap();
+        let mut pack: Pack = serde_json::from_str(LESSON_PACK).unwrap();
+        let deck = import_pack(&store, &pack).unwrap().deck_id;
+        let id = store.lessons(deck).unwrap()[0].id;
+
+        pack.lessons[0].title = "The feedback loop".into();
+        import_pack(&store, &pack).unwrap();
+        assert_eq!(store.lessons(deck).unwrap()[0].id, id);
+        assert_eq!(store.lessons(deck).unwrap()[0].title, "The feedback loop");
+
+        pack.lessons.clear();
+        import_pack(&store, &pack).unwrap();
+        assert_eq!(store.lesson_count(deck).unwrap(), 0);
+        let active: i64 = store
+            .conn()
+            .query_row(
+                "SELECT active FROM lesson WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
     }
 
     #[test]
@@ -670,6 +860,7 @@ mod tests {
                 source: None,
                 tags: vec![],
             }],
+            lessons: vec![],
         };
 
         let merged = merge_packs(vec![a, b]).unwrap();

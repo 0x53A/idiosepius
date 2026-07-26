@@ -91,10 +91,13 @@ nothing pops into being.
   independent, and it settles exactly at zero rather than drifting.
 - **Commit** — the card flies off along the line the hand was moving, fading
   as it goes.
-- **Feedback** — grows in over 0.12 s, then waits for a key or a stationary
-  click on the panel whether the answer was right or wrong. A release that
-  completes a swipe is not a click and must not dismiss the explanation it
-  just opened.
+- **Feedback** — grows in over 0.12 s, then waits whether the answer was right
+  or wrong. A graded answer puts square Undo and Next controls to the left and
+  right of the card; a revealed answer has Next only. The answered question,
+  verdict and explanation form one vertically scrollable card, with the
+  explanation attached below the question rather than covering it. The card
+  itself is not a giant implicit button, so the release that completes a swipe
+  cannot dismiss the explanation it just opened.
 - **Hover** — Boolean cards gain a strong, direction-neutral stepped outline;
   options and feedback panels brighten their border. These transitions are
   animated. The Boolean halo is made from crisp rectangular lines, not a
@@ -112,11 +115,43 @@ a settled screen stops requesting frames.
 
 A fixed 56 pt header (deck, running score, exam countdown) over a hairline,
 with session accuracy as a 2 pt bar beneath it. A centred stage for the card.
-A single line of key hints at the bottom, lowercase and faint — it is a
-reminder, not a toolbar.
+While a card is asking, square Explain and Skip controls sit below it;
+multi-select adds Confirm as the rightmost control. Each has a symbol on its
+face and a hotkey-labelled verb below.
 
 Cards are sized to their content. A three-line multiple-choice question must
 not sit in a half-empty box.
+
+## Navigation
+
+A deck row on the home screen is a split action. The broad left segment opens
+the deck: lessons, the complete question bank and progress live behind it. The
+square segment on the right is the quick route into shuffled study and is
+marked with two dice. These are independent hit targets with independent hover
+states; the shared border must not make the whole row look like one ambiguous
+button.
+
+The dice are drawn from square outlines and square pips rather than taken from
+a font. That keeps the symbol available on every platform and obeys the
+rectangular visual language. The icon means random order, not a separate
+scheduler or a different set of questions.
+
+Lessons organise teaching but do not gate practice. A newly imported deck has
+its entire active question bank available immediately, whether or not the deck
+contains any authored lessons.
+
+The home screen's deck list scrolls independently of its title and database
+actions. A short window or a database with many decks must not push import or
+export beyond the viewport.
+
+The question bank is grouped in authored topic order. Its current topic header
+sticks to the top of the scrolling list and remains the collapse control, so a
+long topic can be closed without scrolling back to its first row. Correct,
+incorrect and not-yet-attempted filters are independent checkboxes; correct
+and incorrect describe the latest recorded attempt. Opening a row asks that
+one question through the ordinary graded study surface, then returns to the
+bank and refreshes the filters. Revealing or skipping returns without turning
+the question into an attempt.
 
 ## Input
 
