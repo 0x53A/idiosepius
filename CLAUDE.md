@@ -39,6 +39,58 @@ cyan/violet for swipe direction, green/magenta (never red) for verdicts.
   Validate packs with `check-packs.py`, `packfmt.py --check`, and the relevant
   tests; leave any reimport to the user.
 
+## Running it
+
+```
+cargo run                                                # study ~/idiosepius/study.db
+cargo run -- path/to/study.db                            # a different database
+cargo run -- --import content/control-systems/cs-*.json  # import, then study
+```
+
+`cargo run` means the app because `crates/app` is the workspace default
+member. With no path the app opens `~/idiosepius/study.db`; pass one to keep
+courses apart — though one database holding several decks is the normal case,
+so a path is usually only for experiments. `crates/app/src/main.rs` carries the
+full usage, including the `--shot` flags `tools/shot.sh` drives.
+
+`idiodb`, in `crates/core`, is the companion CLI for authoring and evaluation:
+
+```
+idiodb study.db import content/control-systems/cs-[0-9][0-9]-*.json  # idempotent, by uid
+idiodb study.db decks                       # progress per deck
+idiodb study.db stats control-systems       # accuracy and readiness per topic
+idiodb study.db weak control-systems        # the cards that keep being missed
+idiodb study.db facts control-systems       # shared notes and symbol glossary
+idiodb study.db events                      # the full log as JSON lines
+```
+
+## The web build
+
+```
+./tools/run-web.sh              # build (dev profile) and serve on :8000
+./tools/run-web.sh --release    # optimized
+```
+
+**There is no Node, npm, bundler or application server anywhere in it.**
+`tools/build-web.sh` runs `wasm-pack build crates/app --target web` into
+`web/pkg`; `web/index.html` hosts the result as an `<idiosepius-app>` custom
+element and `run-web.sh` serves the directory with `python3 -m http.server`.
+Any static HTTPS host will do in production. `IDIOSEPIUS_WEB_PORT` picks
+another port, and further arguments are forwarded to `wasm-pack`.
+
+`build-web.sh` also writes `web/pkg/asset-manifest.json` after the build,
+because wasm-bindgen may emit hashed snippet modules alongside the predictable
+loader and `.wasm` names. The service worker needs a complete, deterministic
+package list for a *first* visit to be enough for offline use — so a new build
+step that adds files to `web/pkg` must keep that manifest generated, not
+hand-written.
+
+The hosted app is installable as a PWA; its shell is cached on the first
+successful visit and refreshed whenever it is opened online. Course data and
+history stay in OPFS, saved automatically — the only browser-specific chrome
+left is the word in the bottom corner saying whether storage is up to date, and
+there is deliberately no "export before you leave" prompt.
+
 ## Things worth knowing
 
 **The database is the whole state.** No config file changes behaviour, and
@@ -46,7 +98,11 @@ there is no cache. Copying the `.db` moves the course and the history together.
 
 **`uid` is a question's identity.** Re-importing an edited pack must keep the
 attempt history and scheduler state attached. Never key on the prompt text or
-the row id.
+the row id. A question that disappears from a pack is *retired* — `active = 0`,
+so it stops being scheduled and drops out of lessons — never deleted, because
+its attempts are history and history does not get rewritten. Facts are not
+retired by an import at all: a pack that mentions none must not empty the
+glossary the other packs of the deck depend on.
 
 **Explanations are shared content.** A question has a short reading and a deep
 reading; either may contain literal text and `{"fact": "uid"}` references.
@@ -94,6 +150,14 @@ That is why the web build has no toolbar of its own: there is nothing left for
 one to hold. Both routes decode packs through `import::decode_packs`, so a ZIP
 of packs behaves identically on either.
 
+Import offers three sources on both platforms: local files (one or more flat
+JSON packs, a ZIP of any number of them, or a mixture), a short built-in list
+of example course repositories, or the URL of any public GitHub repository.
+The GitHub route walks the repository for every `.json` file and merges the
+packs before the ordinary uid-aware import runs, so it expects the
+repository's main URL — `https://github.com/owner/repository` — and not a
+file, branch or directory URL.
+
 **The event log is append-only.** Nothing may `UPDATE` or `DELETE` from
 `event`. Undo removes the `attempt` row and rewinds the box, but the original
 answer stays in the log — it did happen. Scheduler counters (`seen_count`,
@@ -109,6 +173,25 @@ in the UI struct, which a borrow would forbid.
 
 **Latency `-1` means unknown**, not zero — a card answered without a preceding
 `show()` must not report a fabricated 0 ms.
+
+## Scheduling
+
+`scheduler.rs` is a pure function over the card's state, and it is tuned for an
+exam next week rather than for retention over months. That premise is what
+justifies every constant in it, so do not "correct" them towards SM-2.
+
+Leitner boxes with sub-day intervals — 45 s, 3 min, 10 min, 1 h, 6 h, 1 day,
+3 days. A correct answer moves a card up one box; a miss sends it to the
+bottom, which is why the first interval is short enough that the card returns
+inside the same session. When a deck has an `exam_at`, `EXAM_HORIZON` caps any
+interval at 40 % of the time remaining, so everything gets another repetition
+or two before it counts.
+
+Selection scores urgency (is it due?) against weakness (how badly is it
+needed?), samples from the strongest few rather than always taking the maximum
+— `JITTER_LOW`/`JITTER_HIGH` decide how far apart two cards must be before the
+order stops changing between draws — and penalises staying in one topic.
+Interleaving is what separates recognising a card from knowing the answer.
 
 ## The database driver
 
@@ -171,6 +254,7 @@ to include `crates/core` and the `idiodb` binary.
 ./tools/run-all-tests.sh          # core + app, the whole workspace
 cargo test                        # app only (default member)
 nix-shell --run ./tools/shot.sh   # headless UI screenshots -> target/shots/
+nix-shell --run "./tools/shot.sh -m ma"   # another module -> target/shots/ma/
 ```
 
 **The content tooling lives here, in `tools/`, not beside the packs.** All of

@@ -362,9 +362,21 @@ fn used_symbols<'a>(q: &Question, facts: &'a Facts, shown: &[Seg]) -> Vec<&'a Fa
         }
     }
     for seg in shown {
-        if let Seg::Text(s) = seg {
-            context.push(' ');
-            context.push_str(s);
+        match seg {
+            Seg::Text(s) => {
+                context.push(' ');
+                context.push_str(s);
+            }
+            Seg::Fact { fact } => {
+                if let Some(f) = facts.get(fact) {
+                    if let Some(label) = &f.label {
+                        context.push(' ');
+                        context.push_str(label);
+                    }
+                    context.push(' ');
+                    context.push_str(&content_transcript(&f.body));
+                }
+            }
         }
     }
 
@@ -611,6 +623,52 @@ mod tests {
         assert_eq!(
             found.iter().map(|f| f.uid.as_str()).collect::<Vec<_>>(),
             ["sym-omega-0"]
+        );
+    }
+
+    #[test]
+    fn a_question_glossary_reaches_into_quoted_formulas() {
+        let zeta = symbol("sym-zeta", "ζ", "zeta");
+        let omega = symbol("sym-omega-0", "ω₀", "omega zero");
+        let formula = Fact {
+            id: 3,
+            deck_id: Some(1),
+            uid: "f-second-order".into(),
+            kind: FactKind::Formula,
+            label: Some(r"H_2(s) = \frac{\omega_0^2}{s^2 + 2\zeta\omega_0s + \omega_0^2}".into()),
+            name: None,
+            title: Some("Standard second-order system".into()),
+            body: Vec::new(),
+            source: None,
+        };
+        let facts = Facts {
+            by_uid: HashMap::from([(formula.uid.clone(), formula)]),
+            symbols: vec![omega, zeta],
+        };
+        let question = Question {
+            id: 1,
+            deck_id: 1,
+            topic_id: None,
+            uid: "q".into(),
+            prompt: vec![idiosepius_core::ContentBlock::text(
+                "Read the parameters from the standard form.",
+            )],
+            body: Body::TrueFalse { answer: true },
+            explanation: None,
+            explain: Explain {
+                short: Vec::new(),
+                deep: vec![Seg::fact("f-second-order")],
+            },
+            difficulty: 1,
+            source: None,
+            tags: Vec::new(),
+        };
+
+        let segments = segments(&question, Depth::Deep);
+        let found = used_symbols(&question, &facts, &segments);
+        assert_eq!(
+            found.iter().map(|f| f.uid.as_str()).collect::<Vec<_>>(),
+            ["sym-omega-0", "sym-zeta"]
         );
     }
 }

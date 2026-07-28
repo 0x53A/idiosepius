@@ -10,8 +10,8 @@ use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, Sense, Shape, Stroke, 
 use idiosepius_core::model::{Deck, Lesson, LessonBlock, Topic};
 use idiosepius_core::session::{Event, Outcome};
 use idiosepius_core::{
-    Body, ContentBlock, FactKind, Figure, Grade, Input, Mode, Question, Response, Session, Store,
-    content_transcript, now_ms, scheduler, stats,
+    Body, ContentBlock, Fact, FactKind, Figure, Grade, Input, Mode, Question, Response, Session,
+    Store, content_transcript, now_ms, scheduler, stats,
 };
 
 use crate::blocks;
@@ -57,8 +57,13 @@ pub struct App {
     /// A lesson's authored practice sequence, waiting for the current lesson
     /// screen to be attached as its return destination.
     pending_lesson_practice: Option<(Deck, Vec<Question>)>,
+    /// A lesson's authored questions, waiting to become a scoped question bank
+    /// with the current lesson reader as its return destination.
+    pending_lesson_questions: Option<(Deck, String, Vec<Question>)>,
     /// A plot opened from any prompt or explanation at a readable size.
     plot_zoom: Option<Figure>,
+    /// The current deck's authored formula facts, shown over any course screen.
+    formula_sheet: Option<FormulaSheet>,
     /// Back operations asked for by the browser's History API. They are
     /// applied through the same route as the on-screen button and Escape.
     pending_back: usize,
@@ -94,6 +99,13 @@ struct Notice {
     text: String,
     since: Instant,
     ttl: Duration,
+}
+
+struct FormulaSheet {
+    deck_id: i64,
+    deck_title: String,
+    formulas: Vec<Fact>,
+    filter: String,
 }
 
 /// A pending `--shot` capture.
@@ -165,11 +177,18 @@ struct Lessons {
 
 struct QuestionBank {
     deck: Deck,
+    heading: String,
+    title: String,
     questions: Vec<Question>,
     topics: HashMap<i64, String>,
     latest_results: HashMap<i64, bool>,
     filters: QuestionFilters,
     collapsed: HashSet<Option<i64>>,
+    /// The complete bank groups by topic; lesson practice stays in authored
+    /// sequence under one heading.
+    grouped: bool,
+    /// Lesson-scoped banks return to the exact reading that opened them.
+    back: Option<Box<Screen>>,
     /// Screenshot-only initial position; normal navigation leaves this empty.
     initial_scroll: Option<f32>,
 }
@@ -286,12 +305,33 @@ fn screen_depth(screen: &Screen) -> usize {
         Screen::Decks | Screen::MathCheck | Screen::PlotCheck => 0,
         Screen::Course(_) | Screen::Summary(_) => 1,
         Screen::Lessons(lessons) => 2 + usize::from(lessons.selected.is_some()),
-        Screen::Questions(_) | Screen::Progress(_) => 2,
+        Screen::Questions(bank) => bank
+            .back
+            .as_deref()
+            .map_or(2, |back| screen_depth(back) + 1),
+        Screen::Progress(_) => 2,
         Screen::Study(study) => match &study.route {
             StudyRoute::Scheduled => 1,
             StudyRoute::Single { back } | StudyRoute::Lesson { back, .. } => screen_depth(back) + 1,
         },
         Screen::Review(review) => screen_depth(&review.back) + 1,
+    }
+}
+
+fn screen_deck_id(screen: &Screen) -> Option<i64> {
+    match screen {
+        Screen::Course(deck) => Some(deck.id),
+        Screen::Lessons(lessons) => Some(lessons.deck.id),
+        Screen::Questions(bank) => Some(bank.deck.id),
+        Screen::Progress(progress) => Some(progress.deck.id),
+        Screen::Study(study) => Some(study.deck.id),
+        Screen::Summary(summary) => Some(summary.deck_id),
+        Screen::Review(review) => review
+            .items
+            .get(review.idx)
+            .map(|item| item.question.deck_id)
+            .or_else(|| screen_deck_id(&review.back)),
+        Screen::Decks | Screen::MathCheck | Screen::PlotCheck => None,
     }
 }
 
@@ -324,6 +364,36 @@ fn screen_back_button(ui: &egui::Ui, full: Rect) -> bool {
     response.clicked()
 }
 
+fn formula_sheet_button(ui: &egui::Ui, full: Rect) -> bool {
+    let rect = Rect::from_min_size(
+        full.right_top() + Vec2::new(-104.0, 8.0),
+        Vec2::new(44.0, 44.0),
+    );
+    let response = ui
+        .interact(rect, Id::new("formula-sheet"), Sense::click())
+        .on_hover_text("Formula sheet (F)");
+    let hot = response.hovered() || response.has_focus();
+    let colour = if hot {
+        Palette::ACCENT
+    } else {
+        Palette::TEXT_DIM
+    };
+    ui.painter()
+        .rect_filled(rect, 0, if hot { Palette::CARD } else { Palette::SURFACE });
+    ui.painter()
+        .rect_stroke(rect, 0, Stroke::new(1.0, colour), egui::StrokeKind::Inside);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "F",
+        text::title(),
+        colour,
+    );
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Formula sheet"));
+    response.clicked()
+}
+
 impl App {
     pub fn new(ctx: &egui::Context, store: Store, shot: Option<Shot>) -> Self {
         crate::theme::install(ctx);
@@ -352,7 +422,9 @@ impl App {
             pending_review: None,
             pending_question: None,
             pending_lesson_practice: None,
+            pending_lesson_questions: None,
             plot_zoom: None,
+            formula_sheet: None,
             pending_back: 0,
             shot,
         };
@@ -364,6 +436,12 @@ impl App {
             None | Some("decks" | "decks-scroll") => {}
             Some("math") => app.screen = Screen::MathCheck,
             Some("plots") => app.screen = Screen::PlotCheck,
+            Some("formulas") => {
+                if let Some(deck) = app.decks.first().cloned() {
+                    app.screen = Screen::Course(deck.clone());
+                    app.open_formula_sheet(deck.id);
+                }
+            }
             Some("plot-zoom") => {
                 app.screen = Screen::PlotCheck;
                 app.plot_zoom = Some(nyquist_check_figure());
@@ -410,6 +488,38 @@ impl App {
                         };
                     }
                     app.screen = screen;
+                }
+            }
+            Some("lesson-questions") => {
+                if let Some(deck) = app.decks.first().cloned()
+                    && let Some(mut back) = app.lessons(deck.clone())
+                {
+                    let lesson = if let Screen::Lessons(lessons) = &mut back {
+                        let wanted = app.shot.as_ref().and_then(|shot| shot.card.as_deref());
+                        let index = wanted
+                            .and_then(|uid| {
+                                lessons.lessons.iter().position(|lesson| lesson.uid == uid)
+                            })
+                            .or_else(|| {
+                                lessons
+                                    .lessons
+                                    .iter()
+                                    .position(|lesson| !lesson.practice.is_empty())
+                            });
+                        lessons.selected = index;
+                        index
+                            .and_then(|index| lessons.lessons.get(index))
+                            .map(|lesson| (lesson.title.clone(), lesson.practice.clone()))
+                    } else {
+                        None
+                    };
+                    if let Some((title, practice)) = lesson
+                        && let Ok(questions) = app.store.questions_by_uids(deck.id, &practice)
+                    {
+                        app.screen = app.lesson_question_bank(deck, title, questions, back);
+                    } else {
+                        app.screen = back;
+                    }
                 }
             }
             Some("questions" | "questions-scroll" | "questions-collapsed") => {
@@ -519,6 +629,7 @@ impl App {
             Some(ImportView::Sources) => 1,
             Some(ImportView::Examples | ImportView::Github | ImportView::Loading) => 2,
             None if self.plot_zoom.is_some() => 1,
+            None if self.formula_sheet.is_some() => 1,
             None => 0,
         };
         screen_depth(&self.screen) + overlay
@@ -695,17 +806,33 @@ impl eframe::App for App {
         // The root ui has no background of its own.
         ui.painter().rect_filled(ui.max_rect(), 0, Palette::BG);
 
-        // Let Escape close the plot modal without also navigating the screen
-        // visible behind it.
+        // Let Escape close a modal without also navigating the screen visible
+        // behind it.
         let close_plot = if self.plot_zoom.is_some() {
             ui.ctx()
                 .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         } else {
             false
         };
-        let escape_back = if self.plot_zoom.is_none() {
+        let close_formulas = if self.plot_zoom.is_none() && self.formula_sheet.is_some() {
             ui.ctx()
                 .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        } else {
+            false
+        };
+        let escape_back = if self.plot_zoom.is_none() && self.formula_sheet.is_none() {
+            ui.ctx()
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        } else {
+            false
+        };
+        let formula_key = if self.import_view.is_none()
+            && self.plot_zoom.is_none()
+            // A focused filter owns ordinary text keys, including `F`.
+            && !ui.ctx().text_edit_focused()
+        {
+            ui.ctx()
+                .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::F))
         } else {
             false
         };
@@ -735,9 +862,15 @@ impl eframe::App for App {
             Screen::Review(review) => self.review_screen(ui, review),
         };
         let mut screen = next.unwrap_or(screen);
+        let formula_button = screen_deck_id(&screen).is_some()
+            && self.import_view.is_none()
+            && self.plot_zoom.is_none()
+            && self.formula_sheet.is_none()
+            && formula_sheet_button(ui, ui.max_rect());
         let touch_back = screen_depth(&screen) > 0
             && self.import_view.is_none()
             && self.plot_zoom.is_none()
+            && self.formula_sheet.is_none()
             && screen_back_button(ui, ui.max_rect());
 
         // Opening a review needs the screen it was opened from, which only
@@ -748,6 +881,9 @@ impl eframe::App for App {
         }
         if let Some((deck, question)) = self.pending_question.take() {
             screen = self.begin_single(deck, question, screen);
+        }
+        if let Some((deck, title, questions)) = self.pending_lesson_questions.take() {
+            screen = self.lesson_question_bank(deck, title, questions, screen);
         }
         if let Some((deck, questions)) = self.pending_lesson_practice.take() {
             screen = self.begin_lesson_practice(deck, questions, screen);
@@ -763,6 +899,19 @@ impl eframe::App for App {
             }
         }
 
+        if close_formulas {
+            self.formula_sheet = None;
+        }
+        if formula_key {
+            if self.formula_sheet.is_some() {
+                self.formula_sheet = None;
+            } else if let Some(deck_id) = screen_deck_id(&screen) {
+                self.open_formula_sheet(deck_id);
+            }
+        } else if formula_button && let Some(deck_id) = screen_deck_id(&screen) {
+            self.open_formula_sheet(deck_id);
+        }
+
         // egui-winit translates Ctrl/Cmd+C into Event::Copy and deliberately
         // does not emit a C key event, so normal shortcut matching cannot see
         // it. Consume the platform copy event directly.
@@ -770,7 +919,11 @@ impl eframe::App for App {
             .ctx()
             .input_mut(|input| take_copy_event(&mut input.events));
         if copy {
-            let text = self.visible_text(&screen);
+            let text = self
+                .formula_sheet
+                .as_ref()
+                .map(formula_sheet_text)
+                .unwrap_or_else(|| self.visible_text(&screen));
             if !text.trim().is_empty() {
                 ui.ctx().copy_text(text);
                 self.notice = Some(Notice {
@@ -786,6 +939,7 @@ impl eframe::App for App {
             self.plot_zoom = Some(figure);
         }
         self.show_plot_zoom(ui.ctx(), close_plot);
+        self.show_formula_sheet(ui.ctx());
 
         self.show_import_dialog(ui.ctx());
 
@@ -823,6 +977,9 @@ impl App {
         if self.plot_zoom.take().is_some() {
             return true;
         }
+        if self.formula_sheet.take().is_some() {
+            return true;
+        }
 
         let next = match screen {
             Screen::Decks => None,
@@ -832,7 +989,13 @@ impl App {
                 return true;
             }
             Screen::Lessons(lessons) => Some(Screen::Course(lessons.deck.clone())),
-            Screen::Questions(bank) => Some(Screen::Course(bank.deck.clone())),
+            Screen::Questions(bank) => {
+                if let Some(back) = bank.back.take() {
+                    Some(*back)
+                } else {
+                    Some(Screen::Course(bank.deck.clone()))
+                }
+            }
             Screen::Progress(progress) => Some(Screen::Course(progress.deck.clone())),
             Screen::Study(study) => self.apply(study, Action::Quit),
             Screen::Summary(_) => {
@@ -879,6 +1042,169 @@ impl App {
             });
         if close_requested || modal.should_close() || modal.inner {
             self.plot_zoom = None;
+        }
+    }
+
+    fn open_formula_sheet(&mut self, deck_id: i64) {
+        let deck_title = self
+            .store
+            .deck(deck_id)
+            .ok()
+            .flatten()
+            .map(|deck| deck.title)
+            .unwrap_or_else(|| "Course".into());
+        match self.store.facts(deck_id) {
+            Ok(facts) => {
+                self.formula_sheet = Some(FormulaSheet {
+                    deck_id,
+                    deck_title,
+                    formulas: facts
+                        .into_iter()
+                        .filter(|fact| fact.kind == FactKind::Formula)
+                        .collect(),
+                    filter: String::new(),
+                });
+            }
+            Err(error) => {
+                self.error = Some(format!("could not load formula sheet: {error}"));
+            }
+        }
+    }
+
+    fn show_formula_sheet(&mut self, ctx: &egui::Context) {
+        let Some(sheet) = self.formula_sheet.as_mut() else {
+            return;
+        };
+        let width = (ctx.content_rect().width() - 64.0).clamp(260.0, 760.0);
+        // Reserve the rest of the viewport for the title, filter, count,
+        // close control and frame margins; only the formula list scrolls.
+        let scroll_height = (ctx.content_rect().height() - 294.0).clamp(80.0, 500.0);
+        let frame = egui::Frame::new()
+            .inner_margin(24)
+            .fill(Palette::SURFACE)
+            .stroke(Stroke::new(1.0, Palette::LINE_BRIGHT));
+        let modal = egui::Modal::new(Id::new(("formula-sheet-modal", sheet.deck_id)))
+            .backdrop_color(Palette::BG.gamma_multiply(0.86))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                ui.label(
+                    egui::RichText::new(tracked("formula sheet"))
+                        .font(text::title())
+                        .color(Palette::TEXT),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(&sheet.deck_title)
+                        .font(text::small())
+                        .color(Palette::TEXT_DIM),
+                );
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(tracked("filter"))
+                        .font(text::label())
+                        .color(Palette::TEXT_FAINT),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut sheet.filter)
+                        .id_salt(("formula-sheet-filter", sheet.deck_id))
+                        .font(text::small())
+                        .hint_text("title, equation, explanation or source")
+                        .desired_width(f32::INFINITY)
+                        .min_size(Vec2::new(0.0, 44.0)),
+                );
+                ui.add_space(4.0);
+                let visible_count = sheet
+                    .formulas
+                    .iter()
+                    .filter(|formula| formula_matches_filter(formula, &sheet.filter))
+                    .count();
+                ui.label(
+                    egui::RichText::new(formula_count(
+                        visible_count,
+                        sheet.formulas.len(),
+                        &sheet.filter,
+                    ))
+                    .font(text::small())
+                    .color(Palette::TEXT_DIM),
+                );
+                ui.add_space(8.0);
+
+                egui::ScrollArea::vertical()
+                    .id_salt(("formula-sheet-scroll", sheet.deck_id))
+                    .max_height(scroll_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if sheet.formulas.is_empty() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "No formula facts have been authored for this deck yet.",
+                                )
+                                .font(text::body())
+                                .color(Palette::TEXT_DIM),
+                            );
+                            return;
+                        }
+                        if visible_count == 0 {
+                            ui.label(
+                                egui::RichText::new("No formulas match this filter.")
+                                    .font(text::body())
+                                    .color(Palette::TEXT_DIM),
+                            );
+                            return;
+                        }
+
+                        let mut groups: Vec<(&str, Vec<&Fact>)> = Vec::new();
+                        for formula in sheet
+                            .formulas
+                            .iter()
+                            .filter(|formula| formula_matches_filter(formula, &sheet.filter))
+                        {
+                            let source = formula.source.as_deref().unwrap_or("Other");
+                            if let Some((_, formulas)) =
+                                groups.iter_mut().find(|(name, _)| *name == source)
+                            {
+                                formulas.push(formula);
+                            } else {
+                                groups.push((source, vec![formula]));
+                            }
+                        }
+                        for (group_index, (source, formulas)) in groups.into_iter().enumerate() {
+                            if group_index > 0 {
+                                ui.add_space(10.0);
+                            }
+                            ui.label(
+                                egui::RichText::new(tracked(source))
+                                    .font(text::label())
+                                    .color(Palette::TEXT_FAINT),
+                            );
+                            let (rule, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 7.0),
+                                Sense::hover(),
+                            );
+                            ui.painter().line_segment(
+                                [rule.left_center(), rule.right_center()],
+                                Stroke::new(1.0, Palette::LINE),
+                            );
+                            for formula in formulas {
+                                let mut formula = formula.clone();
+                                // The source is already the section heading.
+                                formula.source = None;
+                                explain::fact_block(ui, &formula);
+                                ui.add_space(8.0);
+                            }
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.add_sized(
+                    [ui.available_width(), 44.0],
+                    egui::Button::new(tracked("close  ·  f / esc")),
+                )
+                .clicked()
+            });
+        if modal.should_close() || modal.inner {
+            self.formula_sheet = None;
         }
     }
 }
@@ -1053,6 +1379,64 @@ fn take_copy_event(events: &mut Vec<egui::Event>) -> bool {
     had_copy
 }
 
+fn formula_sheet_text(sheet: &FormulaSheet) -> String {
+    let mut out = format!("{}\n\nFormula sheet", sheet.deck_title);
+    for formula in sheet
+        .formulas
+        .iter()
+        .filter(|formula| formula_matches_filter(formula, &sheet.filter))
+    {
+        if let Some(title) = &formula.title {
+            let _ = write!(out, "\n\n{title}");
+        }
+        if let Some(label) = &formula.label {
+            let _ = write!(out, "\n$${label}$$");
+        }
+        let body = content_transcript(&formula.body);
+        if !body.is_empty() {
+            let _ = write!(out, "\n{body}");
+        }
+        if let Some(source) = &formula.source {
+            let _ = write!(out, "\nSource: {source}");
+        }
+    }
+    out
+}
+
+fn formula_count(visible: usize, total: usize, filter: &str) -> String {
+    if filter.trim().is_empty() {
+        format!("{total} formulas")
+    } else {
+        format!("{visible} of {total} formulas")
+    }
+}
+
+fn formula_matches_filter(formula: &Fact, filter: &str) -> bool {
+    let filter = filter.trim().to_lowercase();
+    if filter.is_empty() {
+        return true;
+    }
+
+    let mut searchable = String::new();
+    for value in [
+        formula.title.as_deref(),
+        formula.label.as_deref(),
+        formula.source.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        searchable.push_str(value);
+        searchable.push('\n');
+    }
+    searchable.push_str(&content_transcript(&formula.body));
+    let searchable = searchable.to_lowercase();
+
+    filter
+        .split_whitespace()
+        .all(|term| searchable.contains(term))
+}
+
 impl App {
     /// A human-readable transcript of the current screen.
     ///
@@ -1143,8 +1527,9 @@ impl App {
             }
             Screen::Questions(bank) => {
                 let mut out = format!(
-                    "{}\n\nQuestion bank\n{} questions",
-                    bank.deck.title,
+                    "{}\n\n{}\n{} questions",
+                    bank.title,
+                    bank.heading,
                     bank.questions.len()
                 );
                 for question in &bank.questions {
@@ -1908,22 +2293,31 @@ impl App {
                         let practice_rect = ui
                             .allocate_exact_size(Vec2::new(row_width, 76.0), Sense::hover())
                             .0;
-                        if navigation_row(
+                        let action = lesson_practice_row(
                             ui,
                             practice_rect,
-                            ("lesson-practice", lesson.id),
-                            "practice this lesson",
-                            "Study exactly the questions taught here, in authored order.",
-                            &format!("{} questions", lesson.practice.len()),
-                        ) {
+                            lesson.id,
+                            lesson.practice.len(),
+                        );
+                        if !matches!(action, LessonPracticeAction::None) {
                             match self
                                 .store
                                 .questions_by_uids(screen.deck.id, &lesson.practice)
                             {
-                                Ok(questions) if !questions.is_empty() => {
-                                    self.pending_lesson_practice =
-                                        Some((screen.deck.clone(), questions));
-                                }
+                                Ok(questions) if !questions.is_empty() => match action {
+                                    LessonPracticeAction::Practice => {
+                                        self.pending_lesson_practice =
+                                            Some((screen.deck.clone(), questions));
+                                    }
+                                    LessonPracticeAction::Browse => {
+                                        self.pending_lesson_questions = Some((
+                                            screen.deck.clone(),
+                                            lesson.title.clone(),
+                                            questions,
+                                        ));
+                                    }
+                                    LessonPracticeAction::None => {}
+                                },
                                 Ok(_) => {
                                     self.error = Some(
                                         "none of this lesson's practice questions are active"
@@ -1991,14 +2385,51 @@ impl App {
             .latest_question_results(deck.id)
             .unwrap_or_default();
         Some(Screen::Questions(Box::new(QuestionBank {
+            heading: "question bank".into(),
+            title: deck.title.clone(),
             deck,
             questions,
             topics,
             latest_results,
             filters: QuestionFilters::default(),
             collapsed: HashSet::new(),
+            grouped: true,
+            back: None,
             initial_scroll: None,
         })))
+    }
+
+    fn lesson_question_bank(
+        &mut self,
+        deck: Deck,
+        lesson_title: String,
+        questions: Vec<Question>,
+        back: Screen,
+    ) -> Screen {
+        let topics = self
+            .store
+            .topics(deck.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|topic: Topic| (topic.id, topic.title))
+            .collect();
+        let latest_results = self
+            .store
+            .latest_question_results(deck.id)
+            .unwrap_or_default();
+        Screen::Questions(Box::new(QuestionBank {
+            deck,
+            heading: "lesson practice".into(),
+            title: lesson_title,
+            questions,
+            topics,
+            latest_results,
+            filters: QuestionFilters::default(),
+            collapsed: HashSet::new(),
+            grouped: false,
+            back: Some(Box::new(back)),
+            initial_scroll: None,
+        }))
     }
 
     fn questions_screen(&mut self, ui: &mut egui::Ui, bank: &mut QuestionBank) -> Option<Screen> {
@@ -2021,14 +2452,14 @@ impl App {
         p.text(
             Pos2::new(header_x, panel.top()),
             Align2::LEFT_TOP,
-            tracked("question bank"),
+            tracked(&bank.heading),
             text::label(),
             Palette::ACCENT,
         );
         p.text(
             Pos2::new(header_x, panel.top() + 26.0),
             Align2::LEFT_TOP,
-            &bank.deck.title,
+            &bank.title,
             text::title(),
             Palette::TEXT,
         );
@@ -2036,7 +2467,11 @@ impl App {
             p.text(
                 Pos2::new(panel.right().min(full.right() - 64.0), panel.top() + 30.0),
                 Align2::RIGHT_TOP,
-                tracked(&format!("{} unlocked", bank.questions.len())),
+                tracked(&if bank.grouped {
+                    format!("{} unlocked", bank.questions.len())
+                } else {
+                    format!("{} questions", bank.questions.len())
+                }),
                 text::label(),
                 Palette::TEXT_DIM,
             );
@@ -2073,22 +2508,41 @@ impl App {
         // share a title. `Store::questions` already follows topic order; this
         // coalescing also guarantees one header per topic if that ever changes.
         let mut groups: Vec<Group> = Vec::new();
-        for (index, question) in bank.questions.iter().enumerate() {
-            let result = bank.latest_results.get(&question.id).copied();
-            if !bank.filters.includes(result) {
-                continue;
+        if bank.grouped {
+            for (index, question) in bank.questions.iter().enumerate() {
+                let result = bank.latest_results.get(&question.id).copied();
+                if !bank.filters.includes(result) {
+                    continue;
+                }
+                let topic_id = question.topic_id;
+                if let Some(group) = groups.iter_mut().find(|group| group.topic_id == topic_id) {
+                    group.questions.push(index);
+                } else {
+                    groups.push(Group {
+                        topic_id,
+                        title: topic_id
+                            .and_then(|id| bank.topics.get(&id))
+                            .cloned()
+                            .unwrap_or_else(|| "Uncategorised".to_owned()),
+                        questions: vec![index],
+                    });
+                }
             }
-            let topic_id = question.topic_id;
-            if let Some(group) = groups.iter_mut().find(|group| group.topic_id == topic_id) {
-                group.questions.push(index);
-            } else {
+        } else {
+            let questions = bank
+                .questions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, question)| {
+                    let result = bank.latest_results.get(&question.id).copied();
+                    bank.filters.includes(result).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            if !questions.is_empty() {
                 groups.push(Group {
-                    topic_id,
-                    title: topic_id
-                        .and_then(|id| bank.topics.get(&id))
-                        .cloned()
-                        .unwrap_or_else(|| "Uncategorised".to_owned()),
-                    questions: vec![index],
+                    topic_id: None,
+                    title: "Authored order".into(),
+                    questions,
                 });
             }
         }
@@ -2107,7 +2561,7 @@ impl App {
                 ui.spacing_mut().scroll.bar_width = 5.0;
                 ui.spacing_mut().scroll.floating = false;
                 let scroll = egui::ScrollArea::vertical()
-                    .id_salt("question-bank")
+                    .id_salt(("question-bank", bank.deck.id, &bank.heading, &bank.title))
                     .auto_shrink([false, false])
                     .scroll_bar_rect(Rect::from_min_max(
                         body.left_top() + Vec2::new(0.0, GROUP_HEADER_HEIGHT),
@@ -3305,7 +3759,8 @@ fn chrome(ui: &egui::Ui, study: &Study, full: Rect, coin: &mut CoinAnimation) {
         _ => format!("{} due", study.counts.due + study.counts.fresh),
     };
     p.text(
-        top.right_center() + Vec2::new(-66.0, 0.0),
+        // Leave room for the formula-sheet and Back controls.
+        top.right_center() + Vec2::new(-118.0, 0.0),
         Align2::RIGHT_CENTER,
         if full.width() < 520.0 {
             right
@@ -3450,6 +3905,129 @@ enum DeckRowAction {
     None,
     Open,
     Shuffle,
+}
+
+enum LessonPracticeAction {
+    None,
+    Practice,
+    Browse,
+}
+
+/// The lesson footer mirrors a deck row: the broad segment performs the
+/// primary action, while the square segment opens the narrower list view.
+fn lesson_practice_row(
+    ui: &mut egui::Ui,
+    row: Rect,
+    lesson_id: i64,
+    question_count: usize,
+) -> LessonPracticeAction {
+    let browse = Rect::from_min_size(
+        Pos2::new(row.right() - row.height(), row.top()),
+        Vec2::splat(row.height()),
+    );
+    let practice = Rect::from_min_max(row.left_top(), browse.left_bottom());
+    let practice_response = ui
+        .push_id(("lesson-practice", lesson_id), |ui| {
+            ui.put(practice, egui::Button::new("").frame(false))
+        })
+        .inner
+        .on_hover_text("practice these questions in authored order");
+    let browse_response = ui
+        .push_id(("lesson-practice-list", lesson_id), |ui| {
+            ui.put(browse, egui::Button::new("").frame(false))
+        })
+        .inner
+        .on_hover_text("browse this lesson's questions");
+    let practice_hot = practice_response.hovered() || practice_response.has_focus();
+    let browse_hot = browse_response.hovered() || browse_response.has_focus();
+    let painter = ui.painter();
+
+    for (rect, hot) in [(practice, practice_hot), (browse, browse_hot)] {
+        painter.rect_filled(rect, 0, if hot { Palette::CARD } else { Palette::SURFACE });
+        painter.rect_stroke(
+            rect,
+            0,
+            Stroke::new(1.0, if hot { Palette::ACCENT } else { Palette::LINE }),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    painter.text(
+        practice.left_top() + Vec2::new(18.0, 14.0),
+        Align2::LEFT_TOP,
+        tracked("practice"),
+        text::label(),
+        if practice_hot {
+            Palette::ACCENT
+        } else {
+            Palette::TEXT
+        },
+    );
+    let description = richtext::layout(
+        painter,
+        "Study these questions in authored order.",
+        12.5,
+        (practice.width() - 36.0).max(100.0),
+    );
+    description.paint(
+        painter,
+        practice.left_top() + Vec2::new(18.0, 41.0),
+        Palette::TEXT_DIM,
+        1.0,
+    );
+    if practice.width() >= 360.0 {
+        painter.text(
+            practice.right_top() + Vec2::new(-18.0, 15.0),
+            Align2::RIGHT_TOP,
+            tracked(&format!("{question_count} questions")),
+            text::label(),
+            if practice_hot {
+                Palette::ACCENT
+            } else {
+                Palette::TEXT_FAINT
+            },
+        );
+    }
+    paint_list_icon(painter, browse.shrink(23.0), browse_hot);
+
+    practice_response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Practice this lesson")
+    });
+    browse_response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Browse practice questions")
+    });
+    if practice_response.clicked() {
+        LessonPracticeAction::Practice
+    } else if browse_response.clicked() {
+        LessonPracticeAction::Browse
+    } else {
+        LessonPracticeAction::None
+    }
+}
+
+/// Three square bullets and three hairlines: a list icon that stays available
+/// without depending on a particular font's symbol coverage.
+fn paint_list_icon(painter: &egui::Painter, rect: Rect, hot: bool) {
+    let ink = if hot {
+        Palette::ACCENT
+    } else {
+        Palette::TEXT_DIM
+    };
+    for row in 0..3 {
+        let y = rect.top() + 4.0 + row as f32 * 10.0;
+        painter.rect_filled(
+            Rect::from_min_size(Pos2::new(rect.left(), y), Vec2::splat(4.0)),
+            0,
+            ink,
+        );
+        painter.line_segment(
+            [
+                Pos2::new(rect.left() + 10.0, y + 2.0),
+                Pos2::new(rect.right(), y + 2.0),
+            ],
+            Stroke::new(2.0, ink),
+        );
+    }
 }
 
 fn deck_row(
@@ -5427,7 +6005,7 @@ fn headline() -> egui::FontId {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use idiosepius_core::ContentBlock;
+    use idiosepius_core::{ContentBlock, NewFact};
 
     fn begin_with_body(body: Body) -> (App, Box<Study>) {
         let context = egui::Context::default();
@@ -5547,6 +6125,88 @@ mod tests {
         assert!(take_copy_event(&mut events));
         assert_eq!(events, vec![egui::Event::Text("unrelated".into())]);
         assert!(!take_copy_event(&mut events));
+    }
+
+    #[test]
+    fn the_formula_sheet_contains_only_formula_facts_and_copies_latex() {
+        let context = egui::Context::default();
+        let store = Store::open_in_memory().unwrap();
+        let deck_id = store
+            .upsert_deck("formulas", "Formula Course", None, None)
+            .unwrap();
+        store
+            .upsert_fact(&NewFact {
+                deck_id: Some(deck_id),
+                uid: "f-peak".into(),
+                kind: FactKind::Formula,
+                label: Some(r"t_p = \frac{\pi}{\omega_d}".into()),
+                name: None,
+                title: Some("Peak time".into()),
+                body: vec![ContentBlock::text("Time to the first peak.")],
+                source: Some("Transient response".into()),
+            })
+            .unwrap();
+        store
+            .upsert_fact(&NewFact {
+                deck_id: Some(deck_id),
+                uid: "f-gain".into(),
+                kind: FactKind::Formula,
+                label: Some(r"A = \frac{y}{u}".into()),
+                name: None,
+                title: Some("Static gain".into()),
+                body: vec![ContentBlock::text("The steady-state output-input ratio.")],
+                source: Some("System properties".into()),
+            })
+            .unwrap();
+        store
+            .upsert_fact(&NewFact {
+                deck_id: Some(deck_id),
+                uid: "note-peak".into(),
+                kind: FactKind::Note,
+                label: None,
+                name: None,
+                title: Some("Not a formula".into()),
+                body: vec![ContentBlock::text("This must stay off the sheet.")],
+                source: None,
+            })
+            .unwrap();
+
+        let mut app = App::new(&context, store, None);
+        app.open_formula_sheet(deck_id);
+        let sheet = app.formula_sheet.as_mut().expect("sheet should open");
+
+        assert_eq!(sheet.formulas.len(), 2);
+        let peak = sheet
+            .formulas
+            .iter()
+            .find(|formula| formula.uid == "f-peak")
+            .cloned()
+            .unwrap();
+        let gain = sheet
+            .formulas
+            .iter()
+            .find(|formula| formula.uid == "f-gain")
+            .cloned()
+            .unwrap();
+        assert_eq!(formula_count(2, 2, ""), "2 formulas");
+
+        let copied = formula_sheet_text(&*sheet);
+        assert!(copied.contains(r"$$t_p = \frac{\pi}{\omega_d}$$"));
+        assert!(copied.contains("Time to the first peak."));
+        assert!(copied.contains("Static gain"));
+        assert!(!copied.contains("This must stay off the sheet."));
+
+        sheet.filter = "TRANSIENT first".into();
+        assert!(formula_matches_filter(&peak, &sheet.filter));
+        assert!(!formula_matches_filter(&gain, &sheet.filter));
+        assert_eq!(formula_count(1, 2, &sheet.filter), "1 of 2 formulas");
+
+        let copied = formula_sheet_text(&*sheet);
+        assert!(copied.contains("Peak time"));
+        assert!(!copied.contains("Static gain"));
+
+        sheet.filter = r"omega_d".into();
+        assert!(formula_matches_filter(&peak, &sheet.filter));
     }
 
     #[test]
@@ -5757,6 +6417,38 @@ mod tests {
                 .includes(bank.latest_results.get(&question.id).copied()),
             "the answered question leaves a not-yet-attempted-only view"
         );
+    }
+
+    #[test]
+    fn a_lesson_question_bank_is_scoped_and_returns_to_its_reader() {
+        let (mut app, study) = begin_with_body(Body::TrueFalse { answer: true });
+        let deck = study.deck.clone();
+        let question = study.current.clone().unwrap();
+        let mut screen = app.lesson_question_bank(
+            deck,
+            "Focused lesson".into(),
+            vec![question.clone()],
+            Screen::Decks,
+        );
+
+        let Screen::Questions(bank) = &screen else {
+            panic!("lesson questions should use the question-bank screen");
+        };
+        assert_eq!(bank.heading, "lesson practice");
+        assert_eq!(bank.title, "Focused lesson");
+        assert!(!bank.grouped, "lesson questions stay in authored order");
+        assert_eq!(
+            bank.questions
+                .iter()
+                .map(|question| question.uid.as_str())
+                .collect::<Vec<_>>(),
+            vec![question.uid.as_str()]
+        );
+        assert!(bank.back.is_some());
+        assert_eq!(screen_depth(&screen), 1);
+
+        assert!(app.back_once(&mut screen));
+        assert!(matches!(screen, Screen::Decks));
     }
 
     #[test]

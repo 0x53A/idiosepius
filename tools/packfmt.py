@@ -158,6 +158,11 @@ def main(argv):
     dirty = []
 
     for path in paths:
+        # A formula sheet sidecar is JSON beside a pack, but is deliberately
+        # not itself a content pack. Keep documented `content/*/*.json` globs
+        # useful without trying to impose pack structure on sheet settings.
+        if path.endswith(".sheet.json"):
+            continue
         with open(path, encoding="utf-8") as fh:
             original = fh.read()
         formatted = format_pack(json.loads(original))

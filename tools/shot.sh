@@ -87,6 +87,7 @@ shoot() {
 }
 
 shoot math      --screen math
+shoot formulas  --screen formulas
 shoot plots     --screen plots
 shoot plot-zoom --screen plot-zoom
 shoot decks     --screen decks
@@ -97,6 +98,7 @@ shoot lesson    --screen lesson
 # practice row. `--card` pins a lesson by uid the way it pins a question, and
 # on a lesson `--drag` is a scroll offset, for a capture of a figure mid-body.
 shoot lesson-end --screen lesson-end
+shoot lesson-questions --screen lesson-questions
 shoot questions --screen questions
 shoot questions-scroll    --screen questions-scroll
 shoot questions-collapsed --screen questions-collapsed

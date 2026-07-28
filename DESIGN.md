@@ -153,6 +153,12 @@ a font. That keeps the symbol available on every platform and obeys the
 rectangular visual language. The icon means random order, not a separate
 scheduler or a different set of questions.
 
+A lesson's practice row uses the same split grammar with the priorities
+reversed: its broad segment starts the authored practice sequence, while the
+square segment on the right draws a list icon and opens a question bank
+containing only that lesson's questions. The two segments are independent hit
+targets, and leaving the scoped bank returns to the same reading.
+
 Lessons organise teaching but do not gate practice. A newly imported deck has
 its entire active question bank available immediately, whether or not the deck
 contains any authored lessons.
@@ -183,6 +189,30 @@ thumb; tapping the prompt itself does not answer.
 Only the visible card, option, panel or button is clickable. Empty margin is a
 safe focus target: clicking it must never answer a question or advance the
 session. Clickable study surfaces give animated hover feedback.
+
+The study keys, as `App::keys` binds them:
+
+| while a card is asking | |
+|---|---|
+| `←` / `A`, `→` / `D`, or drag | answer false / true |
+| `1`–`5` | pick a multiple-choice option |
+| `Enter` or `Space` | confirm a multi-select |
+| `S` | skip — logged, no attempt |
+| `E` | reveal the answer and explanation |
+| **while an answer is showing** | |
+| `D` | switch between the short and deep reading |
+| `U` | undo the answer showing (graded answers only) |
+| `N` (`B` from a single question) `Space` `Enter` | continue |
+
+`E` is a skip that leaves the card up: it is logged, creates no attempt, and
+must never be recorded as wrong — revealing is a decision to learn the card,
+not a failure at it. Undo is offered only where there is an attempt to remove.
+The same `D` toggles depth on the review screen, where `←`/`→` step through the
+answered cards.
+
+`F` opens the current deck's formula sheet from any screen inside that deck.
+The square `F` control beside Back is its pointer and touch route; `F`, `Esc`,
+Back or the modal's Close control dismisses it.
 
 The whole interface scales with `Ctrl/Cmd` + `+` or `−`; `Ctrl/Cmd` + `0`
 returns to 100 %. Scaling applies equally to prose, formulas, cards and chrome.

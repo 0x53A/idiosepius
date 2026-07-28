@@ -200,9 +200,17 @@ impl<'a> Parser<'a> {
             return String::new();
         }
         let start = self.i;
+        let mut depth = 1;
         while let Some(c) = self.peek() {
-            if c == '}' {
-                break;
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
             }
             self.i += 1;
         }
@@ -1983,7 +1991,9 @@ mod tests {
 
     #[test]
     fn an_array_keeps_column_alignment_and_rules() {
-        let n = parse(r"\begin{array}{r|cc} s^3 & 1 & 3 \\ \hline s^2 & 2 & 4 \end{array}");
+        let n = parse(
+            r"\begin{array}{r|cc@{\qquad}l} s^3 & a_3 & a_1 & \\ s^2 & a_2 & a_0 & \text{stable} \\ \hline s^1 & b_1 & 0 & \end{array}",
+        );
         let Node::Matrix {
             rows,
             column_align,
@@ -1994,13 +2004,24 @@ mod tests {
         else {
             panic!("expected an array")
         };
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], Node::Script {
+            base: Box::new(sym("s")),
+            sup: Some(Box::new(sym("3"))),
+            sub: None,
+        });
+        assert_eq!(rows[1][3], Node::Sym("stable".into(), Class::Ord));
         assert_eq!(
             column_align,
-            vec![ColumnAlign::Right, ColumnAlign::Center, ColumnAlign::Center]
+            vec![
+                ColumnAlign::Right,
+                ColumnAlign::Center,
+                ColumnAlign::Center,
+                ColumnAlign::Left,
+            ]
         );
         assert_eq!(vertical_rules, vec![1]);
-        assert_eq!(horizontal_rules, vec![1]);
+        assert_eq!(horizontal_rules, vec![2]);
     }
 
     #[test]

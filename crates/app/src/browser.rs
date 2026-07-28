@@ -392,8 +392,6 @@ impl eframe::App for BrowserApp {
             } else if depth_after < depth_before {
                 self.ignore_pop_to = Some(depth_after);
                 browser_go_history(-((depth_before - depth_after) as i32));
-            } else {
-                browser_replace_history(depth_after);
             }
             match request {
                 Some(Request::ImportLocalDeck) => self.pick_decks(ui.ctx()),
@@ -523,6 +521,11 @@ export function browser_push_history(depth) {
 
 export function browser_replace_history(depth) {
     currentHistoryDepth = depth;
+    const state = history.state;
+    if (state && Number.isInteger(state.idiosepiusDepth) &&
+        state.idiosepiusDepth === depth) {
+        return;
+    }
     history.replaceState(appHistoryState(depth), "");
 }
 

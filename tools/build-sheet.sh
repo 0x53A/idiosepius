@@ -3,6 +3,7 @@
 #
 #   tools/build-sheet.sh cs          # -> content/control-systems/cs-formula-sheet.pdf
 #   tools/build-sheet.sh cs --terse  # -> ...-terse.pdf
+#   tools/build-sheet.sh cs --compact # -> ...-compact.pdf (black-and-white)
 #   tools/build-sheet.sh             # every module that has a formulas pack
 #
 # The argument is a module prefix, matching the `<prefix>-00-formulas.json`
@@ -22,16 +23,25 @@ if ! command -v tectonic >/dev/null 2>&1; then
 fi
 
 terse=
+compact=
 suffix=
 args=()
 for arg in "$@"; do
   if [[ $arg == --terse ]]; then
     terse=--terse
     suffix=-terse
+  elif [[ $arg == --compact ]]; then
+    compact=--compact
+    suffix=-compact
   else
     args+=("$arg")
   fi
 done
+
+if [[ -n $terse && -n $compact ]]; then
+  echo "--terse and --compact are separate output modes; choose one" >&2
+  exit 1
+fi
 
 shopt -s nullglob
 
@@ -62,9 +72,15 @@ for module in "${args[@]}"; do
   out_dir=$(dirname "$pack")
   name="$module-formula-sheet$suffix"
 
-  python3 tools/formula-sheet.py "$pack" $terse -o "$build/$name.tex"
+  # Sheet-level settings — the note, suppressed headings — live in an optional
+  # `<pack>.sheet.json` that the generator picks up on its own. Nothing to
+  # pass through here, and nothing module-specific in a generic tool.
+  python3 tools/formula-sheet.py "$pack" $terse $compact -o "$build/$name.tex"
   # Tectonic is chatty on stderr even when it succeeds; only failure matters.
   tectonic -X compile "$build/$name.tex" --outdir "$build" >/dev/null
   mv "$build/$name.pdf" "$out_dir/$name.pdf"
+  if [[ -n $compact ]]; then
+    cp "$build/$name.tex" "$out_dir/$name.tex"
+  fi
   echo "wrote $out_dir/$name.pdf"
 done

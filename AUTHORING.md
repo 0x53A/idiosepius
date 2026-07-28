@@ -564,8 +564,35 @@ python3 tools/check-packs.py content/<module-name>
 python3 tools/packfmt.py --check content/<module-name>/*.json
 ./tools/build-sheet.sh <mod>                  # <mod>-formula-sheet.pdf, with glosses
 ./tools/build-sheet.sh <mod> --terse          # formulas only, for the exam
+./tools/build-sheet.sh <mod> --compact        # compact black-and-white exam edition
 ./tools/build-sheet.sh                        # every module with a formulas pack
 ```
+
+The sheet carries no running head, no page numbers and no title — it is walked
+into an exam, where a line that is not a formula is paper wasted. What a module
+*does* want on it goes in an optional `<prefix>-00-formulas.sheet.json` beside
+the pack:
+
+```json
+{
+  "note": "Conventions: 5 % settling band, $t_{se} \\approx 3/(\\zeta\\omega_0)$.",
+  "section_order": ["Modeling", "Identification", "Stability"],
+  "heading_aliases": {"Linear Feedback Control": "Controllers & Design"},
+  "compact_gloss_sections": ["Identification", "Stability"],
+  "compact_gloss_sentences": 2,
+  "drop_headings": ["Optional Source Heading"]
+}
+```
+
+`note` is boxed at the top of the first page, prose with `$...$` spans — the
+place for the conventions the course marks to, which is where a remembered
+textbook result costs marks. `section_order` reorders source groups without
+changing their citations, and `heading_aliases` gives a group a shorter printed
+name. The compact edition can include the leading one or two sentences of each
+fact body for selected `compact_gloss_sections`; other sections remain
+formula-only. `drop_headings` suppresses a section heading without touching
+the `source` it is generated from. All are optional and per module: one
+course's conventions and sequence need not suit another course's sheet.
 
 `check-packs.py` and `packfmt.py` need only python3, which the development
 shell provides. `build-sheet.sh` needs LaTeX, which is deliberately *not* in
