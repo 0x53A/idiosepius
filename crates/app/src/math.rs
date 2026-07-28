@@ -2005,11 +2005,14 @@ mod tests {
             panic!("expected an array")
         };
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0][0], Node::Script {
-            base: Box::new(sym("s")),
-            sup: Some(Box::new(sym("3"))),
-            sub: None,
-        });
+        assert_eq!(
+            rows[0][0],
+            Node::Script {
+                base: Box::new(sym("s")),
+                sup: Some(Box::new(sym("3"))),
+                sub: None,
+            }
+        );
         assert_eq!(rows[1][3], Node::Sym("stable".into(), Class::Ord));
         assert_eq!(
             column_align,

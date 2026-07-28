@@ -488,11 +488,7 @@ fn ensure_tick(axis: &mut Axis, value: f64) {
             .iter()
             .enumerate()
             .filter(|(_, tick)| (tick.value - value).abs() < step * 0.65)
-            .min_by(|(_, a), (_, b)| {
-                (a.value - value)
-                    .abs()
-                    .total_cmp(&(b.value - value).abs())
-            })
+            .min_by(|(_, a), (_, b)| (a.value - value).abs().total_cmp(&(b.value - value).abs()))
             .map(|(index, _)| index);
         if let Some(index) = crowded {
             axis.ticks.remove(index);
