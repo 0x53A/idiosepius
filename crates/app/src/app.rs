@@ -6,14 +6,18 @@ use std::rc::Rc;
 use std::time::Duration;
 use web_time::Instant;
 
+#[cfg(not(target_arch = "wasm32"))]
+use anyhow::Context as _;
 use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use idiosepius_core::model::{Deck, Lesson, LessonBlock, Topic};
 use idiosepius_core::session::{Event, Outcome};
 use idiosepius_core::{
     Body, ContentBlock, Fact, FactKind, Figure, Grade, Input, Mode, Question, Response, Session,
-    Store, content_transcript, now_ms, scheduler, stats,
+    Store, content_transcript, display_options, now_ms, option_order, scheduler, stats,
 };
+use rand::{RngExt as _, SeedableRng as _};
 
+use crate::background::OceanBackground;
 use crate::blocks;
 use crate::card::{self, Motion};
 use crate::coin::CoinAnimation;
@@ -21,6 +25,7 @@ use crate::explain::{self, Depth, Facts};
 use crate::import_dialog::{self, ImportAction, ImportView};
 use crate::plot;
 use crate::richtext;
+use crate::settings::{FontSettings, PreparedFont};
 use crate::theme::{Palette, text, tracked};
 
 /// How many answered cards stay reachable with `r`.
@@ -34,6 +39,12 @@ pub struct App {
     screen: Screen,
     decks: Vec<Deck>,
     error: Option<String>,
+    fonts: FontSettings,
+    /// Native preferences live here. The browser shell owns the equivalent
+    /// OPFS paths and therefore leaves this empty.
+    #[cfg(not(target_arch = "wasm32"))]
+    settings_root: Option<std::path::PathBuf>,
+    background: OceanBackground,
     coin: CoinAnimation,
     /// A brief confirmation in the corner: a copy, an import, an export.
     notice: Option<Notice>,
@@ -70,7 +81,16 @@ pub struct App {
     /// Development aid: render a few frames, save a PNG, quit. Lets the UI be
     /// checked headlessly (under Xvfb, in CI) instead of by eye.
     shot: Option<Shot>,
+    /// Draws the seed that decides an option order, once per dealt card.
+    /// Seeded from a constant under `--shot` and from the system otherwise,
+    /// which is the whole of what makes a screenshot reproducible without
+    /// making a card's layout learnable.
+    shuffle: rand::rngs::StdRng,
 }
+
+/// Fixed so a captured card lays its options out the same way every run. Any
+/// value does; this one is arbitrary.
+const SHOT_SHUFFLE_SEED: u64 = 0x1d10_5e91_5eed;
 
 /// Something only the shell around the app can do: put a file picker on
 /// screen, fetch a public repository, or hand a file back to the user.
@@ -82,12 +102,15 @@ pub(crate) enum Request {
     ImportLocalDeck,
     ImportGithub(String),
     ExportDatabase,
+    ImportFont,
+    SaveSettings(Vec<u8>),
 }
 
 /// What a native file dialog came back with.
 #[cfg(not(target_arch = "wasm32"))]
 enum Picked {
     Decks(Vec<std::path::PathBuf>),
+    Font(std::path::PathBuf),
     Repository(Result<Vec<crate::import::PickedFile>, String>, ImportView),
     ExportTo(std::path::PathBuf),
     /// The dialog was cancelled, or could not be shown at all.
@@ -146,6 +169,7 @@ impl Shot {
 
 enum Screen {
     Decks,
+    Settings(Box<Screen>),
     Course(Deck),
     Lessons(Box<Lessons>),
     Questions(Box<QuestionBank>),
@@ -235,6 +259,10 @@ struct Study {
     topics: HashMap<i64, String>,
     facts: Rc<Facts>,
     current: Option<Question>,
+    /// Which order `current`'s options are being drawn in. Redrawn from
+    /// `App::shuffle` every time a card is dealt, so a card that comes back
+    /// comes back in a different order.
+    order_seed: u64,
     motion: Motion,
     /// Tail of question ids already shown, for interleaving.
     recent: Vec<i64>,
@@ -270,6 +298,10 @@ struct Answered {
     /// screen is a card to re-read, not a record of one attempt.
     response: Option<Response>,
     grade: Option<Grade>,
+    /// The order its options were in when it was answered, so looking back at
+    /// a card shows the card that was actually seen. A card being re-read
+    /// rather than recalled was never dealt, and gets a fresh one.
+    order_seed: u64,
 }
 
 struct Feedback {
@@ -280,6 +312,9 @@ struct Feedback {
     since: Instant,
     outcome: Option<Outcome>,
     depth: Depth,
+    /// Carried over from the card, so the verdict lists the options in the
+    /// order they were just clicked in.
+    order_seed: u64,
 }
 
 struct Summary {
@@ -303,6 +338,7 @@ struct Review {
 fn screen_depth(screen: &Screen) -> usize {
     match screen {
         Screen::Decks | Screen::MathCheck | Screen::PlotCheck => 0,
+        Screen::Settings(settings) => screen_depth(settings) + 1,
         Screen::Course(_) | Screen::Summary(_) => 1,
         Screen::Lessons(lessons) => 2 + usize::from(lessons.selected.is_some()),
         Screen::Questions(bank) => bank
@@ -331,15 +367,19 @@ fn screen_deck_id(screen: &Screen) -> Option<i64> {
             .get(review.idx)
             .map(|item| item.question.deck_id)
             .or_else(|| screen_deck_id(&review.back)),
-        Screen::Decks | Screen::MathCheck | Screen::PlotCheck => None,
+        Screen::Decks | Screen::Settings(_) | Screen::MathCheck | Screen::PlotCheck => None,
     }
 }
 
+fn top_chrome_rect(full: Rect, slot: usize) -> Rect {
+    Rect::from_min_size(
+        full.right_top() + Vec2::new(-52.0 - 52.0 * slot as f32, 8.0),
+        Vec2::splat(44.0),
+    )
+}
+
 fn screen_back_button(ui: &egui::Ui, full: Rect) -> bool {
-    let rect = Rect::from_min_size(
-        full.right_top() + Vec2::new(-52.0, 8.0),
-        Vec2::new(44.0, 44.0),
-    );
+    let rect = top_chrome_rect(full, 0);
     let response = ui
         .interact(rect, Id::new("screen-back"), Sense::click())
         .on_hover_text("Back");
@@ -364,11 +404,8 @@ fn screen_back_button(ui: &egui::Ui, full: Rect) -> bool {
     response.clicked()
 }
 
-fn formula_sheet_button(ui: &egui::Ui, full: Rect) -> bool {
-    let rect = Rect::from_min_size(
-        full.right_top() + Vec2::new(-104.0, 8.0),
-        Vec2::new(44.0, 44.0),
-    );
+fn formula_sheet_button(ui: &egui::Ui, full: Rect, slot: usize) -> bool {
+    let rect = top_chrome_rect(full, slot);
     let response = ui
         .interact(rect, Id::new("formula-sheet"), Sense::click())
         .on_hover_text("Formula sheet (F)");
@@ -394,9 +431,87 @@ fn formula_sheet_button(ui: &egui::Ui, full: Rect) -> bool {
     response.clicked()
 }
 
+fn settings_button(ui: &egui::Ui, rect: Rect, id: &'static str) -> bool {
+    let response = ui
+        .interact(rect, Id::new(("settings", id)), Sense::click())
+        .on_hover_text("Settings");
+    let hot = response.hovered() || response.has_focus();
+    let colour = if hot {
+        Palette::ACCENT
+    } else {
+        Palette::TEXT_DIM
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0, if hot { Palette::CARD } else { Palette::SURFACE });
+    painter.rect_stroke(rect, 0, Stroke::new(1.0, colour), egui::StrokeKind::Inside);
+
+    // The hit surface stays square like the rest of the chrome, while the
+    // familiar radial cog is drawn here rather than borrowed from a font.
+    let centre = rect.center();
+    let mut teeth = Vec::with_capacity(32);
+    for step in 0..32 {
+        let angle = std::f32::consts::TAU * step as f32 / 32.0;
+        let radius = match step % 4 {
+            1 | 2 => 13.5,
+            _ => 10.5,
+        };
+        teeth.push(centre + Vec2::angled(angle) * radius);
+    }
+    painter.add(Shape::convex_polygon(
+        teeth,
+        colour,
+        Stroke::new(1.0, colour),
+    ));
+    painter.circle_filled(
+        centre,
+        4.0,
+        if hot { Palette::CARD } else { Palette::SURFACE },
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Settings"));
+    response.clicked()
+}
+
 impl App {
     pub fn new(ctx: &egui::Context, store: Store, shot: Option<Shot>) -> Self {
+        Self::new_with_settings(ctx, store, shot, FontSettings::default(), None, None)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_native(
+        ctx: &egui::Context,
+        store: Store,
+        shot: Option<Shot>,
+        fonts: FontSettings,
+        settings_root: std::path::PathBuf,
+        settings_error: Option<String>,
+    ) -> Self {
+        Self::new_with_settings(ctx, store, shot, fonts, Some(settings_root), settings_error)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn new_browser(
+        ctx: &egui::Context,
+        store: Store,
+        fonts: FontSettings,
+        settings_error: Option<String>,
+    ) -> Self {
+        Self::new_with_settings(ctx, store, None, fonts, None, settings_error)
+    }
+
+    fn new_with_settings(
+        ctx: &egui::Context,
+        store: Store,
+        shot: Option<Shot>,
+        fonts: FontSettings,
+        settings_root: Option<std::path::PathBuf>,
+        mut settings_error: Option<String>,
+    ) -> Self {
         crate::theme::install(ctx);
+        if let Err(error) = fonts.apply(ctx) {
+            settings_error = Some(format!("Could not load the selected font: {error:#}"));
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = settings_root;
         // Keep egui's browser-style whole-interface zoom available:
         // Ctrl/Cmd + or =, Ctrl/Cmd -, and Ctrl/Cmd 0 to reset. This scales
         // cards, explanations, formulas and chrome together rather than
@@ -404,13 +519,29 @@ impl App {
         ctx.options_mut(|o| o.zoom_with_keyboard = true);
         let store = Rc::new(store);
         let decks = store.decks().unwrap_or_default();
-        let animate_coin = shot.is_none();
+        let motion_enabled = shot.is_none();
+        // A capture must lay a pinned card out the same way twice; a study
+        // session must not lay it out the same way twice.
+        let shuffle = match &shot {
+            Some(_) => rand::rngs::StdRng::seed_from_u64(SHOT_SHUFFLE_SEED),
+            None => rand::rngs::StdRng::from_rng(&mut rand::rng()),
+        };
         let mut app = App {
             store,
             screen: Screen::Decks,
             decks,
-            error: None,
-            coin: CoinAnimation::new(animate_coin),
+            error: settings_error,
+            fonts,
+            #[cfg(not(target_arch = "wasm32"))]
+            settings_root,
+            // A capture gets no sea: nine drifting animals are the part of the
+            // frame a visual check is least interested in, and their layout
+            // reads the frame width, which is not settled at capture time.
+            background: match &shot {
+                Some(_) => OceanBackground::hidden(),
+                None => OceanBackground::new(true),
+            },
+            coin: CoinAnimation::new(motion_enabled),
             notice: None,
             request: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -427,6 +558,7 @@ impl App {
             formula_sheet: None,
             pending_back: 0,
             shot,
+            shuffle,
         };
 
         // Jump straight to the screen being captured.
@@ -434,6 +566,9 @@ impl App {
         let screen_name = screen_name.as_deref();
         match screen_name {
             None | Some("decks" | "decks-scroll") => {}
+            Some("settings" | "settings-open") => {
+                app.screen = Screen::Settings(Box::new(Screen::Decks))
+            }
             Some("math") => app.screen = Screen::MathCheck,
             Some("plots") => app.screen = Screen::PlotCheck,
             Some("formulas") => {
@@ -618,6 +753,24 @@ impl App {
         self.request.take()
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn font_settings(&self) -> FontSettings {
+        self.fonts.clone()
+    }
+
+    pub(crate) fn prepare_font(&self, name: &str, bytes: Vec<u8>) -> anyhow::Result<PreparedFont> {
+        FontSettings::prepare_import(name, bytes)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn settings_with_font(&self, prepared: &PreparedFont) -> anyhow::Result<Vec<u8>> {
+        self.fonts.json_with_import(prepared)
+    }
+
+    pub(crate) fn commit_font(&mut self, prepared: PreparedFont) {
+        self.fonts.commit_import(prepared);
+    }
+
     /// Number of browser-history steps represented by the current view.
     ///
     /// This is intentionally about navigation, not enum nesting: ending a
@@ -703,9 +856,12 @@ impl App {
     /// Put the captured screen into a fixed, reproducible state.
     fn stage_shot(&mut self, screen: &mut Screen) {
         let Some(shot) = &self.shot else { return };
+        // Taken by value: staging the card needs `&mut self` for the shuffle,
+        // so the borrow of `shot` cannot outlive this line.
+        let (card, drag, shot_screen) = (shot.card.clone(), shot.drag, shot.screen.clone());
         let Screen::Study(study) = screen else { return };
 
-        if let Some(uid) = &shot.card {
+        if let Some(uid) = &card {
             let found = self
                 .store
                 .questions(study.deck.id)
@@ -714,28 +870,40 @@ impl App {
                 .find(|q| &q.uid == uid);
             match found {
                 Some(q) => {
-                    study.session.show(q.id);
-                    study.current = Some(q);
+                    // Dealt exactly as a scheduled card is, then pinned: the
+                    // order comes straight from the constant rather than from
+                    // however many draws happened to precede it. `--card` is
+                    // the flag that promises a diffable screenshot, so it must
+                    // not depend on the scheduler having dealt anything first.
+                    self.place_card(study, q);
+                    study.order_seed = SHOT_SHUFFLE_SEED;
                 }
                 None => eprintln!("no question with uid {uid:?}"),
             }
         }
 
-        if shot.drag != 0.0 {
-            study.motion.entry = 1.0;
+        // Land the deal animation before capturing. `drive_shot` grabs the
+        // framebuffer after a fixed *frame* count while `ENTRY_TIME` is a
+        // *duration*, so on a fast headless frame the card would be caught
+        // part-way through its entry — scaled and faded by however long twelve
+        // frames happened to take. That is wall-clock, so it differs between
+        // runs and makes card screenshots undiffable.
+        study.motion.entry = 1.0;
+
+        if drag != 0.0 {
             study.motion.dragging = true; // freeze it: no spring-back mid-capture
-            study.motion.offset = Vec2::new(shot.drag, shot.drag * 0.08);
+            study.motion.offset = Vec2::new(drag, drag * 0.08);
         }
 
         // Screens that only exist after an answer or reveal: give ordinary
         // feedback a deliberately wrong answer, and exercise `e` separately.
         let wants_feedback = matches!(
-            shot.screen.as_deref(),
+            shot_screen.as_deref(),
             Some("feedback" | "deep" | "review" | "explain")
         );
-        let deep = shot.screen.as_deref() == Some("deep");
+        let deep = shot_screen.as_deref() == Some("deep");
         if wants_feedback && let Some(q) = study.current.clone() {
-            if shot.screen.as_deref() == Some("explain") {
+            if shot_screen.as_deref() == Some("explain") {
                 self.apply(study, Action::Explain);
             } else {
                 let wrong = match &q.body {
@@ -805,6 +973,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // The root ui has no background of its own.
         ui.painter().rect_filled(ui.max_rect(), 0, Palette::BG);
+        self.background.paint(ui, ui.max_rect());
 
         // Let Escape close a modal without also navigating the screen visible
         // behind it.
@@ -845,6 +1014,7 @@ impl eframe::App for App {
 
         let next = match &mut screen {
             Screen::Decks => self.deck_screen(ui),
+            Screen::Settings(_) => self.settings_screen(ui),
             Screen::Course(deck) => self.course_screen(ui, deck),
             Screen::Lessons(lessons) => self.lessons_screen(ui, lessons),
             Screen::Questions(bank) => self.questions_screen(ui, bank),
@@ -862,11 +1032,18 @@ impl eframe::App for App {
             Screen::Review(review) => self.review_screen(ui, review),
         };
         let mut screen = next.unwrap_or(screen);
+        let top_settings_visible = !matches!(&screen, Screen::Decks | Screen::Settings(_))
+            && self.import_view.is_none()
+            && self.plot_zoom.is_none()
+            && self.formula_sheet.is_none();
+        let open_settings =
+            top_settings_visible && settings_button(ui, top_chrome_rect(ui.max_rect(), 1), "top");
+        let formula_slot = if top_settings_visible { 2 } else { 1 };
         let formula_button = screen_deck_id(&screen).is_some()
             && self.import_view.is_none()
             && self.plot_zoom.is_none()
             && self.formula_sheet.is_none()
-            && formula_sheet_button(ui, ui.max_rect());
+            && formula_sheet_button(ui, ui.max_rect(), formula_slot);
         let touch_back = screen_depth(&screen) > 0
             && self.import_view.is_none()
             && self.plot_zoom.is_none()
@@ -887,6 +1064,9 @@ impl eframe::App for App {
         }
         if let Some((deck, questions)) = self.pending_lesson_practice.take() {
             screen = self.begin_lesson_practice(deck, questions, screen);
+        }
+        if open_settings {
+            screen = Screen::Settings(Box::new(screen));
         }
 
         let mut back_steps = std::mem::take(&mut self.pending_back);
@@ -983,6 +1163,7 @@ impl App {
 
         let next = match screen {
             Screen::Decks => None,
+            Screen::Settings(back) => Some(*std::mem::replace(back, Box::new(Screen::Decks))),
             Screen::Course(_) => Some(Screen::Decks),
             Screen::Lessons(lessons) if lessons.selected.is_some() => {
                 lessons.selected = None;
@@ -1228,6 +1409,8 @@ impl App {
             Request::ImportLocalDeck => self.start_deck_dialog(ctx),
             Request::ImportGithub(url) => self.start_repository_import(ctx, url),
             Request::ExportDatabase => self.start_export_dialog(ctx),
+            Request::ImportFont => self.start_font_dialog(ctx),
+            Request::SaveSettings(settings) => self.save_native_settings(&settings),
         }
     }
 
@@ -1279,6 +1462,29 @@ impl App {
         }
     }
 
+    fn start_font_dialog(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("idiosepius-font-dialog".into())
+            .spawn(move || {
+                let picked = rfd::FileDialog::new()
+                    .set_title("Open a font")
+                    .add_filter("TrueType or OpenType font", &["ttf", "otf"])
+                    .pick_file()
+                    .map_or(Picked::Nothing, Picked::Font);
+                let _ = tx.send(picked);
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(_) => self.dialog = Some(rx),
+            Err(error) => self.error = Some(format!("could not open a file dialog: {error}")),
+        }
+    }
+
     fn start_repository_import(&mut self, ctx: &egui::Context, url: String) {
         if self.dialog.is_some() {
             return;
@@ -1317,6 +1523,7 @@ impl App {
         match picked {
             Picked::Nothing => {}
             Picked::Decks(paths) => self.import_paths(&paths),
+            Picked::Font(path) => self.import_font_path(&path),
             Picked::Repository(Ok(files), _) => self.import_picked_files(files),
             Picked::Repository(Err(error), return_to) => {
                 self.repository_return_view = return_to;
@@ -1357,6 +1564,38 @@ impl App {
                 self.error = None;
             }
             Err(e) => self.report_error(format!("could not export the database: {e:#}")),
+        }
+    }
+
+    fn import_font_path(&mut self, path: &std::path::Path) {
+        let result = (|| {
+            let root = self
+                .settings_root
+                .clone()
+                .context("font storage is unavailable")?;
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            let prepared = self.prepare_font(&path.to_string_lossy(), bytes)?;
+            FontSettings::copy_into_native_storage(&root, &prepared)?;
+            self.commit_font(prepared);
+            self.fonts.save_native(&root)?;
+            Ok::<_, anyhow::Error>(())
+        })();
+        match result {
+            Ok(()) => {
+                self.notify("font added");
+                self.error = None;
+            }
+            Err(error) => self.report_error(format!("could not import the font: {error:#}")),
+        }
+    }
+
+    fn save_native_settings(&mut self, settings: &[u8]) {
+        let Some(root) = self.settings_root.clone() else {
+            return;
+        };
+        if let Err(error) = FontSettings::save_native_json(&root, settings) {
+            self.report_error(format!("could not save settings: {error:#}"));
         }
     }
 }
@@ -1473,6 +1712,10 @@ impl App {
                 }
                 out
             }
+            Screen::Settings(_) => format!(
+                "Settings\n\nTypeface\n{}\n\nAdd a local TTF or OTF font",
+                self.fonts.selected_label()
+            ),
             Screen::Course(deck) => format!(
                 "{}\n\nLessons\nQuestions\nProgress\n\nAll active questions are available for study.",
                 deck.title
@@ -1601,6 +1844,7 @@ impl App {
                     Some(feedback) => card_text(
                         &feedback.question,
                         topic,
+                        feedback.order_seed,
                         &[],
                         feedback.response.as_ref(),
                         feedback.grade,
@@ -1611,6 +1855,7 @@ impl App {
                     None => card_text(
                         question,
                         topic,
+                        study.order_seed,
                         &study.selected,
                         None,
                         None,
@@ -1632,6 +1877,7 @@ impl App {
                 card_text(
                     &item.question,
                     topic,
+                    item.order_seed,
                     &[],
                     item.response.as_ref(),
                     item.grade,
@@ -1744,6 +1990,137 @@ impl App {
 // ------------------------------------------------------------ deck screen --
 
 impl App {
+    fn settings_screen(&mut self, ui: &mut egui::Ui) -> Option<Screen> {
+        let full = ui.available_rect_before_wrap();
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(full.width().min(660.0), full.height().min(580.0)),
+        );
+        let content = Rect::from_min_max(
+            panel.left_top() + Vec2::new(0.0, 72.0),
+            panel.right_bottom(),
+        );
+        ui.painter().text(
+            panel.left_top() + Vec2::new(0.0, 10.0),
+            Align2::LEFT_TOP,
+            "SETTINGS",
+            text::title(),
+            Palette::TEXT,
+        );
+        ui.painter().line_segment(
+            [
+                panel.left_top() + Vec2::new(0.0, 54.0),
+                panel.right_top() + Vec2::new(0.0, 54.0),
+            ],
+            Stroke::new(1.0, Palette::LINE),
+        );
+
+        let choices = self.fonts.choices();
+        let mut picked = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+            ui.set_width(content.width());
+            ui.label(
+                egui::RichText::new(tracked("typeface"))
+                    .font(text::label())
+                    .color(Palette::TEXT_FAINT),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "One face is used throughout the interface, including prompts and formulas.",
+                )
+                .font(text::body())
+                .color(Palette::TEXT_DIM),
+            );
+            ui.add_space(16.0);
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let selected = self.fonts.selected_label().to_owned();
+                ui.spacing_mut().button_padding.y = 13.0;
+                if self.shot.as_ref().and_then(|shot| shot.screen.as_deref())
+                    == Some("settings-open")
+                {
+                    let button_id = ui.make_persistent_id("settings-font");
+                    egui::Popup::open_id(ui.ctx(), button_id.with("popup"));
+                }
+                egui::ComboBox::from_id_salt("settings-font")
+                    .selected_text(selected)
+                    .width(ui.available_width())
+                    .height(360.0_f32.min((content.height() - 100.0).max(240.0)))
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show_ui(ui, |ui| {
+                        ui.set_min_width((content.width() - 16.0).max(240.0));
+                        ui.add(
+                            egui::TextEdit::singleline(self.fonts.filter_mut())
+                                .hint_text("Type to filter installed fonts"),
+                        )
+                        .request_focus();
+                        let filter = self.fonts.filter().trim().to_lowercase();
+                        ui.add_space(4.0);
+                        for (id, label) in &choices {
+                            if !filter.is_empty() && !label.to_lowercase().contains(&filter) {
+                                continue;
+                            }
+                            let selected = id == self.fonts.selected_id();
+                            if ui.selectable_label(selected, label).clicked() {
+                                picked = Some(id.clone());
+                                ui.close();
+                            }
+                        }
+                    });
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                for (id, label) in &choices {
+                    let (row, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), 44.0),
+                        Sense::hover(),
+                    );
+                    if font_radio(ui, row, label, id == self.fonts.selected_id()) {
+                        picked = Some(id.clone());
+                    }
+                    ui.add_space(6.0);
+                }
+            }
+
+            ui.add_space(18.0);
+            let (import, _) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), 54.0),
+                Sense::hover(),
+            );
+            if dashed_row(ui, import, "add local font") {
+                self.request = Some(Request::ImportFont);
+            }
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "Add validates and stores a TTF or OTF. Choose it above when you want to make it active.",
+                )
+                .font(text::small())
+                .color(Palette::TEXT_FAINT),
+            );
+        });
+
+        if let Some(id) = picked {
+            match self.fonts.select(&id, ui.ctx()) {
+                Ok(true) => match self.fonts.json() {
+                    Ok(settings) => {
+                        self.request = Some(Request::SaveSettings(settings));
+                        self.error = None;
+                    }
+                    Err(error) => {
+                        self.report_error(format!("could not save font choice: {error:#}"));
+                    }
+                },
+                Ok(false) => {}
+                Err(error) => self.report_error(format!("could not load that font: {error:#}")),
+            }
+        }
+        None
+    }
+
     fn deck_screen(&mut self, ui: &mut egui::Ui) -> Option<Screen> {
         let mut next = None;
         let avail = ui.available_rect_before_wrap();
@@ -1891,6 +2268,14 @@ impl App {
         let export = Pos2::new(panel.right(), panel.bottom() - 80.0);
         if chrome_button(ui, export, "export database") {
             self.request = Some(Request::ExportDatabase);
+        }
+        let export_width = chrome_button_width(ui, "export database");
+        let settings_rect = Rect::from_min_size(
+            export - Vec2::new(export_width + 52.0, 0.0),
+            Vec2::splat(44.0),
+        );
+        if settings_button(ui, settings_rect, "decks") {
+            next = Some(Screen::Settings(Box::new(Screen::Decks)));
         }
 
         ui.painter().text(
@@ -2927,14 +3312,18 @@ impl App {
         );
 
         if let Some(index) = open_weak {
-            let items = progress
+            let weakest: Vec<Question> = progress
                 .weakest
                 .iter()
                 .filter_map(|weak| self.store.question(weak.question_id).ok().flatten())
+                .collect();
+            let items = weakest
+                .into_iter()
                 .map(|question| Answered {
                     question,
                     response: None,
                     grade: None,
+                    order_seed: self.shuffle.random(),
                 })
                 .collect();
             self.open_review(
@@ -2972,6 +3361,7 @@ impl App {
             topics,
             facts,
             current: None,
+            order_seed: 0,
             motion: Motion::deal(),
             recent: Vec::new(),
             history: Vec::new(),
@@ -2989,7 +3379,7 @@ impl App {
     }
 
     fn begin_single(&mut self, deck: Deck, question: Question, back: Screen) -> Screen {
-        let mut session = match Session::start(self.store.clone(), deck.id, Mode::Practice) {
+        let session = match Session::start(self.store.clone(), deck.id, Mode::Practice) {
             Ok(session) => session,
             Err(e) => {
                 self.error = Some(format!("could not start session: {e}"));
@@ -3005,14 +3395,14 @@ impl App {
             .collect();
         let facts = Rc::new(Facts::load(&self.store, deck.id));
         let counts = scheduler::counts(&self.store, deck.id).unwrap_or_default();
-        session.show(question.id);
         self.coin.spin();
-        Screen::Study(Box::new(Study {
+        let mut study = Study {
             session,
             deck,
             topics,
             facts,
-            current: Some(question),
+            current: None,
+            order_seed: 0,
             motion: Motion::deal(),
             recent: Vec::new(),
             history: Vec::new(),
@@ -3025,7 +3415,9 @@ impl App {
                 back: Box::new(back),
             },
             grab: None,
-        }))
+        };
+        self.place_card(&mut study, question);
+        Screen::Study(Box::new(study))
     }
 
     fn begin_lesson_practice(
@@ -3034,7 +3426,7 @@ impl App {
         mut questions: Vec<Question>,
         back: Screen,
     ) -> Screen {
-        let mut session = match Session::start(self.store.clone(), deck.id, Mode::Practice) {
+        let session = match Session::start(self.store.clone(), deck.id, Mode::Practice) {
             Ok(session) => session,
             Err(error) => {
                 self.error = Some(format!("could not start lesson practice: {error}"));
@@ -3045,7 +3437,6 @@ impl App {
             return back;
         }
         let current = questions.remove(0);
-        session.show(current.id);
         let topics = self
             .store
             .topics(deck.id)
@@ -3056,12 +3447,13 @@ impl App {
         let facts = Rc::new(Facts::load(&self.store, deck.id));
         let counts = scheduler::counts(&self.store, deck.id).unwrap_or_default();
         self.coin.spin();
-        Screen::Study(Box::new(Study {
+        let mut study = Study {
             session,
             deck,
             topics,
             facts,
-            current: Some(current),
+            current: None,
+            order_seed: 0,
             motion: Motion::deal(),
             recent: Vec::new(),
             history: Vec::new(),
@@ -3075,7 +3467,9 @@ impl App {
                 remaining: questions,
             },
             grab: None,
-        }))
+        };
+        self.place_card(&mut study, current);
+        Screen::Study(Box::new(study))
     }
 
     fn finish_single(&mut self, study: &mut Study) -> Option<Screen> {
@@ -3114,6 +3508,20 @@ impl App {
         Some(*back)
     }
 
+    /// Put a question on screen as the card being answered: log the show, deal
+    /// it in, clear any selection, and draw the order its options are in.
+    ///
+    /// Every route that deals a *new* card goes through here, so none of them
+    /// can leave a card holding the previous one's option order. `deal_again`
+    /// is the exception, and reopens a card rather than dealing one.
+    fn place_card(&mut self, study: &mut Study, question: Question) {
+        study.session.show(question.id);
+        study.current = Some(question);
+        study.motion = Motion::deal();
+        study.selected.clear();
+        study.order_seed = self.shuffle.random();
+    }
+
     fn deal_next(&mut self, study: &mut Study) {
         if let StudyRoute::Lesson { remaining, .. } = &mut study.route {
             if remaining.is_empty() {
@@ -3121,10 +3529,7 @@ impl App {
                 return;
             }
             let question = remaining.remove(0);
-            study.session.show(question.id);
-            study.current = Some(question);
-            study.motion = Motion::deal();
-            study.selected.clear();
+            self.place_card(study, question);
             study.counts = scheduler::counts(&self.store, study.deck.id).unwrap_or_default();
             return;
         }
@@ -3137,7 +3542,6 @@ impl App {
         );
         match picked {
             Ok(Some(q)) => {
-                study.session.show(q.id);
                 study.recent.push(q.id);
                 // The scheduler decides how much of this tail it actually
                 // suppresses; keep enough of it that a large deck can use a
@@ -3145,9 +3549,7 @@ impl App {
                 if study.recent.len() > 32 {
                     study.recent.remove(0);
                 }
-                study.current = Some(q);
-                study.motion = Motion::deal();
-                study.selected.clear();
+                self.place_card(study, q);
             }
             Ok(None) => study.current = None,
             Err(e) => {
@@ -3161,6 +3563,10 @@ impl App {
     /// Put a specific question back on the table, as after an undo.
     fn deal_again(&mut self, study: &mut Study, question_id: i64) {
         match self.store.question(question_id) {
+            // Deliberately not `place_card`: undo puts back the card that is
+            // already on screen, so it keeps `order_seed` and the options stay
+            // where the user was just looking at them. Reshuffling under a
+            // mis-click correction would be its own mis-click.
             Ok(Some(q)) => {
                 study.session.show(q.id);
                 study.current = Some(q);
@@ -3179,14 +3585,18 @@ impl App {
     /// Open the weak-card list from the summary screen, starting at the one
     /// that was clicked. All of them are loaded, so `← →` walks the list.
     fn open_weakest(&mut self, sum: &Summary, idx: usize) {
-        let items: Vec<Answered> = sum
+        let weakest: Vec<Question> = sum
             .weakest
             .iter()
             .filter_map(|w| self.store.question(w.question_id).ok().flatten())
+            .collect();
+        let items: Vec<Answered> = weakest
+            .into_iter()
             .map(|question| Answered {
                 question,
                 response: None,
                 grade: None,
+                order_seed: self.shuffle.random(),
             })
             .collect();
         let topics: HashMap<i64, String> = self
@@ -3364,7 +3774,8 @@ impl App {
                 return Some(Action::Explain);
             }
 
-            match study.current.as_ref().map(|q| &q.body) {
+            let current = study.current.as_ref();
+            match current.map(|q| &q.body) {
                 Some(Body::TrueFalse { .. }) => {
                     if i.key_pressed(ArrowLeft) || i.key_pressed(A) {
                         Some(Action::Answer(
@@ -3381,9 +3792,12 @@ impl App {
                     }
                 }
                 Some(Body::MultipleChoice { options, multi }) => {
+                    // The number keys address the card as it is drawn, so key
+                    // n picks whatever sits in slot n — not authored option n.
+                    let order = option_order(study.order_seed, options.len());
                     for (n, key) in [Num1, Num2, Num3, Num4, Num5].into_iter().enumerate() {
-                        if i.key_pressed(key) && n < options.len() {
-                            return Some(Action::Pick(n, *multi));
+                        if i.key_pressed(key) && n < order.len() {
+                            return Some(Action::Pick(order[n], *multi));
                         }
                     }
                     (*multi && (i.key_pressed(Enter) || i.key_pressed(Space)))
@@ -3411,6 +3825,7 @@ impl App {
                             question: q.clone(),
                             response: Some(response.clone()),
                             grade: Some(outcome.grade),
+                            order_seed: study.order_seed,
                         });
                         if study.history.len() > REVIEW_HISTORY {
                             study.history.remove(0);
@@ -3422,6 +3837,7 @@ impl App {
                             since: Instant::now(),
                             outcome: Some(outcome),
                             depth: Depth::Short,
+                            order_seed: study.order_seed,
                         });
                     }
                     Err(e) => self.error = Some(format!("could not record answer: {e}")),
@@ -3495,6 +3911,7 @@ impl App {
                         question: q.clone(),
                         response: None,
                         grade: None,
+                        order_seed: study.order_seed,
                     });
                     if study.history.len() > REVIEW_HISTORY {
                         study.history.remove(0);
@@ -3506,6 +3923,7 @@ impl App {
                         since: Instant::now(),
                         outcome: None,
                         depth: Depth::Short,
+                        order_seed: study.order_seed,
                     });
                 }
                 None
@@ -3594,6 +4012,9 @@ enum Action {
 fn card_text(
     question: &Question,
     topic: Option<&str>,
+    // The order the card's options were drawn in, so a pasted transcript
+    // numbers them the way the screen did.
+    order_seed: u64,
     selected: &[usize],
     response: Option<&Response>,
     grade: Option<Grade>,
@@ -3631,20 +4052,23 @@ fn card_text(
                 _ => Vec::new(),
             };
             let option_notes = explain::option_notes(options, &picked, notes);
-            for (index, option) in options.iter().enumerate() {
-                let marker = if !reveal_answer && selected.contains(&index) {
+            // Numbered as the card draws them, so a pasted transcript and the
+            // screen agree on what "3." was.
+            let shown = display_options(order_seed, options);
+            for (slot, (index, option)) in shown.iter().enumerate() {
+                let marker = if !reveal_answer && selected.contains(index) {
                     " [selected]"
                 } else {
                     ""
                 };
-                let _ = write!(out, "\n{}. {}{marker}", index + 1, option.text.trim());
-                if let Some(note) = option_notes[index] {
+                let _ = write!(out, "\n{}. {}{marker}", slot + 1, option.text.trim());
+                if let Some(note) = option_notes[*index] {
                     let _ = write!(out, "\n   Note: {note}");
                 }
             }
 
             if let Some(Response::MultipleChoice { selected }) = response {
-                let answer = choice_text(options, selected);
+                let answer = choice_text(order_seed, options, selected);
                 let _ = write!(out, "\n\nMy answer: {answer}");
             }
             if reveal_answer {
@@ -3653,7 +4077,11 @@ fn card_text(
                     .enumerate()
                     .filter_map(|(index, option)| option.correct.then_some(index))
                     .collect();
-                let _ = write!(out, "\nCorrect answer: {}", choice_text(options, &correct));
+                let _ = write!(
+                    out,
+                    "\nCorrect answer: {}",
+                    choice_text(order_seed, options, &correct)
+                );
             }
         }
     }
@@ -3689,16 +4117,20 @@ fn truth_word(value: bool) -> &'static str {
     if value { "True" } else { "False" }
 }
 
-fn choice_text(options: &[idiosepius_core::Choice], indices: &[usize]) -> String {
+/// Names options the way the card numbered them: `indices` are authored, the
+/// numbers printed are the slots those options were drawn in.
+fn choice_text(seed: u64, options: &[idiosepius_core::Choice], indices: &[usize]) -> String {
     if indices.is_empty() {
         return "none".to_owned();
     }
+    let order = option_order(seed, options.len());
     indices
         .iter()
         .filter_map(|&index| {
+            let slot = order.iter().position(|&i| i == index)?;
             options
                 .get(index)
-                .map(|option| format!("{}. {}", index + 1, option.text.trim()))
+                .map(|option| format!("{}. {}", slot + 1, option.text.trim()))
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -3759,8 +4191,8 @@ fn chrome(ui: &egui::Ui, study: &Study, full: Rect, coin: &mut CoinAnimation) {
         _ => format!("{} due", study.counts.due + study.counts.fresh),
     };
     p.text(
-        // Leave room for the formula-sheet and Back controls.
-        top.right_center() + Vec2::new(-118.0, 0.0),
+        // Leave room for Settings, the formula sheet, and Back.
+        top.right_center() + Vec2::new(-170.0, 0.0),
         Align2::RIGHT_CENTER,
         if full.width() < 520.0 {
             right
@@ -4637,12 +5069,7 @@ fn dashed_row(ui: &egui::Ui, rect: Rect, label: &str) -> bool {
 /// they are made of, and a guessed width clips them.
 fn chrome_button(ui: &egui::Ui, right_top: Pos2, label: &str) -> bool {
     let caps = tracked(label);
-    let width = ui
-        .painter()
-        .layout_no_wrap(caps.clone(), text::label(), Palette::TEXT)
-        .rect
-        .width()
-        + 28.0;
+    let width = chrome_button_width(ui, label);
     let rect = Rect::from_min_size(right_top - Vec2::new(width, 0.0), Vec2::new(width, 44.0));
     let response = ui.interact(rect, Id::new(("chrome-button", label)), Sense::click());
     let colour = if response.hovered() {
@@ -4659,6 +5086,54 @@ fn chrome_button(ui: &egui::Ui, right_top: Pos2, label: &str) -> bool {
         text::label(),
         colour,
     );
+    response.clicked()
+}
+
+fn chrome_button_width(ui: &egui::Ui, label: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(tracked(label), text::label(), Palette::TEXT)
+        .rect
+        .width()
+        + 28.0
+}
+
+#[cfg(target_arch = "wasm32")]
+fn font_radio(ui: &egui::Ui, rect: Rect, label: &str, selected: bool) -> bool {
+    let response = ui.interact(rect, Id::new(("font-radio", label)), Sense::click());
+    let hot = response.hovered() || response.has_focus();
+    let colour = if hot || selected {
+        Palette::ACCENT
+    } else {
+        Palette::TEXT_DIM
+    };
+    ui.painter()
+        .rect_filled(rect, 0, if hot { Palette::CARD } else { Palette::SURFACE });
+    ui.painter()
+        .rect_stroke(rect, 0, Stroke::new(1.0, colour), egui::StrokeKind::Inside);
+    let mark = Rect::from_center_size(
+        Pos2::new(rect.left() + 22.0, rect.center().y),
+        Vec2::splat(14.0),
+    );
+    ui.painter()
+        .rect_stroke(mark, 0, Stroke::new(1.0, colour), egui::StrokeKind::Inside);
+    if selected {
+        ui.painter()
+            .rect_filled(mark.shrink(3.0), 0, Palette::ACCENT);
+    }
+    ui.painter().text(
+        Pos2::new(rect.left() + 44.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        text::body(),
+        if selected {
+            Palette::TEXT
+        } else {
+            Palette::TEXT_DIM
+        },
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, label)
+    });
     response.clicked()
 }
 
@@ -4687,19 +5162,28 @@ fn fmt_ms(ms: i64) -> String {
 
 // ------------------------------------------------------------- card views --
 
+/// `slot` is where the row sits on screen — it is the number in the key box,
+/// and so the number key that picks it. `authored` is the option's identity in
+/// the pack, which is what the widget is keyed on and what a pick reports.
+#[allow(clippy::too_many_arguments)]
 fn choice_option_row(
     ui: &mut egui::Ui,
     row: Rect,
     question_id: i64,
-    index: usize,
+    slot: usize,
+    authored: usize,
     doc: &richtext::Doc,
     picked: bool,
+    // False during a capture, where a cursor resting over a row would light
+    // it in one run and not the next. The same reason the card's own hover
+    // state is overridden rather than or-ed.
+    pointer: bool,
 ) -> bool {
-    let response = ui.interact(row, Id::new(("opt", question_id, index)), Sense::click());
-    let hot = response.hovered() || response.has_focus();
+    let response = ui.interact(row, Id::new(("opt", question_id, authored)), Sense::click());
+    let hot = pointer && (response.hovered() || response.has_focus());
     let hover = ui
         .ctx()
-        .animate_bool(Id::new(("opt-hover", question_id, index)), hot);
+        .animate_bool(Id::new(("opt-hover", question_id, authored)), hot);
     let (border, fill, label_col) = if picked {
         (
             Palette::ACCENT,
@@ -4730,7 +5214,7 @@ fn choice_option_row(
     painter.text(
         key_box.center(),
         Align2::CENTER_CENTER,
-        format!("{}", index + 1),
+        format!("{}", slot + 1),
         text::label(),
         label_col,
     );
@@ -4818,8 +5302,13 @@ impl App {
         }
 
         // A reproducible screenshot of the active state is more useful than
-        // trying to race a real pointer against the headless capture.
-        hovered |= self.shot.as_ref().and_then(|shot| shot.screen.as_deref()) == Some("hover");
+        // trying to race a real pointer against the capture. This *overrides*
+        // rather than adds to the pointer: a capture opens a real window, so
+        // a cursor left resting over the card would otherwise style it hot in
+        // one run and not the next, and only `--screen hover` should say so.
+        if let Some(shot) = &self.shot {
+            hovered = shot.screen.as_deref() == Some("hover");
+        }
 
         // The card that was just answered is still animating away; keep
         // drawing it until it clears the screen.
@@ -5020,9 +5509,14 @@ impl App {
         // Measure first: the card is sized to its content, so a two-line
         // question does not sit in a half-empty box.
         let prompt = blocks::layout(ui.painter(), &q.prompt, 17.5, wrap);
-        let option_docs: Vec<_> = options
+        // Display order, not authored order — see `model::option_order`. The
+        // pairs carry the authored index, which is what a pick is reported as.
+        // A capture must not depend on where the cursor happens to be.
+        let pointer = self.shot.is_none();
+        let shown = display_options(study.order_seed, options);
+        let option_docs: Vec<_> = shown
             .iter()
-            .map(|o| richtext::layout(ui.painter(), &o.text, 15.0, wrap - 54.0))
+            .map(|(_, o)| richtext::layout(ui.painter(), &o.text, 15.0, wrap - 54.0))
             .collect();
         let options_h: f32 = option_docs
             .iter()
@@ -5099,7 +5593,8 @@ impl App {
                             Id::new(("choice-plot", q.id)),
                         );
                         ui.add_space(22.0);
-                        for (index, doc) in option_docs.iter().enumerate() {
+                        for (slot, doc) in option_docs.iter().enumerate() {
+                            let authored = shown[slot].0;
                             let height = (doc.height() + 22.0).max(44.0);
                             let (row, _) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), height),
@@ -5109,11 +5604,13 @@ impl App {
                                 ui,
                                 row,
                                 q.id,
-                                index,
+                                slot,
+                                authored,
                                 doc,
-                                study.selected.contains(&index),
+                                study.selected.contains(&authored),
+                                pointer,
                             ) {
-                                action = Action::Pick(index, multi);
+                                action = Action::Pick(authored, multi);
                             }
                             ui.add_space(8.0);
                         }
@@ -5130,14 +5627,24 @@ impl App {
                 Id::new(("choice-plot", q.id)),
             );
             let mut y = prompt_pos.y + prompt.height() + 22.0;
-            for (index, doc) in option_docs.iter().enumerate() {
+            for (slot, doc) in option_docs.iter().enumerate() {
+                let authored = shown[slot].0;
                 let height = (doc.height() + 22.0).max(44.0);
                 let row = Rect::from_min_size(
                     Pos2::new(card_rect.left() + 24.0, y),
                     Vec2::new(card_rect.width() - 48.0, height),
                 );
-                if choice_option_row(ui, row, q.id, index, doc, study.selected.contains(&index)) {
-                    action = Action::Pick(index, multi);
+                if choice_option_row(
+                    ui,
+                    row,
+                    q.id,
+                    slot,
+                    authored,
+                    doc,
+                    study.selected.contains(&authored),
+                    pointer,
+                ) {
+                    action = Action::Pick(authored, multi);
                 }
                 y += height + 8.0;
             }
@@ -5347,7 +5854,7 @@ fn feedback_answer(ui: &mut egui::Ui, fb: &Feedback) {
                 ui.add_space(4.0);
             }
             let notes = explain::option_notes(options, &selected, explain::NoteView::Picked);
-            for (index, option) in options.iter().enumerate() {
+            for (index, option) in display_options(fb.order_seed, options) {
                 let chose = selected.contains(&index);
                 let colour = match (option.correct, chose) {
                     (true, _) => Palette::CORRECT,
@@ -5754,7 +6261,7 @@ fn answer_summary(ui: &mut egui::Ui, item: &Answered) {
             // note is shown: together they are a map of the mistakes the
             // question was built to catch.
             let notes = explain::option_notes(options, &selected, explain::NoteView::All);
-            for (i, opt) in options.iter().enumerate() {
+            for (i, opt) in display_options(item.order_seed, options) {
                 let chose = selected.contains(&i);
                 let colour = match (opt.correct, chose) {
                     (true, _) => Palette::CORRECT,
@@ -6067,6 +6574,23 @@ mod tests {
         }
     }
 
+    /// A seed for tests that only need *an* order, not a particular one.
+    const TEST_SEED: u64 = 9;
+
+    /// Which slot an authored option is drawn in under `seed`. Tests assert
+    /// against the card as it is shown, so none of them may hard-code
+    /// authored order.
+    fn slot_of(question: &Question, seed: u64, authored: usize) -> usize {
+        let Body::MultipleChoice { options, .. } = &question.body else {
+            panic!("not a choice question");
+        };
+        option_order(seed, options.len())
+            .iter()
+            .position(|&i| i == authored)
+            .expect("authored option has a slot")
+            + 1
+    }
+
     #[test]
     fn spans_read_naturally() {
         assert_eq!(fmt_span(90 * 60_000), "1h 30m");
@@ -6211,9 +6735,11 @@ mod tests {
 
     #[test]
     fn copying_an_unanswered_card_does_not_leak_the_answer() {
+        let question = clipboard_question();
         let text = card_text(
-            &clipboard_question(),
+            &question,
             Some("Modeling"),
+            TEST_SEED,
             &[1],
             None,
             None,
@@ -6223,7 +6749,10 @@ mod tests {
         );
 
         assert!(text.contains(r"$G(s)=\frac{1}{s+1}$"));
-        assert!(text.contains("2. $G(0)=0$ [selected]"));
+        assert!(text.contains(&format!(
+            "{}. $G(0)=0$ [selected]",
+            slot_of(&question, TEST_SEED, 1)
+        )));
         assert!(!text.contains("Correct answer:"));
         // A note names a wrong option, so it gives the answer away just as
         // surely as the answer line does.
@@ -6237,6 +6766,7 @@ mod tests {
         let text = card_text(
             &question,
             Some("Modeling"),
+            TEST_SEED,
             &[],
             Some(&Response::MultipleChoice { selected: vec![1] }),
             Some(Grade::WRONG),
@@ -6257,6 +6787,7 @@ mod tests {
         let text = card_text(
             &question,
             Some("Modeling"),
+            TEST_SEED,
             &[],
             Some(&Response::MultipleChoice { selected: vec![1] }),
             Some(Grade::WRONG),
@@ -6276,6 +6807,7 @@ mod tests {
         let text = card_text(
             &question,
             Some("Modeling"),
+            TEST_SEED,
             &[],
             Some(&Response::MultipleChoice { selected: vec![1] }),
             Some(Grade::WRONG),
@@ -6284,9 +6816,51 @@ mod tests {
             Some((&facts, Depth::Short)),
         );
 
-        assert!(text.contains("My answer: 2. $G(0)=0$"));
-        assert!(text.contains("Correct answer: 1. $G(0)=1$"));
+        // Numbered by the slot each option was drawn in, not by authored
+        // order — that is what the learner saw and what they will paste.
+        assert!(text.contains(&format!(
+            "My answer: {}. $G(0)=0$",
+            slot_of(&question, TEST_SEED, 1)
+        )));
+        assert!(text.contains(&format!(
+            "Correct answer: {}. $G(0)=1$",
+            slot_of(&question, TEST_SEED, 0)
+        )));
         assert!(text.contains("Explanation\nSet $s=0$ in the transfer function."));
+    }
+
+    /// The defect this shuffle exists for: every pack authors the correct
+    /// option first, so without it slot 1 is always the answer. A card that
+    /// comes back on a new seed has to come back in a new order, which is
+    /// what stops the position being learnable over a week of repetitions.
+    #[test]
+    fn a_card_dealt_again_does_not_keep_its_option_order() {
+        let mut question = clipboard_question();
+        question.body = Body::MultipleChoice {
+            options: (0..4)
+                .map(|i| idiosepius_core::Choice::new(format!("opt{i}"), i == 0))
+                .collect(),
+            multi: false,
+        };
+        let mut slots = std::collections::HashSet::new();
+        for seed in 0..40 {
+            let text = card_text(
+                &question,
+                None,
+                seed,
+                &[],
+                None,
+                None,
+                false,
+                explain::NoteView::Hidden,
+                None,
+            );
+            let slot = (1..=4)
+                .find(|n| text.contains(&format!("{n}. opt0")))
+                .expect("the correct option is drawn somewhere");
+            slots.insert(slot);
+        }
+        assert_eq!(slots.len(), 4, "the same card kept the same option order");
     }
 
     #[test]
@@ -6382,6 +6956,97 @@ mod tests {
         assert_eq!(study.answered, 1, "Undo expires when Next is chosen");
         assert_eq!(study.correct, 1);
         assert_eq!(study.history.len(), 1);
+    }
+
+    /// Undo puts back the card already on screen, so its options must stay
+    /// where they were. Reshuffling under a mis-click correction would move
+    /// the option the user was reaching for.
+    #[test]
+    fn undo_does_not_reshuffle_the_card_it_puts_back() {
+        let (mut app, mut study) = begin_with_body(Body::MultipleChoice {
+            options: vec![
+                idiosepius_core::Choice::new("right", true),
+                idiosepius_core::Choice::new("wrong", false),
+            ],
+            multi: false,
+        });
+        let before = study.order_seed;
+
+        app.apply(&mut study, Action::Pick(1, false));
+        assert!(study.feedback.is_some());
+        app.apply(&mut study, Action::Undo);
+
+        assert_eq!(study.order_seed, before, "undo reshuffled the card");
+    }
+
+    /// `--card` promises a diffable screenshot, so the pinned card's option
+    /// order must come from the constant and not from however many cards the
+    /// scheduler dealt before staging.
+    #[test]
+    fn a_pinned_shot_card_always_gets_the_same_option_order() {
+        let staged = |uid: &str| {
+            let context = egui::Context::default();
+            let store = Store::open_in_memory().unwrap();
+            let deck_id = store.upsert_deck("shot", "Shot", None, None).unwrap();
+            for n in 0..4 {
+                store
+                    .upsert_question(&idiosepius_core::NewQuestion {
+                        deck_id,
+                        topic_id: None,
+                        uid: format!("shot-{n}"),
+                        prompt: vec![ContentBlock::text("Which one?")],
+                        body: Body::MultipleChoice {
+                            options: vec![
+                                idiosepius_core::Choice::new("right", true),
+                                idiosepius_core::Choice::new("wrong", false),
+                                idiosepius_core::Choice::new("also wrong", false),
+                            ],
+                            multi: false,
+                        },
+                        explanation: None,
+                        explain: Default::default(),
+                        difficulty: 1,
+                        source: None,
+                        tags: Vec::new(),
+                    })
+                    .unwrap();
+            }
+            let shot =
+                Shot::new("/dev/null".into(), Some("study".into())).with_card(Some(uid.to_owned()));
+            let app = App::new(&context, store, Some(shot));
+            let Screen::Study(study) = &app.screen else {
+                panic!("a --shot study screen should be staged");
+            };
+            (
+                study.current.as_ref().unwrap().uid.clone(),
+                study.order_seed,
+            )
+        };
+
+        let (uid, seed) = staged("shot-2");
+        assert_eq!(uid, "shot-2", "--card should pin that question");
+        assert_eq!(seed, SHOT_SHUFFLE_SEED);
+        // Twice, because the scheduler picks a random card first and the
+        // pinned seed must not depend on what it picked.
+        assert_eq!(staged("shot-2").1, SHOT_SHUFFLE_SEED);
+        assert_eq!(staged("shot-0").1, SHOT_SHUFFLE_SEED);
+    }
+
+    /// Dealing the next card must draw a new order, or a card that comes back
+    /// after a lapse comes back in the layout it was already memorised in.
+    #[test]
+    fn dealing_a_card_draws_a_fresh_option_order() {
+        let (mut app, mut study) = begin_with_body(Body::TrueFalse { answer: true });
+        let mut seeds = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seeds.insert(study.order_seed);
+            app.apply(
+                &mut study,
+                Action::Answer(Response::TrueFalse { value: true }, Input::Key),
+            );
+            app.apply(&mut study, Action::Continue);
+        }
+        assert!(seeds.len() > 1, "every deal reused the same option order");
     }
 
     #[test]

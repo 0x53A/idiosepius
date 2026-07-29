@@ -202,6 +202,21 @@ pub fn next_card(
     recent: &[Id],
     topic_filter: Option<Id>,
 ) -> Result<Option<Question>> {
+    next_card_with_rng(store, deck_id, mode, recent, topic_filter, &mut rand::rng())
+}
+
+/// Pick the next card using a caller-supplied random-number generator.
+///
+/// Production callers normally use [`next_card`]. Supplying the generator
+/// keeps simulations and randomized tests reproducible from one recorded seed.
+pub fn next_card_with_rng<R: rand::Rng + ?Sized>(
+    store: &Store,
+    deck_id: Id,
+    mode: Mode,
+    recent: &[Id],
+    topic_filter: Option<Id>,
+    rng: &mut R,
+) -> Result<Option<Question>> {
     let now = now_ms();
 
     let mut sql = String::from(
@@ -243,7 +258,6 @@ pub fn next_card(
     // of a hundred and thirty, so the window grows with the deck.
     let cooldown = recent.len().min((candidates.len() / 8).max(4));
 
-    let mut rng = rand::rng();
     let mut scored: Vec<(f64, &Candidate)> = candidates
         .iter()
         .map(|c| (score(c, now, mode, recent, cooldown, last_topic), c))
@@ -277,7 +291,7 @@ pub fn next_card(
     // the deck does not replay in a memorised order.
     let pool = scored.len().min(5);
     let total: f64 = scored[..pool].iter().map(|(s, _)| s).sum();
-    let mut pick = rand::rng().random_range(0.0..total.max(f64::MIN_POSITIVE));
+    let mut pick = rng.random_range(0.0..total.max(f64::MIN_POSITIVE));
     let mut chosen = scored[0].1;
     for (s, c) in &scored[..pool] {
         if pick < *s {
@@ -350,6 +364,7 @@ fn score(
 mod tests {
     use super::*;
     use crate::db::NewQuestion;
+    use rand::{SeedableRng, rngs::StdRng};
 
     const HOUR: Millis = 3_600_000;
 
@@ -455,22 +470,29 @@ mod tests {
     #[test]
     fn never_repeats_the_same_card_back_to_back() {
         let (store, deck, ids) = setup(4);
+        let seed = 0;
+        let mut rng = StdRng::seed_from_u64(seed);
         let mut recent = vec![ids[0]];
         for _ in 0..30 {
-            let q = next_card(&store, deck, Mode::Practice, &recent, None)
+            let q = next_card_with_rng(&store, deck, Mode::Practice, &recent, None, &mut rng)
                 .unwrap()
                 .expect("deck is not empty");
-            assert_ne!(q.id, *recent.last().unwrap());
+            assert_ne!(
+                q.id,
+                *recent.last().unwrap(),
+                "repeated a card with RNG seed {seed}"
+            );
             recent.push(q.id);
         }
     }
 
     /// Draw `n` cards the way the app does, keeping the same recent tail.
-    fn draw(store: &Store, deck: Id, n: usize) -> Vec<Id> {
+    fn draw(store: &Store, deck: Id, n: usize, seed: u64) -> Vec<Id> {
+        let mut rng = StdRng::seed_from_u64(seed);
         let mut recent: Vec<Id> = Vec::new();
         let mut drawn = Vec::with_capacity(n);
         for _ in 0..n {
-            let q = next_card(store, deck, Mode::Practice, &recent, None)
+            let q = next_card_with_rng(store, deck, Mode::Practice, &recent, None, &mut rng)
                 .unwrap()
                 .expect("deck is not empty");
             drawn.push(q.id);
@@ -485,15 +507,18 @@ mod tests {
     #[test]
     fn a_large_fresh_deck_is_covered_rather_than_looped() {
         let (store, deck, _) = setup(100);
-        let distinct: std::collections::HashSet<Id> = draw(&store, deck, 60).into_iter().collect();
         // Identical fresh cards score identically, and a stable sort over a
         // tie serves them in row-id order: this used to loop over the first
         // handful of rows and never reach the rest of the deck.
-        assert!(
-            distinct.len() > 40,
-            "only {} distinct cards in 60 draws",
-            distinct.len()
-        );
+        for seed in 0..16 {
+            let distinct: std::collections::HashSet<Id> =
+                draw(&store, deck, 60, seed).into_iter().collect();
+            assert!(
+                distinct.len() > 40,
+                "only {} distinct cards in 60 draws with RNG seed {seed}",
+                distinct.len()
+            );
+        }
     }
 
     #[test]
@@ -512,11 +537,27 @@ mod tests {
         }
 
         let hard: std::collections::HashSet<Id> = ids[..10].iter().copied().collect();
-        let drawn = draw(&store, deck, 100);
-        let easy = drawn.iter().filter(|id| !hard.contains(id)).count();
+        let mut total_easy = 0;
+        let mut least_easy = usize::MAX;
+        let mut least_easy_seed = 0;
+        const SEEDS: u64 = 16;
+        for seed in 0..SEEDS {
+            let drawn = draw(&store, deck, 100, seed);
+            let easy = drawn.iter().filter(|id| !hard.contains(id)).count();
+            total_easy += easy;
+            if easy < least_easy {
+                least_easy = easy;
+                least_easy_seed = seed;
+            }
+        }
+        // A single 100-draw run has enough variance to land on either side of
+        // 50. Check the scheduler's tendency across a deterministic seed
+        // corpus instead of making a coin-flip sample gate the suite.
         assert!(
-            easy > 50,
-            "the fifty easier cards took only {easy} of 100 draws"
+            total_easy > 50 * SEEDS as usize,
+            "the fifty easier cards took only {total_easy} of {} draws; \
+             worst seed {least_easy_seed} produced {least_easy}/100",
+            100 * SEEDS
         );
     }
 
@@ -555,22 +596,28 @@ mod tests {
             .execute("UPDATE review_state SET due_at = 0", params![])
             .unwrap();
 
-        let mut weak = 0;
         const DRAWS: usize = 200;
-        for _ in 0..DRAWS {
-            let q = next_card(&store, deck, Mode::Practice, &[], None)
-                .unwrap()
-                .unwrap();
-            if q.id == ids[1] {
-                weak += 1;
+        for seed in 0..16 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut weak = 0;
+            for _ in 0..DRAWS {
+                let q = next_card_with_rng(&store, deck, Mode::Practice, &[], None, &mut rng)
+                    .unwrap()
+                    .unwrap();
+                if q.id == ids[1] {
+                    weak += 1;
+                }
             }
+            // Clearly favoured, but the solid card must still come round.
+            assert!(
+                weak > 130,
+                "the weak card should dominate, got {weak}/{DRAWS} with RNG seed {seed}"
+            );
+            assert!(
+                weak < DRAWS,
+                "the solid card was starved entirely with RNG seed {seed}"
+            );
         }
-        // Clearly favoured, but the solid card must still come round.
-        assert!(
-            weak > 130,
-            "the weak card should dominate, got {weak}/{DRAWS}"
-        );
-        assert!(weak < DRAWS, "the solid card must not be starved entirely");
     }
 
     #[test]

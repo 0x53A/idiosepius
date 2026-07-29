@@ -10,12 +10,12 @@ use idiosepius_core::content::{self, Pack};
 use idiosepius_core::model::Response;
 use idiosepius_core::session::{Input, Mode, Session};
 use idiosepius_core::{Store, params, scheduler, stats};
+use rand::{SeedableRng, rngs::StdRng};
 
 const PACK: &str = r#"{
   "deck": {
     "slug": "cs",
-    "title": "Control Systems",
-    "exam_at": "2026-07-27T09:00:00+02:00"
+    "title": "Control Systems"
   },
   "topics": [
     { "slug": "stability", "title": "Stability", "ord": 1 },
@@ -56,6 +56,7 @@ fn imported_store() -> (Rc<Store>, i64) {
 #[test]
 fn a_practice_pass_answers_the_fresh_cards_then_spaces_them_out() {
     let (store, deck) = imported_store();
+    let mut rng = StdRng::seed_from_u64(0);
 
     // Drive purely off the scheduler like the UI does. In a single sitting a
     // correct card is pushed minutes into the future, so once every card has
@@ -70,7 +71,9 @@ fn a_practice_pass_answers_the_fresh_cards_then_spaces_them_out() {
         if counts.fresh == 0 && counts.due == 0 {
             break;
         }
-        let Some(q) = scheduler::next_card(&store, deck, Mode::Practice, &recent, None).unwrap()
+        let Some(q) =
+            scheduler::next_card_with_rng(&store, deck, Mode::Practice, &recent, None, &mut rng)
+                .unwrap()
         else {
             break;
         };
@@ -120,6 +123,7 @@ fn a_practice_pass_answers_the_fresh_cards_then_spaces_them_out() {
 #[test]
 fn cram_keeps_cards_in_rotation_until_the_deck_is_learned() {
     let (store, deck) = imported_store();
+    let mut rng = StdRng::seed_from_u64(1);
 
     // Cram ignores spacing, so it can carry a card from box 0 to "learned"
     // (box >= 3) inside one sitting. Answering everything right must reach a
@@ -132,7 +136,7 @@ fn cram_keeps_cards_in_rotation_until_the_deck_is_learned() {
         if stats::deck_stats(&store, deck).unwrap().readiness >= 1.0 {
             break;
         }
-        let q = scheduler::next_card(&store, deck, Mode::Cram, &recent, None)
+        let q = scheduler::next_card_with_rng(&store, deck, Mode::Cram, &recent, None, &mut rng)
             .unwrap()
             .expect("cram always offers a card while any remain unlearned");
         session.show(q.id);
@@ -217,7 +221,12 @@ fn wrong_answers_surface_as_the_weakest_cards() {
 #[test]
 fn nothing_is_scheduled_past_the_exam() {
     let (store, deck) = imported_store();
-    let exam = store.deck(deck).unwrap().unwrap().exam_at.unwrap();
+    // Keep the boundary relative to the run: a calendar date here turns this
+    // into a time bomb as soon as that date passes.
+    let exam = idiosepius_core::now_ms() + 2 * 3_600_000;
+    store
+        .upsert_deck("cs", "Control Systems", None, Some(exam))
+        .unwrap();
 
     let mut session = Session::start(store.clone(), deck, Mode::Practice).unwrap();
     let q = store.questions(deck).unwrap().into_iter().next().unwrap();

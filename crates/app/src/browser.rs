@@ -16,17 +16,22 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::app::{App, Request};
 use crate::import::PickedFile;
+use crate::settings::{FontSettings, PreparedFont};
 use crate::theme::{Palette, text, tracked};
 
 enum Event {
     DatabasePicked(Result<Option<Vec<u8>>, String>),
     DecksPicked(Result<Option<Vec<PickedFile>>, String>),
+    FontPicked(Result<Option<PickedFile>, String>),
+    FontStored(Result<PreparedFont, String>),
     RepositoryLoaded(Result<Vec<PickedFile>, String>),
     Saved(Result<(), String>),
+    SettingsSaved(Result<(), String>),
 }
 
 pub(crate) struct BrowserApp {
     app: Option<App>,
+    fonts: FontSettings,
     events: Rc<RefCell<Vec<Event>>>,
     status: Option<String>,
     error: Option<String>,
@@ -40,20 +45,26 @@ pub(crate) struct BrowserApp {
 pub(crate) struct InitialState {
     database: Vec<u8>,
     wal: Vec<u8>,
+    fonts: FontSettings,
     error: Option<String>,
 }
 
 impl InitialState {
     pub(crate) async fn load() -> Self {
         match load_opfs().await {
-            Ok((database, wal)) => Self {
-                database,
-                wal,
-                error: None,
-            },
+            Ok((database, wal, settings, font_files)) => {
+                let (fonts, error) = FontSettings::load_browser(&settings, font_files);
+                Self {
+                    database,
+                    wal,
+                    fonts,
+                    error,
+                }
+            }
             Err(error) => Self {
                 database: Vec::new(),
                 wal: Vec::new(),
+                fonts: FontSettings::default(),
                 error: Some(format!(
                     "Could not read browser storage: {}",
                     display_js(error)
@@ -72,13 +83,17 @@ impl BrowserApp {
         let InitialState {
             database,
             wal,
+            fonts,
             mut error,
         } = initial;
+        if let Err(font_error) = fonts.apply(ctx) {
+            error = Some(format!("Could not load the selected font: {font_error:#}"));
+        }
         let app = if database.is_empty() {
             None
         } else {
             match idiosepius_core::Store::open_browser(database, wal) {
-                Ok(store) => Some(App::new(ctx, store, None)),
+                Ok(store) => Some(App::new_browser(ctx, store, fonts.clone(), error.clone())),
                 Err(open_error) => {
                     error = Some(format!(
                         "Could not open the database stored in this browser: {open_error:#}"
@@ -90,6 +105,7 @@ impl BrowserApp {
 
         Self {
             app,
+            fonts,
             events: Rc::new(RefCell::new(Vec::new())),
             status: None,
             error,
@@ -134,7 +150,7 @@ impl BrowserApp {
     fn open_database(&mut self, ctx: &egui::Context, database: Vec<u8>) {
         match idiosepius_core::Store::open_browser(database, Vec::new()) {
             Ok(store) => {
-                self.app = Some(App::new(ctx, store, None));
+                self.app = Some(App::new_browser(ctx, store, self.fonts.clone(), None));
                 self.error = None;
                 self.status = Some("Database ready".into());
                 self.last_saved_generation = 0;
@@ -179,6 +195,67 @@ impl BrowserApp {
         });
     }
 
+    fn pick_font(&self, ctx: &egui::Context) {
+        let promise = browser_pick_files(".ttf,.otf", false);
+        let events = self.events.clone();
+        let ctx = ctx.clone();
+        spawn_local(async move {
+            let result = picked_files(promise)
+                .await
+                .map(|mut files| files.pop())
+                .map_err(display_js);
+            events.borrow_mut().push(Event::FontPicked(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn store_font(&mut self, ctx: &egui::Context, picked: PickedFile) {
+        let Some(app) = &mut self.app else { return };
+        let prepared = match app.prepare_font(&picked.name, picked.bytes) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                app.report_error(format!("could not add the font: {error:#}"));
+                return;
+            }
+        };
+        let settings = match app.settings_with_font(&prepared) {
+            Ok(settings) => settings,
+            Err(error) => {
+                app.report_error(format!("could not save the added font: {error:#}"));
+                return;
+            }
+        };
+        let file_name = prepared.file_name().to_owned();
+        let bytes = js_sys::Uint8Array::from(prepared.bytes());
+        let settings = js_sys::Uint8Array::from(settings.as_slice());
+        let promise = browser_store_font(&file_name, &bytes, &settings);
+        let events = self.events.clone();
+        let ctx = ctx.clone();
+        spawn_local(async move {
+            let result = JsFuture::from(promise)
+                .await
+                .map(|_| prepared)
+                .map_err(display_js);
+            events.borrow_mut().push(Event::FontStored(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn save_settings(&self, ctx: &egui::Context, settings: Vec<u8>) {
+        let settings = js_sys::Uint8Array::from(settings.as_slice());
+        let promise = browser_save_settings(&settings);
+        let events = self.events.clone();
+        let ctx = ctx.clone();
+        spawn_local(async move {
+            let result = JsFuture::from(promise)
+                .await
+                .map(|_| ())
+                .map_err(display_js);
+            events.borrow_mut().push(Event::SettingsSaved(result));
+            ctx.request_repaint();
+        });
+    }
+
     fn load_repository(&mut self, ctx: &egui::Context, url: String) {
         let promise = browser_load_github_repository(&url);
         let events = self.events.clone();
@@ -208,9 +285,27 @@ impl BrowserApp {
         for event in events {
             match event {
                 Event::DatabasePicked(Ok(Some(bytes))) => self.open_database(ctx, bytes),
-                Event::DatabasePicked(Ok(None)) | Event::DecksPicked(Ok(None)) => {}
-                Event::DatabasePicked(Err(error)) | Event::DecksPicked(Err(error)) => {
+                Event::DatabasePicked(Ok(None))
+                | Event::DecksPicked(Ok(None))
+                | Event::FontPicked(Ok(None)) => {}
+                Event::DatabasePicked(Err(error))
+                | Event::DecksPicked(Err(error))
+                | Event::FontPicked(Err(error)) => {
                     self.error = Some(error);
+                }
+                Event::FontPicked(Ok(Some(file))) => self.store_font(ctx, file),
+                Event::FontStored(Ok(prepared)) => {
+                    if let Some(app) = &mut self.app {
+                        app.commit_font(prepared);
+                        app.notify("font added");
+                        self.fonts = app.font_settings();
+                        self.error = None;
+                    }
+                }
+                Event::FontStored(Err(error)) => {
+                    if let Some(app) = &mut self.app {
+                        app.report_error(format!("could not store the font: {error}"));
+                    }
                 }
                 Event::DecksPicked(Ok(Some(files))) | Event::RepositoryLoaded(Ok(files)) => {
                     if let Some(app) = &mut self.app {
@@ -228,6 +323,10 @@ impl BrowserApp {
                 Event::Saved(Err(error)) => {
                     self.save_in_flight = false;
                     self.error = Some(format!("Browser storage write failed: {error}"));
+                }
+                Event::SettingsSaved(Ok(())) => {}
+                Event::SettingsSaved(Err(error)) => {
+                    self.error = Some(format!("Could not save browser settings: {error}"));
                 }
             }
         }
@@ -397,6 +496,13 @@ impl eframe::App for BrowserApp {
                 Some(Request::ImportLocalDeck) => self.pick_decks(ui.ctx()),
                 Some(Request::ImportGithub(url)) => self.load_repository(ui.ctx(), url),
                 Some(Request::ExportDatabase) => self.export_database(),
+                Some(Request::ImportFont) => self.pick_font(ui.ctx()),
+                Some(Request::SaveSettings(settings)) => {
+                    if let Some(app) = &self.app {
+                        self.fonts = app.font_settings();
+                    }
+                    self.save_settings(ui.ctx(), settings);
+                }
                 None => {}
             }
             self.storage_state(ui);
@@ -436,12 +542,28 @@ fn draw_button(ui: &mut egui::Ui, rect: Rect, label: &str) -> bool {
     response.clicked()
 }
 
-async fn load_opfs() -> Result<(Vec<u8>, Vec<u8>), JsValue> {
+type BrowserStorage = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<(String, Vec<u8>)>);
+
+async fn load_opfs() -> Result<BrowserStorage, JsValue> {
     let value = JsFuture::from(browser_load_database()).await?;
     let array = js_sys::Array::from(&value);
+    let raw_fonts = js_sys::Array::from(&array.get(3));
+    let mut fonts = Vec::new();
+    let mut index = 0;
+    while index + 1 < raw_fonts.length() {
+        if let Some(name) = raw_fonts.get(index).as_string() {
+            fonts.push((
+                name,
+                js_sys::Uint8Array::new(&raw_fonts.get(index + 1)).to_vec(),
+            ));
+        }
+        index += 2;
+    }
     Ok((
         js_sys::Uint8Array::new(&array.get(0)).to_vec(),
         js_sys::Uint8Array::new(&array.get(1)).to_vec(),
+        js_sys::Uint8Array::new(&array.get(2)).to_vec(),
+        fonts,
     ))
 }
 
@@ -552,8 +674,42 @@ async function opfsWrite(name, bytes) {
     await writable.close();
 }
 
+async function opfsReadFonts() {
+    const root = await navigator.storage.getDirectory();
+    let directory;
+    try {
+        directory = await root.getDirectoryHandle("fonts");
+    } catch (error) {
+        if (error && error.name === "NotFoundError") return [];
+        throw error;
+    }
+    const result = [];
+    for await (const [name, handle] of directory.entries()) {
+        if (handle.kind !== "file") continue;
+        result.push(
+            name,
+            new Uint8Array(await (await handle.getFile()).arrayBuffer()),
+        );
+    }
+    return result;
+}
+
+async function opfsWriteFont(name, bytes) {
+    const root = await navigator.storage.getDirectory();
+    const directory = await root.getDirectoryHandle("fonts", { create: true });
+    const handle = await directory.getFileHandle(name, { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(bytes);
+    await writable.close();
+}
+
 export async function browser_load_database() {
-    return [await opfsRead("study.db"), await opfsRead("study.db-wal")];
+    return [
+        await opfsRead("study.db"),
+        await opfsRead("study.db-wal"),
+        await opfsRead("settings.json"),
+        await opfsReadFonts(),
+    ];
 }
 
 export function browser_save_database(database, wal) {
@@ -562,6 +718,26 @@ export function browser_save_database(database, wal) {
     const write = saveQueue.catch(() => {}).then(async () => {
         await opfsWrite("study.db", dbCopy);
         await opfsWrite("study.db-wal", walCopy);
+    });
+    saveQueue = write;
+    return write;
+}
+
+export function browser_save_settings(settings) {
+    const copy = new Uint8Array(settings);
+    const write = saveQueue.catch(() => {}).then(
+        () => opfsWrite("settings.json", copy),
+    );
+    saveQueue = write;
+    return write;
+}
+
+export function browser_store_font(name, bytes, settings) {
+    const fontCopy = new Uint8Array(bytes);
+    const settingsCopy = new Uint8Array(settings);
+    const write = saveQueue.catch(() => {}).then(async () => {
+        await opfsWriteFont(name, fontCopy);
+        await opfsWrite("settings.json", settingsCopy);
     });
     saveQueue = write;
     return write;
@@ -721,6 +897,12 @@ extern "C" {
     fn browser_save_database(
         database: &js_sys::Uint8Array,
         wal: &js_sys::Uint8Array,
+    ) -> js_sys::Promise;
+    fn browser_save_settings(settings: &js_sys::Uint8Array) -> js_sys::Promise;
+    fn browser_store_font(
+        name: &str,
+        bytes: &js_sys::Uint8Array,
+        settings: &js_sys::Uint8Array,
     ) -> js_sys::Promise;
     fn browser_pick_files(accept: &str, multiple: bool) -> js_sys::Promise;
     fn browser_load_github_repository(repository_url: &str) -> js_sys::Promise;

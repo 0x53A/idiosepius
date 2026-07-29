@@ -194,6 +194,13 @@ confirms that answer with no boxes checked. Import rejects a question with
 fewer than two options, a single-choice card with none marked correct, or
 several correct without `multi`.
 
+**Write the correct option first.** It makes a pack reviewable and keeps its
+diffs readable, and it costs nothing: the app reshuffles the options every time
+it deals the card, so authored order is never what the learner sees and the
+same card is not even laid out the same way twice. What this does mean is that
+**an option may not refer to another by position** — no "both of the above",
+no "the first two". Say the thing instead.
+
 **Distractors must be wrong for a reason.** The best ones are the results of
 specific, common mistakes: the inverted fraction, the missing factor of 2, the
 formula for the neighbouring quantity, the right method applied to the wrong

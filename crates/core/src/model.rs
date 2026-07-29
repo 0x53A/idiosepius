@@ -184,6 +184,48 @@ impl Body {
     }
 }
 
+/// The order a card's options are shown in: authored indices, permuted from
+/// `seed`.
+///
+/// Packs are authored with the correct option first — it keeps a pack
+/// reviewable and its diffs readable — so drawing them in authored order puts
+/// the answer in slot 1 on every card, and the position becomes the answer.
+///
+/// The seed is drawn fresh each time a card is dealt, so a card reshuffles
+/// between repetitions and the position never becomes learnable. It is passed
+/// in rather than taken from the ambient generator here because the order has
+/// to be *recoverable*: the same seed is kept beside the answer so the review
+/// screen and the clipboard transcript can lay the card out exactly as it was
+/// seen. It is also what makes screenshots reproducible — `--shot` seeds the
+/// generator that produces these, so a pinned card lays out the same way twice.
+///
+/// **The indices it returns are authored indices.** A `Response`, a grade and
+/// the event log only ever carry those, so a seed going missing costs the
+/// layout of an old card and never the meaning of a recorded answer.
+pub fn option_order(seed: u64, len: usize) -> Vec<usize> {
+    use rand::{RngExt, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut order: Vec<usize> = (0..len).collect();
+    // Fisher-Yates, downwards, so every permutation is equally likely.
+    for i in (1..len).rev() {
+        order.swap(i, rng.random_range(0..=i));
+    }
+    order
+}
+
+/// A card's options in display order, each paired with its authored index.
+///
+/// This is the one place display order is resolved, so the card, the feedback
+/// panel, the review screen and the clipboard transcript cannot drift apart —
+/// the same reason `explain::option_notes` is the one place a note's audience
+/// is decided.
+pub fn display_options(seed: u64, options: &[Choice]) -> Vec<(usize, &Choice)> {
+    option_order(seed, options.len())
+        .into_iter()
+        .map(|i| (i, &options[i]))
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
@@ -670,5 +712,71 @@ mod tests {
         assert!(mc(&[true, true], false).validate().is_err());
         assert!(mc(&[true, true], true).validate().is_ok());
         assert!(mc(&[true], false).validate().is_err());
+    }
+
+    #[test]
+    fn option_order_is_a_permutation() {
+        for len in 0..12 {
+            for seed in [0, 1, 7, u64::MAX] {
+                let order = option_order(seed, len);
+                assert_eq!(order.len(), len);
+                let mut sorted = order.clone();
+                sorted.sort_unstable();
+                assert_eq!(sorted, (0..len).collect::<Vec<_>>(), "{seed} / {len}");
+            }
+        }
+    }
+
+    /// The seed is kept beside the answer so an answered card can be laid out
+    /// again exactly as it was seen; that only works if it fully determines
+    /// the order.
+    #[test]
+    fn the_same_seed_always_gives_the_same_order() {
+        assert_eq!(option_order(42, 5), option_order(42, 5));
+        assert_ne!(option_order(42, 5), option_order(43, 5));
+    }
+
+    /// The point of the exercise: the authored first option, which is the
+    /// correct one throughout every pack, must not keep landing in slot 1.
+    #[test]
+    fn option_order_moves_the_authored_first_option_around() {
+        let mut slots = std::collections::HashSet::new();
+        for seed in 0..200 {
+            let order = option_order(seed, 4);
+            slots.insert(order.iter().position(|&i| i == 0).unwrap());
+        }
+        assert_eq!(slots.len(), 4, "authored option 0 never reaches some slot");
+    }
+
+    /// Every slot must be roughly as likely as every other — a shuffle that
+    /// merely moved the answer off slot 1 would trade one tell for another.
+    #[test]
+    fn the_correct_option_lands_in_every_slot_about_equally_often() {
+        let mut counts = [0usize; 4];
+        for seed in 0..4_000 {
+            counts[option_order(seed, 4).iter().position(|&i| i == 0).unwrap()] += 1;
+        }
+        for (slot, n) in counts.iter().enumerate() {
+            assert!(
+                (800..1200).contains(n),
+                "slot {slot} got {n} of 4000, expected about 1000"
+            );
+        }
+    }
+
+    #[test]
+    fn display_options_pairs_authored_indices() {
+        let options = vec![
+            Choice::new("right", true),
+            Choice::new("wrong a", false),
+            Choice::new("wrong b", false),
+            Choice::new("wrong c", false),
+        ];
+        let shown = display_options(7, &options);
+        assert_eq!(shown.len(), 4);
+        for (authored, choice) in shown {
+            assert_eq!(choice.text, options[authored].text);
+            assert_eq!(choice.correct, options[authored].correct);
+        }
     }
 }

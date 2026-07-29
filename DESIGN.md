@@ -16,10 +16,14 @@ brighten on hover; the large Boolean card additionally grows a stepped,
 rectangular outline because a single brighter pixel is too easy to miss.
 Feedback borders use their semantic colour.
 
-**Monospace throughout.** Berkeley Mono if the system has it, JetBrains Mono
-otherwise, egui's default as a last resort. Nothing is vendored, so no font
-licence travels with the source. Monospace is a deliberate choice, not just for
-chrome: it keeps formulas like `ω₀²/(s² + 2ζω₀s + ω₀²)` aligned in a prompt.
+**One face throughout.** The initial choice is monospace: Berkeley Mono if the
+native system has it, then JetBrains Mono, Iosevka or DejaVu Sans Mono;
+JetBrains Mono in the browser. The settings screen also exposes egui's bundled
+faces and accepts a local TTF or OTF. Adding validates and copies a face into
+app-owned storage but does not activate it; selection is a separate action, so
+a malformed file can fail without disturbing the current UI. A temporary
+picker grant never becomes a runtime dependency. The chosen face applies to
+prose and chrome alike and is remembered in `settings.json`.
 
 **Chrome is tracked-out capitals.** `S T A B I L I T Y`, `E X A M  I N  2 D`.
 egui has no letter-spacing property, so `theme::tracked()` interleaves spaces.
@@ -140,6 +144,16 @@ In the browser, each forward screen adds a History API entry and `popstate`
 calls that same operation, so the browser Back button and edge/back gesture do
 not invent a second navigation model. At the deck list, browser Back is left to
 the containing page.
+
+A conventional round, hand-drawn cog inside a square chrome button opens
+Settings. The round glyph is an intentional icon-level exception; its hit
+surface and border remain rectangular. On the deck list it sits at the bottom
+beside Export Database; below the deck list it sits directly to the left of
+Back, with the formula-sheet control moving one slot further left when present.
+The Settings screen itself shows Back but not another cog. Native font choice
+uses a searchable combo box because it includes installed system families; the
+browser has only bundled and explicitly imported faces, so it uses rectangular
+radio rows.
 
 A deck row on the home screen is a split action. The broad left segment opens
 the deck: lessons, the complete question bank and progress live behind it. The

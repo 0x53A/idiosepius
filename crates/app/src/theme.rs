@@ -147,12 +147,12 @@ fn style_of(style: &mut egui::Style) {
 /// built-in font if neither is installed. Nothing is vendored into the repo,
 /// so no font licence travels with the source.
 #[cfg(target_arch = "wasm32")]
-fn install_fonts(ctx: &egui::Context) {
+pub(crate) fn install_fonts(ctx: &egui::Context) {
     egui_web_component::install_fonts(ctx);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn install_fonts(ctx: &egui::Context) {
+pub(crate) fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let mut installed = None;
 

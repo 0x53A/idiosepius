@@ -3,6 +3,15 @@
 Cross-cutting work that content authoring has run into. Each entry names what
 is missing, what it currently does instead, and where the fix goes.
 
+## Kindle Paperwhite port, after the exams
+
+The feasibility investigation and staged plan are recorded in
+[`KINDLE.md`](KINDLE.md). The intended design is a custom egui runner, CPU
+software rasterizer and a narrow original Rust implementation of the PW1/PW2
+framebuffer, refresh and touch ABIs. It deliberately does not link or port
+GPLv3+ FBInk. Hardware identification and a read-mostly probe come before any
+application integration.
+
 ## End-to-end encrypted sync, after the exams
 
 The desired shape and the July 2026 Turso/Wasm investigation are recorded in

@@ -44,6 +44,7 @@ pub use db::{NewFact, NewLesson, NewQuestion, Store};
 pub use figure::Figure;
 pub use model::{
     Body, Choice, ContentBlock, Explain, Fact, FactKind, Grade, Id, Kind, Lesson, LessonBlock,
-    Millis, Question, Response, Seg, content_text, content_transcript, lesson_transcript, now_ms,
+    Millis, Question, Response, Seg, content_text, content_transcript, display_options,
+    lesson_transcript, now_ms, option_order,
 };
 pub use session::{Input, Mode, Session};

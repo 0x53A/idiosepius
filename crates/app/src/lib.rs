@@ -7,6 +7,8 @@
 #[cfg(target_arch = "wasm32")]
 mod app;
 #[cfg(target_arch = "wasm32")]
+mod background;
+#[cfg(target_arch = "wasm32")]
 mod blocks;
 #[cfg(target_arch = "wasm32")]
 mod browser;
@@ -26,6 +28,8 @@ mod math;
 mod plot;
 #[cfg(target_arch = "wasm32")]
 mod richtext;
+#[cfg(target_arch = "wasm32")]
+mod settings;
 #[cfg(target_arch = "wasm32")]
 mod theme;
 

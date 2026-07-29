@@ -3,6 +3,7 @@
 //! Single binary, no server: it opens the SQLite study file directly.
 
 mod app;
+mod background;
 mod blocks;
 mod card;
 mod coin;
@@ -14,6 +15,7 @@ mod math;
 mod native_github;
 mod plot;
 mod richtext;
+mod settings;
 mod theme;
 
 use anyhow::{Context, Result};
@@ -54,6 +56,14 @@ fn main() -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let mut store = Store::open(&db_path)?;
+    let settings_root = default_settings_dir();
+    let (font_settings, settings_error) = if parsed.shot.is_some() {
+        // Reproducible visual checks must not inherit a developer's local
+        // typeface or a stale imported-font warning.
+        (settings::FontSettings::default(), None)
+    } else {
+        settings::FontSettings::load_native(&settings_root)
+    };
 
     if !imports.is_empty() {
         let packs = imports
@@ -90,7 +100,16 @@ fn main() -> Result<()> {
     eframe::run_native(
         "idiosepius",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(&cc.egui_ctx, store, shot)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::App::new_native(
+                &cc.egui_ctx,
+                store,
+                shot,
+                font_settings,
+                settings_root,
+                settings_error,
+            )))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -192,6 +211,19 @@ fn default_db_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join("idiosepius").join("study.db")
+}
+
+/// App-owned preferences and copied font files.
+///
+/// The study database remains independently movable; preferences describe the
+/// installation rather than a course, so they live beside the default
+/// database even when a one-off database path was supplied on the command
+/// line.
+fn default_settings_dir() -> PathBuf {
+    default_db_path()
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]

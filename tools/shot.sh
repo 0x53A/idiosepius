@@ -36,7 +36,11 @@ shopt -s nullglob
 # One directory per module under content/, each a repository of its own.
 # The same glob as reimport.sh: two digits, so a tenth topic file is not
 # silently left out.
-packs=(content/*/"$module"-[0-9][0-9]-*.json)
+pack_candidates=(content/*/"$module"-[0-9][0-9]-*.json)
+packs=()
+for pack in "${pack_candidates[@]}"; do
+  [[ $pack == *.sheet.json ]] || packs+=("$pack")
+done
 if ((${#packs[@]} == 0)); then
   echo "no '$module' packs found under content/" >&2
   exit 1
@@ -91,6 +95,8 @@ shoot formulas  --screen formulas
 shoot plots     --screen plots
 shoot plot-zoom --screen plot-zoom
 shoot decks     --screen decks
+shoot settings  --screen settings
+shoot settings-open --screen settings-open
 shoot course    --screen course
 shoot lessons   --screen lessons
 shoot lesson    --screen lesson

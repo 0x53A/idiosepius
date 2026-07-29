@@ -120,8 +120,7 @@ reading starts by citing one, then substitutes through to the answer.
 **Who an option note is addressed to decides where it is shown.**
 `explain::NoteView` is the single decision — `Hidden`, `Picked` or `All` — and
 `explain::option_notes` is the only place that applies it, so the card, the
-review screen and the clipboard transcript cannot drift apart. There are ~1,230
-authored notes across the three decks.
+review screen and the clipboard transcript cannot drift apart.
 
 - A note is addressed to *whoever picked that option*, so the card shows the
   note of each option the learner actually selected — not all of them. That is
@@ -139,6 +138,36 @@ authored notes across the three decks.
 - An unanswered card must never leak a note, for the same reason it must not
   leak the answer — a note names which option is wrong. That applies to
   `Ctrl+C` as much as to the screen.
+
+**Options are authored correct-first and shown shuffled.** Putting the right
+answer first keeps a pack reviewable and its diffs readable, but drawn in that
+order it made the position the answer — every choice question in every deck had
+its key in slot 1. `model::option_order` permutes them from a `u64` seed, and
+`model::display_options` is the one place that resolves it, for the same reason
+`option_notes` is the one place that resolves a note.
+
+- **The seed is drawn once per dealt card**, in `App::place_card` — which is
+  why every route that deals one goes through it. A card that comes back after
+  a lapse comes back in a new order, so the position never becomes learnable
+  the way it would if the order were fixed per question.
+- **`App::shuffle` is where determinism is decided.** It is seeded from the
+  system in a study session and from `SHOT_SHUFFLE_SEED` under `--shot`, so
+  nothing else needs to know whether it is being captured. A card pinned with
+  `--card` then takes that constant as its seed *directly*, rather than the
+  next value in the sequence: `--card` is the flag that promises a diffable
+  screenshot, so its layout must not depend on how many cards were dealt
+  before it.
+- **The seed is kept, not just used.** `Study`, `Feedback` and `Answered` each
+  carry the `order_seed` of the card they hold, so the verdict panel, the
+  review screen and the clipboard transcript can lay a card out exactly as it
+  was answered. Re-reading a card that was never dealt (the weak-card list)
+  gets a fresh one.
+- **Indices that leave the UI are authored indices.** A `Response`, a grade and
+  the event log only ever carry those, so a lost seed costs the layout of an
+  old card and never the meaning of a recorded answer. Only two things are in
+  display order: the number in an option's key box — which is therefore the
+  number key that picks it — and the numbering in the `Ctrl+C` transcript, so a
+  pasted card and the screen agree on what "3." was.
 
 **Files are the shell's job, not a screen's.** Importing a deck and exporting
 the database are asked for on the deck screen — the dashed row under the last
@@ -283,6 +312,24 @@ buttons silently do nothing.
 Check UI changes with `tools/shot.sh` rather than by eye. `--card <uid>` and
 `--drag <px>` pin a capture to a specific question and a frozen mid-swipe, so
 screenshots are reproducible and diffable.
+
+**A capture is a still of a moving interface, so `--shot` has to stop the
+clock everywhere.** Anything animated is a source of run-to-run pixel noise,
+and noise is what makes a diff useless — a screenshot that always differs is
+one nobody reads. Three things are silenced, and a fourth kind of motion added
+later has to be silenced too:
+
+- The **ocean background** is not painted at all (`OceanBackground::hidden`).
+  Freezing its clock was tried first and was not enough: every swimmer is
+  positioned from the width of the frame, so the composition stayed coupled to
+  whatever size the window had reached by the capture frame.
+- The **coin** does not spin — `CoinAnimation::new(false)` makes `spin()` a
+  no-op rather than merely pausing it.
+- The **card entry animation** is completed in `stage_shot` instead of being
+  left to settle. `drive_shot` captures after a fixed *frame* count while
+  `ENTRY_TIME` is a *duration*, so on a fast headless frame the card would
+  otherwise be caught part-way in, scaled and faded by however long twelve
+  frames happened to take.
 
 ## Content correctness
 
