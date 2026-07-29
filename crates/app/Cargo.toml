@@ -7,8 +7,20 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["audio"]
+# The background soundscape, and with it the whole Apteronotus synthesis
+# engine. Enabled by default because the feature is part of the app; kept
+# separable because it is the only thing in the tree that opens an audio
+# device, links a host audio stack, or depends on another repository —
+# `--no-default-features` builds a study app with none of that.
+audio = ["dep:apteronotus-live", "dep:apteronotus-lua", "dep:apteronotus-songs"]
+
 [dependencies]
 anyhow.workspace = true
+apteronotus-live = { workspace = true, optional = true }
+apteronotus-lua = { workspace = true, optional = true }
+apteronotus-songs = { workspace = true, optional = true }
 idiosepius-core = { version = "0.1.0", path = "../core" }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 rand = "0.10.2"

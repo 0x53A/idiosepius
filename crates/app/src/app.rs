@@ -28,6 +28,11 @@ use crate::richtext;
 use crate::settings::{FontSettings, PreparedFont};
 use crate::theme::{Palette, text, tracked};
 
+#[cfg(feature = "audio")]
+use crate::audio::Soundscape;
+#[cfg(feature = "audio")]
+use crate::library::Library;
+
 /// How many answered cards stay reachable with `r`.
 ///
 /// Not the whole session: this is for "wait, what was that one", not for
@@ -86,6 +91,18 @@ pub struct App {
     /// which is the whole of what makes a screenshot reproducible without
     /// making a card's layout learnable.
     shuffle: rand::rngs::StdRng,
+    /// The background audio, and the caret line of its editor.
+    #[cfg(feature = "audio")]
+    soundscape: Soundscape,
+    /// The deck screen draws its own copy of the soundscape control, next to
+    /// its own copy of the cog. It records the click here because it is
+    /// holding a borrow of the screen the control may have to open over.
+    #[cfg(feature = "audio")]
+    pending_audio: Option<crate::soundscape::Action>,
+    /// The soundscape screen's own state: the saved library, the name field
+    /// and the caret line.
+    #[cfg(feature = "audio")]
+    soundscape_editor: crate::soundscape::Editor,
 }
 
 /// Fixed so a captured card lays its options out the same way every run. Any
@@ -104,6 +121,27 @@ pub(crate) enum Request {
     ExportDatabase,
     ImportFont,
     SaveSettings(Vec<u8>),
+    /// Write a score into the soundscape library. `settings` travels with it
+    /// because the settings file records which score is open, and the two are
+    /// one act.
+    #[cfg(feature = "audio")]
+    SaveSoundscape {
+        file: String,
+        source: String,
+        settings: Vec<u8>,
+    },
+    #[cfg(feature = "audio")]
+    DeleteSoundscape {
+        file: String,
+        settings: Vec<u8>,
+    },
+    /// Hand a score to the user as a file. Browser-only: natively the library
+    /// *is* a directory of files, so there is nowhere to download it to.
+    #[cfg(all(feature = "audio", target_arch = "wasm32"))]
+    DownloadSoundscape {
+        file: String,
+        source: String,
+    },
 }
 
 /// What a native file dialog came back with.
@@ -170,6 +208,9 @@ impl Shot {
 enum Screen {
     Decks,
     Settings(Box<Screen>),
+    /// The background soundscape, over the screen it was opened from.
+    #[cfg(feature = "audio")]
+    Soundscape(Box<Screen>),
     Course(Deck),
     Lessons(Box<Lessons>),
     Questions(Box<QuestionBank>),
@@ -339,6 +380,8 @@ fn screen_depth(screen: &Screen) -> usize {
     match screen {
         Screen::Decks | Screen::MathCheck | Screen::PlotCheck => 0,
         Screen::Settings(settings) => screen_depth(settings) + 1,
+        #[cfg(feature = "audio")]
+        Screen::Soundscape(back) => screen_depth(back) + 1,
         Screen::Course(_) | Screen::Summary(_) => 1,
         Screen::Lessons(lessons) => 2 + usize::from(lessons.selected.is_some()),
         Screen::Questions(bank) => bank
@@ -367,6 +410,8 @@ fn screen_deck_id(screen: &Screen) -> Option<i64> {
             .get(review.idx)
             .map(|item| item.question.deck_id)
             .or_else(|| screen_deck_id(&review.back)),
+        #[cfg(feature = "audio")]
+        Screen::Soundscape(_) => None,
         Screen::Decks | Screen::Settings(_) | Screen::MathCheck | Screen::PlotCheck => None,
     }
 }
@@ -520,6 +565,40 @@ impl App {
         let store = Rc::new(store);
         let decks = store.decks().unwrap_or_default();
         let motion_enabled = shot.is_none();
+        // Read the soundscape out of the settings before they are moved into
+        // the app. A capture is silent whatever was saved: `--shot` paints a
+        // few frames and exits, so opening a device for it would put a burst
+        // of noise on every screenshot run.
+        #[cfg(feature = "audio")]
+        let fonts_soundscape = fonts.soundscape().map(str::to_owned);
+        //
+        // The browser additionally starts stopped whatever was saved. An
+        // AudioContext may only be created inside a trusted gesture, so
+        // restoring "playing" on load would not restore sound — it would
+        // produce a blocked context and an error message about it. The start
+        // button is that gesture, so the state survives as *one click away*
+        // rather than as a failure.
+        #[cfg(feature = "audio")]
+        let decibels_soundscape = fonts
+            .soundscape_decibels()
+            .unwrap_or(crate::audio::DEFAULT_DECIBELS);
+        #[cfg(feature = "audio")]
+        let file_soundscape = fonts.soundscape_file().map(str::to_owned);
+        #[cfg(feature = "audio")]
+        let stopped_soundscape =
+            fonts.soundscape_stopped() || shot.is_some() || cfg!(target_arch = "wasm32");
+        // The library arrives from the shell in a moment, through
+        // `adopt_soundscapes`; until then the editor knows the templates and
+        // nothing else.
+        #[cfg(feature = "audio")]
+        let source_soundscape =
+            fonts_soundscape.unwrap_or_else(|| crate::soundscape::default_source().to_owned());
+        #[cfg(feature = "audio")]
+        let editor_soundscape = crate::soundscape::Editor::new(
+            &source_soundscape,
+            file_soundscape.as_deref(),
+            Library::default(),
+        );
         // A capture must lay a pinned card out the same way twice; a study
         // session must not lay it out the same way twice.
         let shuffle = match &shot {
@@ -557,6 +636,12 @@ impl App {
             plot_zoom: None,
             formula_sheet: None,
             pending_back: 0,
+            #[cfg(feature = "audio")]
+            pending_audio: None,
+            #[cfg(feature = "audio")]
+            soundscape: Soundscape::new(source_soundscape, stopped_soundscape, decibels_soundscape),
+            #[cfg(feature = "audio")]
+            soundscape_editor: editor_soundscape,
             shot,
             shuffle,
         };
@@ -569,6 +654,8 @@ impl App {
             Some("settings" | "settings-open") => {
                 app.screen = Screen::Settings(Box::new(Screen::Decks))
             }
+            #[cfg(feature = "audio")]
+            Some("soundscape") => app.screen = Screen::Soundscape(Box::new(Screen::Decks)),
             Some("math") => app.screen = Screen::MathCheck,
             Some("plots") => app.screen = Screen::PlotCheck,
             Some("formulas") => {
@@ -1005,6 +1092,26 @@ impl eframe::App for App {
         } else {
             false
         };
+        // Collect whatever the player reported since the last frame, and let
+        // `M` reach the mute switch from anywhere — except while the caret is
+        // in a text field, which includes the soundscape editor itself.
+        #[cfg(feature = "audio")]
+        {
+            self.soundscape.poll();
+            if let Some(interval) = self.soundscape.repaint_interval() {
+                ui.ctx().request_repaint_after(interval);
+            }
+            if self.import_view.is_none()
+                && self.plot_zoom.is_none()
+                && !ui.ctx().text_edit_focused()
+                && ui
+                    .ctx()
+                    .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::M))
+            {
+                self.soundscape.set_stopped(!self.soundscape.stopped());
+                self.save_soundscape();
+            }
+        }
 
         // Move the screen out of `self` for the duration of the frame. The
         // screen owns a `Session`, which needs `&mut`, while the handlers also
@@ -1015,6 +1122,8 @@ impl eframe::App for App {
         let next = match &mut screen {
             Screen::Decks => self.deck_screen(ui),
             Screen::Settings(_) => self.settings_screen(ui),
+            #[cfg(feature = "audio")]
+            Screen::Soundscape(_) => self.soundscape_screen(ui),
             Screen::Course(deck) => self.course_screen(ui, deck),
             Screen::Lessons(lessons) => self.lessons_screen(ui, lessons),
             Screen::Questions(bank) => self.questions_screen(ui, bank),
@@ -1036,8 +1145,31 @@ impl eframe::App for App {
             && self.import_view.is_none()
             && self.plot_zoom.is_none()
             && self.formula_sheet.is_none();
-        let open_settings =
-            top_settings_visible && settings_button(ui, top_chrome_rect(ui.max_rect(), 1), "top");
+        #[cfg(feature = "audio")]
+        let top_settings_visible = top_settings_visible && !matches!(&screen, Screen::Soundscape(_));
+        let cog = top_chrome_rect(ui.max_rect(), 1);
+        let open_settings = top_settings_visible && settings_button(ui, cog, "top");
+
+        // The soundscape control keeps station immediately left of the cog, so
+        // the two halves of "how this installation behaves" are found in one
+        // place. It is two slots wide, which is what pushes the formula sheet
+        // along.
+        #[cfg(feature = "audio")]
+        let audio_action = top_settings_visible
+            .then(|| {
+                crate::soundscape::audio_button(
+                    ui,
+                    crate::soundscape::button_rect(cog),
+                    self.soundscape.stopped(),
+                    self.soundscape.status(),
+                    "top",
+                )
+            })
+            .flatten();
+
+        #[cfg(feature = "audio")]
+        let formula_slot = if top_settings_visible { 4 } else { 1 };
+        #[cfg(not(feature = "audio"))]
         let formula_slot = if top_settings_visible { 2 } else { 1 };
         let formula_button = screen_deck_id(&screen).is_some()
             && self.import_view.is_none()
@@ -1067,6 +1199,18 @@ impl eframe::App for App {
         }
         if open_settings {
             screen = Screen::Settings(Box::new(screen));
+        }
+        #[cfg(feature = "audio")]
+        if let Some(action) = audio_action.or(self.pending_audio.take()) {
+            match action {
+                crate::soundscape::Action::ToggleTransport => {
+                    self.soundscape.set_stopped(!self.soundscape.stopped());
+                    self.save_soundscape();
+                }
+                crate::soundscape::Action::Open => {
+                    screen = Screen::Soundscape(Box::new(screen));
+                }
+            }
         }
 
         let mut back_steps = std::mem::take(&mut self.pending_back);
@@ -1164,6 +1308,8 @@ impl App {
         let next = match screen {
             Screen::Decks => None,
             Screen::Settings(back) => Some(*std::mem::replace(back, Box::new(Screen::Decks))),
+            #[cfg(feature = "audio")]
+            Screen::Soundscape(back) => Some(*std::mem::replace(back, Box::new(Screen::Decks))),
             Screen::Course(_) => Some(Screen::Decks),
             Screen::Lessons(lessons) if lessons.selected.is_some() => {
                 lessons.selected = None;
@@ -1411,6 +1557,16 @@ impl App {
             Request::ExportDatabase => self.start_export_dialog(ctx),
             Request::ImportFont => self.start_font_dialog(ctx),
             Request::SaveSettings(settings) => self.save_native_settings(&settings),
+            #[cfg(feature = "audio")]
+            Request::SaveSoundscape {
+                file,
+                source,
+                settings,
+            } => self.write_native_soundscape(&file, &source, &settings),
+            #[cfg(feature = "audio")]
+            Request::DeleteSoundscape { file, settings } => {
+                self.delete_native_soundscape(&file, &settings)
+            }
         }
     }
 
@@ -1598,6 +1754,30 @@ impl App {
             self.report_error(format!("could not save settings: {error:#}"));
         }
     }
+
+    #[cfg(feature = "audio")]
+    fn write_native_soundscape(&mut self, file: &str, source: &str, settings: &[u8]) {
+        let Some(root) = self.settings_root.clone() else {
+            return;
+        };
+        if let Err(error) = crate::library::save_native(&root, file, source) {
+            self.report_error(format!("could not save the soundscape: {error:#}"));
+            return;
+        }
+        self.save_native_settings(settings);
+    }
+
+    #[cfg(feature = "audio")]
+    fn delete_native_soundscape(&mut self, file: &str, settings: &[u8]) {
+        let Some(root) = self.settings_root.clone() else {
+            return;
+        };
+        if let Err(error) = crate::library::delete_native(&root, file) {
+            self.report_error(format!("could not delete the soundscape: {error:#}"));
+            return;
+        }
+        self.save_native_settings(settings);
+    }
 }
 
 /// `idiosepius-2026-07-26.db`: dated, because an export is a snapshot and the
@@ -1715,6 +1895,16 @@ impl App {
             Screen::Settings(_) => format!(
                 "Settings\n\nTypeface\n{}\n\nAdd a local TTF or OTF font",
                 self.fonts.selected_label()
+            ),
+            #[cfg(feature = "audio")]
+            Screen::Soundscape(_) => format!(
+                "Soundscape\n\n{}\n\n{}",
+                if self.soundscape.stopped() {
+                    "Stopped"
+                } else {
+                    "Playing"
+                },
+                self.soundscape.source()
             ),
             Screen::Course(deck) => format!(
                 "{}\n\nLessons\nQuestions\nProgress\n\nAll active questions are available for study.",
@@ -1990,6 +2180,96 @@ impl App {
 // ------------------------------------------------------------ deck screen --
 
 impl App {
+    /// Take the saved soundscapes the shell read out of storage.
+    ///
+    /// It arrives after construction rather than through it because reading
+    /// the library is the shell's job — a directory natively, an
+    /// origin-private directory in the browser — and the app is built the same
+    /// way on both. Re-deciding the origin here is what lets a score restored
+    /// from `settings.json` recognise itself as the file it was saved to.
+    #[cfg(feature = "audio")]
+    pub(crate) fn adopt_soundscapes(&mut self, library: Library) {
+        self.soundscape_editor = crate::soundscape::Editor::new(
+            self.soundscape.source(),
+            self.fonts.soundscape_file(),
+            library,
+        );
+    }
+
+    #[cfg(feature = "audio")]
+    fn soundscape_screen(&mut self, ui: &mut egui::Ui) -> Option<Screen> {
+        use crate::soundscape::Command;
+
+        match crate::soundscape::screen(ui, &mut self.soundscape, &mut self.soundscape_editor) {
+            Some(Command::Persist) => self.save_soundscape(),
+            Some(Command::Save { name, source }) => {
+                // The library is updated here rather than when the write comes
+                // back: there is no answer to wait for on either platform, and
+                // a list that lags the file it describes is worse than one
+                // that is briefly optimistic.
+                self.soundscape_editor.saved_as(name.clone(), &source);
+                if let Some(settings) = self.soundscape_settings() {
+                    self.request = Some(Request::SaveSoundscape {
+                        file: crate::library::file_name(&name),
+                        source,
+                        settings,
+                    });
+                    self.notify(format!("saved as {name}"));
+                }
+            }
+            Some(Command::Delete { name }) => {
+                self.soundscape_editor.deleted(&name);
+                if let Some(settings) = self.soundscape_settings() {
+                    self.request = Some(Request::DeleteSoundscape {
+                        file: crate::library::file_name(&name),
+                        settings,
+                    });
+                    self.notify(format!("deleted {name}"));
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            Some(Command::Download { name, source }) => {
+                self.request = Some(Request::DownloadSoundscape {
+                    file: crate::library::file_name(&name),
+                    source,
+                });
+            }
+            None => {}
+        }
+        None
+    }
+
+    /// Write the soundscape back to `settings.json` through the same route the
+    /// font choice uses, so one shell handler covers both.
+    #[cfg(feature = "audio")]
+    fn save_soundscape(&mut self) {
+        if let Some(settings) = self.soundscape_settings() {
+            self.request = Some(Request::SaveSettings(settings));
+        }
+    }
+
+    /// The settings file with the current soundscape state in it.
+    ///
+    /// A library write carries this along rather than queueing a second
+    /// request behind itself, the same way storing a font does: there is one
+    /// request slot, and the two writes describe one act.
+    #[cfg(feature = "audio")]
+    fn soundscape_settings(&mut self) -> Option<Vec<u8>> {
+        self.fonts.set_soundscape(
+            self.soundscape.source(),
+            self.soundscape_editor.file(),
+            self.soundscape.stopped(),
+            self.soundscape.decibels(),
+        );
+        match self.fonts.json() {
+            Ok(settings) => Some(settings),
+            Err(error) => {
+                self.report_error(format!("could not save the soundscape: {error:#}"));
+                None
+            }
+        }
+    }
+
     fn settings_screen(&mut self, ui: &mut egui::Ui) -> Option<Screen> {
         let full = ui.available_rect_before_wrap();
         let panel = Rect::from_center_size(
@@ -2276,6 +2556,17 @@ impl App {
         );
         if settings_button(ui, settings_rect, "decks") {
             next = Some(Screen::Settings(Box::new(Screen::Decks)));
+        }
+        // Same station as on every other screen: immediately left of the cog.
+        #[cfg(feature = "audio")]
+        {
+            self.pending_audio = crate::soundscape::audio_button(
+                ui,
+                crate::soundscape::button_rect(settings_rect),
+                self.soundscape.stopped(),
+                self.soundscape.status(),
+                "decks",
+            );
         }
 
         ui.painter().text(

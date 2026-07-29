@@ -3,6 +3,8 @@
 //! Single binary, no server: it opens the SQLite study file directly.
 
 mod app;
+#[cfg(feature = "audio")]
+mod audio;
 mod background;
 mod blocks;
 mod card;
@@ -10,12 +12,16 @@ mod coin;
 mod explain;
 mod import;
 mod import_dialog;
+#[cfg(feature = "audio")]
+mod library;
 mod math;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_github;
 mod plot;
 mod richtext;
 mod settings;
+#[cfg(feature = "audio")]
+mod soundscape;
 mod theme;
 
 use anyhow::{Context, Result};
@@ -64,6 +70,18 @@ fn main() -> Result<()> {
     } else {
         settings::FontSettings::load_native(&settings_root)
     };
+    // The saved soundscapes, read here for the same reason the fonts are: this
+    // is the shell, and reaching a directory is its job rather than the
+    // application's. A capture gets none, so a screenshot never depends on
+    // what happens to be in a developer's library.
+    #[cfg(feature = "audio")]
+    let (soundscape_files, soundscape_error) = if parsed.shot.is_some() {
+        (Vec::new(), None)
+    } else {
+        library::load_native(&settings_root)
+    };
+    #[cfg(not(feature = "audio"))]
+    let soundscape_error: Option<String> = None;
 
     if !imports.is_empty() {
         let packs = imports
@@ -101,14 +119,18 @@ fn main() -> Result<()> {
         "idiosepius",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(app::App::new_native(
+            #[cfg_attr(not(feature = "audio"), allow(unused_mut))]
+            let mut app = app::App::new_native(
                 &cc.egui_ctx,
                 store,
                 shot,
                 font_settings,
                 settings_root,
-                settings_error,
-            )))
+                settings_error.or(soundscape_error),
+            );
+            #[cfg(feature = "audio")]
+            app.adopt_soundscapes(library::Library::new(soundscape_files));
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))

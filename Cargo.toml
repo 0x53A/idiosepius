@@ -8,7 +8,39 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+# `cargo run` is the normal way this app is used during development, and with
+# the soundscape playing it is a realtime application. Audio-rate DSP cannot
+# meet a device deadline when it is compiled unoptimized — the symptom is a
+# steady stream of "buffer underrun" on stderr and audible crackle, not a
+# subtle slowdown. Optimize the engine while leaving the study app itself, and
+# everything a debugger is ever pointed at here, untouched.
+[profile.dev.package.apteronotus-live]
+opt-level = 3
+
+[profile.dev.package.apteronotus-synth]
+opt-level = 3
+
+[profile.dev.package.fundsp]
+opt-level = 3
+
 [workspace.dependencies]
 anyhow = "1"
+apteronotus-live = { git = "https://github.com/0x53A/apteronotus" }
+apteronotus-lua = { git = "https://github.com/0x53A/apteronotus" }
+apteronotus-songs = { git = "https://github.com/0x53A/apteronotus" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Apteronotus is developed in a sibling checkout that is ahead of its pushed
+# `main`. The dependency above names the source this will resolve from once
+# that work lands; until then every one of its crates is served from the
+# working tree next door. Delete this section — nothing else — when the
+# upstream revision carries what `audio.rs` calls.
+#[patch."https://github.com/0x53A/apteronotus"]
+#apteronotus-live = { path = "../apteronotus/crates/live" }
+#apteronotus-lua = { path = "../apteronotus/crates/lua" }
+#apteronotus-music = { path = "../apteronotus/crates/music" }
+#apteronotus-pattern = { path = "../apteronotus/crates/pattern" }
+#apteronotus-songs = { path = "../apteronotus/crates/songs" }
+#apteronotus-synth = { path = "../apteronotus/crates/synth" }
+#apteronotus-transport = { path = "../apteronotus/crates/transport" }

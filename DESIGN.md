@@ -155,6 +155,68 @@ uses a searchable combo box because it includes installed system families; the
 browser has only bundled and explicitly imported faces, so it uses rectangular
 radio rows.
 
+The soundscape control is a split button, and it keeps station immediately to
+the left of the cog wherever the cog is — bottom row on the deck list, top
+chrome below it. Starting audio and editing it are one subject, and the
+top-right corner is already spending three slots on Back, Settings and the
+formula sheet; two more separate squares there would read as clutter rather
+than as structure. The two halves are independent hit targets under one border,
+with a hairline between them, and the border brightens as a whole because it is
+one control.
+
+Its left half is the transport, and it is **stop**, not mute: it closes the
+audio device and rewinds, so calling it mute would name something the app does
+not do. It draws the action rather than the state, as transport controls
+everywhere do — a triangle to start, a square to stop — while the *colour*
+carries the state: faint when stopped, cyan while sounding, magenta when a
+score was refused. Magenta rather than red for the same reason a wrong answer
+is magenta: red belongs to a design language this one does not use. The
+triangle is nudged right of centre, because a triangle's visual centre is not
+its bounding box's and centring it by the box reads as leaning.
+
+Its right half opens the editor and draws one cycle of a sine. Transport and
+waveform are deliberately different subjects — one is playback, the other is
+the score — and both are straight-edged, so the cog remains the only
+icon-level exception to the rectangular language.
+
+The Soundscape screen is a mood picker over an editor, not a settings form.
+Templates come first as rows carrying a name and one line on what they sound
+like, the open one railed in cyan the way a cited fact is railed. Underneath
+them is the library of saved scores, in a well of its own so an empty one is
+visibly a place things go rather than a gap in the screen — a row per score,
+railed the same way when open, its actions right-aligned in it. Two lists
+rather than one merged list, because a template is shipped and unwritable and a
+saved score is the user's; merging them would mean explaining, per row, which
+kind you were about to overwrite. The score below is a colourised Lua document
+with a line-number gutter, and the row under it is Restart, Start/Stop, a level
+fader with its reading, and the player's status. Its colouring uses the
+palette's own hues — cyan for mini-notation strings, violet for the synthesis
+vocabulary, pale blue for numeric literals, everything structural receding —
+and deliberately never `CORRECT` or `WRONG`. Those two mean "you were right"
+and "you were wrong"; a score being edited is not being marked, and spending
+the verdict pair on numeric literals would blunt the one distinction the
+interface most needs to keep sharp.
+
+Between the name of the score and the editor sits the one button that writes
+anything: it says **save** over a file it can write back to and **save as**
+over a template or a retyped name, because that is the difference between the
+two acts and the label is the only warning either needs. Deleting takes two
+clicks — the row's *delete* arms and becomes *really?* — since there is no undo
+for a file and no bin to fish it out of. Arming another row disarms the first,
+so a mis-click is undone by moving on rather than by finding a cancel.
+
+The fader is drawn by hand rather than taken from egui, whose grabber is a
+circle and whose companion spinner is a text field. A track, a filled portion
+and a square handle obey the rectangular language. Its travel is linear in
+decibels and it carries its reading beside it, with the bottom of the travel
+written −∞ dB rather than −60: a fader whose taper is linear in amplitude does
+its whole audible job in the bottom fifth, and one that claims a number where
+it means silence is lying about its own end stop. It has **no disabled state**:
+the gain it drives sits between the engine and the device rather than inside
+the score, so it means something whatever is loaded and whether or not
+anything is playing. A master control that greys out depending on which song
+is open is not a master control.
+
 A deck row on the home screen is a split action. The broad left segment opens
 the deck: lessons, the complete question bank and progress live behind it. The
 square segment on the right is the quick route into shuffled study and is

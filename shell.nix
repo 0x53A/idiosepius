@@ -11,6 +11,8 @@
 let
   # Loaded at runtime by winit (windowing) and glow (OpenGL).
   runtimeLibs = with pkgs; [
+    # cpal, under the apteronotus soundscape player, opens ALSA at runtime.
+    alsa-lib
     libGL
     libxkbcommon
     wayland
@@ -35,6 +37,8 @@ pkgs.mkShell {
     mesa
   ];
 
+  # alsa-lib is in runtimeLibs and therefore also a buildInput: cpal's
+  # alsa-sys asks pkg-config for it at compile time, not only at load time.
   buildInputs = runtimeLibs ++ [ pkgs.sqlite ];
 
   # The database engine (turso) is pure Rust, so no system sqlite is required

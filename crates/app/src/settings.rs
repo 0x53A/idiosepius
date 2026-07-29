@@ -28,6 +28,33 @@ const DEFAULT_FONT_ID: &str = "bundled:automatic";
 struct PersistedSettings {
     font: String,
     fonts: Vec<StoredFont>,
+    /// The background soundscape: whether it is stopped, the document it
+    /// plays, and at what level. All stored unconditionally, without regard to
+    /// the `audio` feature — a build made without the engine must not quietly
+    /// discard the score a build with it saved.
+    ///
+    /// The alias is the key this was called before the control was renamed
+    /// from mute to stop, so an installation that already has a settings file
+    /// keeps its choice.
+    #[serde(alias = "soundscape_muted")]
+    soundscape_stopped: bool,
+    /// Empty means "whatever the app ships as its default", so a preset that
+    /// is edited upstream keeps improving for anybody who never touched it.
+    soundscape: String,
+    /// Which library entry the editor was last on, so it reopens where it was
+    /// left. The score above is what plays; this is only its identity, and a
+    /// name that no longer exists simply reads as an unsaved document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    soundscape_file: Option<String>,
+    /// The fader, in decibels — the engine's own scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    soundscape_decibels: Option<f64>,
+    /// What the fader was before it was calibrated: a 0…1 position on a
+    /// squared amplitude curve this app used to implement itself. Read once to
+    /// carry an existing installation's level over, then dropped on the next
+    /// save rather than kept in step with a scale it cannot express.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    soundscape_volume: Option<f64>,
 }
 
 impl Default for PersistedSettings {
@@ -35,6 +62,14 @@ impl Default for PersistedSettings {
         Self {
             font: DEFAULT_FONT_ID.into(),
             fonts: Vec::new(),
+            // Sound is never sprung on anybody. Stopped is the state a fresh
+            // installation is in, and the only way out of it is a deliberate
+            // click.
+            soundscape_stopped: true,
+            soundscape: String::new(),
+            soundscape_file: None,
+            soundscape_decibels: None,
+            soundscape_volume: None,
         }
     }
 }
@@ -282,6 +317,53 @@ impl FontSettings {
         serde_json::to_vec_pretty(&self.persisted).context("encoding settings")
     }
 
+    pub(crate) fn soundscape_stopped(&self) -> bool {
+        self.persisted.soundscape_stopped
+    }
+
+    /// The stored fader position in decibels, or `None` for "wherever the app
+    /// starts one". An installation that only ever saw the old 0…1 fader is
+    /// carried over rather than reset.
+    pub(crate) fn soundscape_decibels(&self) -> Option<f64> {
+        self.persisted
+            .soundscape_decibels
+            .or_else(|| self.persisted.soundscape_volume.map(legacy_decibels))
+    }
+
+    /// The stored score, or `None` while the installation is still on
+    /// whichever preset the app ships as its default.
+    pub(crate) fn soundscape(&self) -> Option<&str> {
+        (!self.persisted.soundscape.is_empty()).then_some(self.persisted.soundscape.as_str())
+    }
+
+    /// The library entry the score came from, if it came from one.
+    pub(crate) fn soundscape_file(&self) -> Option<&str> {
+        self.persisted.soundscape_file.as_deref()
+    }
+
+    /// Record the soundscape state. A document identical to the shipped
+    /// default is stored as "the default" rather than as a copy of it.
+    #[cfg(feature = "audio")]
+    pub(crate) fn set_soundscape(
+        &mut self,
+        source: &str,
+        file: Option<&str>,
+        stopped: bool,
+        decibels: f64,
+    ) {
+        self.persisted.soundscape_stopped = stopped;
+        self.persisted.soundscape_decibels = Some(decibels);
+        // The legacy key cannot express this scale, so it goes rather than
+        // sitting in the file disagreeing with the one that can.
+        self.persisted.soundscape_volume = None;
+        self.persisted.soundscape_file = file.map(str::to_owned);
+        self.persisted.soundscape = if source == crate::soundscape::default_source() {
+            String::new()
+        } else {
+            source.to_owned()
+        };
+    }
+
     pub(crate) fn prepare_import(name: &str, bytes: Vec<u8>) -> Result<PreparedFont> {
         if bytes.is_empty() {
             bail!("the selected font file is empty");
@@ -453,6 +535,21 @@ fn system_options() -> Vec<FontOption> {
         .collect()
 }
 
+/// The old fader's 0…1 position, in the decibels it was actually producing.
+///
+/// That fader squared its position to get an amplitude, so this is the exact
+/// level the installation was hearing — not an approximation of the feel of
+/// the control. Silence is `-inf`, which the fader's own clamp turns into the
+/// bottom of its travel.
+fn legacy_decibels(position: f64) -> f64 {
+    let amplitude = position.clamp(0.0, 1.0).powi(2);
+    if amplitude <= 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        20.0 * amplitude.log10()
+    }
+}
+
 fn option_rank(source: &FontSource) -> u8 {
     match source {
         FontSource::Automatic | FontSource::Bundled(_) => 0,
@@ -566,6 +663,7 @@ mod tests {
         let persisted = PersistedSettings {
             font: record.id.clone(),
             fonts: vec![record],
+            ..PersistedSettings::default()
         };
         let mut files = HashMap::new();
         files.insert(

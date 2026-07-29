@@ -58,6 +58,12 @@ pub mod text {
     pub fn stamp() -> FontId {
         FontId::new(46.0, FontFamily::Monospace)
     }
+    /// The soundscape editor. Smaller than prose: it is a document being
+    /// worked on rather than read, and a score wants its lines to fit.
+    #[cfg(feature = "audio")]
+    pub fn code() -> FontId {
+        FontId::new(13.0, FontFamily::Monospace)
+    }
     pub fn title() -> FontId {
         FontId::new(21.0, FontFamily::Monospace)
     }

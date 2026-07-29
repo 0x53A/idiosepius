@@ -97,6 +97,7 @@ shoot plot-zoom --screen plot-zoom
 shoot decks     --screen decks
 shoot settings  --screen settings
 shoot settings-open --screen settings-open
+shoot soundscape --screen soundscape
 shoot course    --screen course
 shoot lessons   --screen lessons
 shoot lesson    --screen lesson

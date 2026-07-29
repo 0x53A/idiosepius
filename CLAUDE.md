@@ -16,7 +16,8 @@ cyan/violet for swipe direction, green/magenta (never red) for verdicts.
   (swipe motion and rotated painting), `math.rs` + `richtext.rs` (inline
   LaTeX), `explain.rs` (short/deep readings and facts), `app.rs` (screens),
   `import.rs` (decoding picked JSON/ZIP packs), `browser.rs` (the wasm shell:
-  OPFS persistence, file picker, download).
+  OPFS persistence, file picker, download), `audio.rs` + `soundscape.rs` +
+  `library.rs` (the background soundscape and its saved scores — see below).
 - `content/` — one directory per module, each a separately versioned Git
   repository holding question packs: one JSON file per topic plus shared
   facts, merged on import. Currently `control-systems/` (deck `control-systems`,
@@ -187,6 +188,137 @@ packs before the ordinary uid-aware import runs, so it expects the
 repository's main URL — `https://github.com/owner/repository` — and not a
 file, branch or directory URL.
 
+## The soundscape
+
+Background audio while you study, synthesised live rather than played back
+from a file. The engine is **Apteronotus** (`~/src/apteronotus`, a sibling
+repository): `apteronotus-lua` is a sandboxed Lua VM producing an owned
+`Program`, and `apteronotus-live` schedules it onto a fundsp/cpal output.
+
+**It is behind the default-on `audio` feature.** `--no-default-features`
+builds a study app with no audio engine, no host audio stack and no dependency
+on another repository at all. Everything in `audio.rs`, `soundscape.rs` and
+`library.rs`, and every use of them, is `#[cfg(feature = "audio")]`.
+
+**The dependency is declared against GitHub and patched to the working tree.**
+The workspace `Cargo.toml` names `https://github.com/0x53A/apteronotus` and
+then `[patch]`es every Apteronotus crate to `../apteronotus/crates/*`, because
+that checkout is ahead of its pushed `main`. **Delete only the patch section**
+when upstream catches up; the dependency lines are already correct. Apteronotus
+is under active development, so an occasional build error inside
+`../apteronotus` is its own repository's business and not something to fix
+from here.
+
+**The engine must be optimized even in a debug build.** The workspace sets
+`opt-level = 3` on `fundsp`, `apteronotus-synth` and `apteronotus-live` for the
+dev profile. Without it the audio callback misses its deadline and the console
+fills with `buffer underrun`. Do not "simplify" those three profile stanzas
+away; `cargo run` is a realtime application now.
+
+**`audio.rs` is deliberately not Apteronotus's player.** That one keeps a live
+performance sounding across an edit, reconciling revisions at a monotonic
+scheduling frontier. A soundscape is picked once and left for an hour, so every
+activation here is a fresh stream at cycle zero and none of that machinery is
+reimplemented. What *is* kept is its one real promise: the replacement is
+evaluated, lowered, opened and filled completely before the previous stream is
+touched, so a score that fails to compile leaves the previous one playing.
+
+**There is no mute, only stop — and the name is the point.** Stopped is the
+default, so a session that never asks for sound never opens a device: no ALSA
+handle, no DSP running behind a silent output, and in the browser no
+AudioContext for the autoplay policy to block. Starting again therefore
+restarts the piece rather than resuming it, which for a cyclic ambient loop is
+inaudible — but it is why the control must not be called mute. A mute button
+that silently closed the device and rewound the piece would be lying. The
+browser additionally starts stopped whatever was saved, because restoring
+"playing" outside a trusted gesture would restore an error rather than sound.
+
+**In the browser, a frame *is* the audio scheduler's clock.** There is no
+worker thread without cross-origin isolation, so `Worker::pump` — which
+evaluates and fills lookahead — runs only inside an egui frame. But this app
+deliberately stops requesting frames when a screen settles, so audio
+scheduling would starve on an idle screen. `Soundscape::repaint_interval`
+is what closes that: while anything is playing it asks for a frame every 40 ms
+on the web, and every 250 ms natively, where the worker thread is doing the
+real work and frames are needed only to notice a status change. **Do not
+remove that call thinking the background animation covers it** — that is
+exactly the bug it fixed. The ocean requests its own repaints, so before this
+existed, whether the music stuttered depended on whether a decoration happened
+to be visible.
+
+For the same reason the web build fills **0.60 s** ahead where native fills
+0.20 s. Apteronotus cannot buy slack that way — it is an instrument, and
+lookahead is the delay before an edit is heard. Nobody is playing a background
+soundscape, so nobody can feel a longer horizon, and it is the cheapest
+resilience there is against a long main-thread task. The WebAudio *buffer*
+size needs no attention here: `apteronotus-live` already keeps cpal's
+2048-frame browser default instead of the 512-frame native target, and that
+decision is shared code.
+
+**Volume is `apteronotus_live::MasterGain`, a stage between the engine and the
+device rather than part of the score.** The obvious alternative — an
+Apteronotus `control` the score declares and the fader drives, which is how
+that project does its live faders — was tried and removed. **`master` may be
+declared only once**, so a score that already has one cannot be given a gain
+stage from outside, and every real song ends with a `master(...)`. That version
+worked on the shipped presets only because the presets had been edited to
+declare a `volume` control, and died the moment a song was pasted in.
+`tests::the_presets_declare_no_volume_control_and_do_not_need_to` is the guard
+against drifting back to it.
+
+This app then grew its own gain node, and Apteronotus grew a better one, so
+**the local copy is gone and the engine's is used**: it is smoothed, so a fader
+move is not a step in gain; it is calibrated in decibels over
+`MasterGain::MIN_DECIBELS ..= MAX_DECIBELS`, which is a usable taper where a
+linear-amplitude fader does its whole audible job in the bottom fifth; and it
+is inside *every* `AudioOutput`, so the route with no persistent processor
+opens through plain `AudioOutput::open` again. `Player` keeps the *number*, not
+the handle, and reapplies it to a new output before that output ever plays —
+the handle belongs to one stream, and a replacement must not render a block at
+unity. Moving the fader is an atomic store into a node the running graph
+already holds, so it never restarts or re-lowers anything, and the fader
+consequently has **no disabled state**. An installation that predates the
+change is migrated once by `settings::legacy_decibels`, which converts the old
+0…1 position through the squared curve it actually used.
+
+`fundsp` is consequently *not* a direct dependency of this crate any more. The
+`[profile.dev.package.fundsp]` stanza stays: it still arrives through
+`apteronotus-live`, and it still has to be optimized.
+
+**The presets are byte-for-byte copies, and two tests keep them that way.**
+They come from Apteronotus's `songs/`, which is that project's specification
+corpus rather than a library it exports, so they travel as assets under
+`crates/app/assets/soundscapes/` — currently `waves`, `drift` and `neon`, which
+is a selection rather than the whole corpus. `every_preset_is_playable`
+evaluates each one and builds its arena, catching a copy going stale as the
+engine moves next door. Nothing may be *added* to them either — the volume
+control that used to be patched in is exactly the kind of edit that made a copy
+stop being a copy, and re-syncing one should stay a plain `cp`. `neon`
+declares an `audio_input`; the study app opens no capture device, and
+`PersistentRuntime::take_processor` feeds those lanes their declared silence
+fallback, which is why it plays here unchanged.
+
+**The library is files, and files are the shell's job.** `library.rs` holds the
+saved scores and knows nothing about where they are: natively they are `.eod`
+documents in `~/idiosepius/soundscapes/`, beside the database and the copied
+fonts; in the browser they are in the same origin-private storage, and each row
+offers a download, which is the only way out of that sandbox. Both routes go
+through an `app::Request` exactly as importing a deck does, and a library write
+carries the settings JSON with it rather than queueing a second request behind
+itself — there is one request slot, and "which score is open" is part of the
+same act. The in-memory list is updated when the request is *made*, not when
+the write comes back: a list that lags the file it describes is worse than one
+that is briefly optimistic, and a failed write reports itself as an error.
+
+**A template cannot be overwritten, which is the whole of the save/save-as
+rule.** The presets are compiled in, so `soundscape::Origin` is `Template`,
+`File` or `Unsaved`, and the button reads "save" only for a `File` whose name
+has not been retyped. Everything else is a copy under a free name, which
+`Library::free_name` finds by stepping `-2`, `-3` past what is taken. A score
+reopened from `settings.json` is recognised as its file only if the library
+still holds that name *with that content*: an edit made and not saved is not
+that file any more, and must not be able to replace it by accident.
+
 **The event log is append-only.** Nothing may `UPDATE` or `DELETE` from
 `event`. Undo removes the `attempt` row and rewinds the box, but the original
 answer stays in the log — it did happen. Scheduler counters (`seen_count`,
@@ -282,9 +414,23 @@ to include `crates/core` and the `idiodb` binary.
 ```
 ./tools/run-all-tests.sh          # core + app, the whole workspace
 cargo test                        # app only (default member)
+cargo check --no-default-features # the app without the audio engine
 nix-shell --run ./tools/shot.sh   # headless UI screenshots -> target/shots/
 nix-shell --run "./tools/shot.sh -m ma"   # another module -> target/shots/ma/
+cargo test -- --ignored           # needs a real audio device; see below
 ```
+
+`shell.nix` carries `alsa-lib` for the soundscape: cpal asks pkg-config for it
+at compile time and dlopens it at run time, so it is in `buildInputs` *and* on
+`LD_LIBRARY_PATH`.
+
+**One test is `#[ignore]`d because it opens the audio device.**
+`audio::tests::the_default_soundscape_reaches_a_real_device` runs the whole
+path — evaluate, lower, open, fill, sound, move the volume control — and is the
+only check that the engine actually reaches hardware. Under Xvfb or in CI there
+is no device, and a test that fails for want of one teaches nothing, so it is
+opt-in rather than skipped conditionally. A capture never plays either:
+`--shot` forces mute, because a screenshot run should not make noise.
 
 **The content tooling lives here, in `tools/`, not beside the packs.** All of
 it is generic, so a copy per module repository only guaranteed drift — and did:

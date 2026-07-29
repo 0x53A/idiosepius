@@ -32,6 +32,11 @@ enum Event {
 pub(crate) struct BrowserApp {
     app: Option<App>,
     fonts: FontSettings,
+    /// The saved soundscapes, kept here because a `App` is built afresh
+    /// whenever a database is opened and each one has to be handed the same
+    /// library.
+    #[cfg(feature = "audio")]
+    soundscapes: Vec<(String, String)>,
     events: Rc<RefCell<Vec<Event>>>,
     status: Option<String>,
     error: Option<String>,
@@ -46,18 +51,23 @@ pub(crate) struct InitialState {
     database: Vec<u8>,
     wal: Vec<u8>,
     fonts: FontSettings,
+    #[cfg(feature = "audio")]
+    soundscapes: Vec<(String, String)>,
     error: Option<String>,
 }
 
 impl InitialState {
     pub(crate) async fn load() -> Self {
         match load_opfs().await {
-            Ok((database, wal, settings, font_files)) => {
-                let (fonts, error) = FontSettings::load_browser(&settings, font_files);
+            Ok(storage) => {
+                let (fonts, error) =
+                    FontSettings::load_browser(&storage.settings, storage.font_files);
                 Self {
-                    database,
-                    wal,
+                    database: storage.database,
+                    wal: storage.wal,
                     fonts,
+                    #[cfg(feature = "audio")]
+                    soundscapes: storage.soundscapes,
                     error,
                 }
             }
@@ -65,6 +75,8 @@ impl InitialState {
                 database: Vec::new(),
                 wal: Vec::new(),
                 fonts: FontSettings::default(),
+                #[cfg(feature = "audio")]
+                soundscapes: Vec::new(),
                 error: Some(format!(
                     "Could not read browser storage: {}",
                     display_js(error)
@@ -84,6 +96,8 @@ impl BrowserApp {
             database,
             wal,
             fonts,
+            #[cfg(feature = "audio")]
+            soundscapes,
             mut error,
         } = initial;
         if let Err(font_error) = fonts.apply(ctx) {
@@ -93,7 +107,12 @@ impl BrowserApp {
             None
         } else {
             match idiosepius_core::Store::open_browser(database, wal) {
-                Ok(store) => Some(App::new_browser(ctx, store, fonts.clone(), error.clone())),
+                Ok(store) => {
+                    let mut app = App::new_browser(ctx, store, fonts.clone(), error.clone());
+                    #[cfg(feature = "audio")]
+                    app.adopt_soundscapes(crate::library::Library::new(soundscapes.clone()));
+                    Some(app)
+                }
                 Err(open_error) => {
                     error = Some(format!(
                         "Could not open the database stored in this browser: {open_error:#}"
@@ -106,6 +125,8 @@ impl BrowserApp {
         Self {
             app,
             fonts,
+            #[cfg(feature = "audio")]
+            soundscapes,
             events: Rc::new(RefCell::new(Vec::new())),
             status: None,
             error,
@@ -150,7 +171,10 @@ impl BrowserApp {
     fn open_database(&mut self, ctx: &egui::Context, database: Vec<u8>) {
         match idiosepius_core::Store::open_browser(database, Vec::new()) {
             Ok(store) => {
-                self.app = Some(App::new_browser(ctx, store, self.fonts.clone(), None));
+                let mut app = App::new_browser(ctx, store, self.fonts.clone(), None);
+                #[cfg(feature = "audio")]
+                app.adopt_soundscapes(crate::library::Library::new(self.soundscapes.clone()));
+                self.app = Some(app);
                 self.error = None;
                 self.status = Some("Database ready".into());
                 self.last_saved_generation = 0;
@@ -244,6 +268,45 @@ impl BrowserApp {
     fn save_settings(&self, ctx: &egui::Context, settings: Vec<u8>) {
         let settings = js_sys::Uint8Array::from(settings.as_slice());
         let promise = browser_save_settings(&settings);
+        let events = self.events.clone();
+        let ctx = ctx.clone();
+        spawn_local(async move {
+            let result = JsFuture::from(promise)
+                .await
+                .map(|_| ())
+                .map_err(display_js);
+            events.borrow_mut().push(Event::SettingsSaved(result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Write a saved soundscape, or remove one when `source` is `None`, and
+    /// the settings file that records which is open, in one queued write.
+    ///
+    /// The in-memory copy is updated here rather than when the promise
+    /// settles, for the same reason the app's own library is: the list the
+    /// user is looking at describes what they just did, and a rejected write
+    /// reports itself as an error rather than as a silently reappearing file.
+    #[cfg(feature = "audio")]
+    fn store_soundscape(
+        &mut self,
+        ctx: &egui::Context,
+        file: String,
+        source: Option<String>,
+        settings: Vec<u8>,
+    ) {
+        self.soundscapes.retain(|(name, _)| *name != file);
+        if let Some(source) = &source {
+            self.soundscapes.push((file.clone(), source.clone()));
+        }
+        if let Some(app) = &self.app {
+            self.fonts = app.font_settings();
+        }
+        let settings = js_sys::Uint8Array::from(settings.as_slice());
+        let promise = match &source {
+            Some(source) => browser_store_soundscape(&file, source, &settings),
+            None => browser_delete_soundscape(&file, &settings),
+        };
         let events = self.events.clone();
         let ctx = ctx.clone();
         spawn_local(async move {
@@ -503,6 +566,18 @@ impl eframe::App for BrowserApp {
                     }
                     self.save_settings(ui.ctx(), settings);
                 }
+                #[cfg(feature = "audio")]
+                Some(Request::SaveSoundscape {
+                    file,
+                    source,
+                    settings,
+                }) => self.store_soundscape(ui.ctx(), file, Some(source), settings),
+                #[cfg(feature = "audio")]
+                Some(Request::DeleteSoundscape { file, settings }) => {
+                    self.store_soundscape(ui.ctx(), file, None, settings)
+                }
+                #[cfg(feature = "audio")]
+                Some(Request::DownloadSoundscape { file, source }) => download_text(&file, &source),
                 None => {}
             }
             self.storage_state(ui);
@@ -542,29 +617,56 @@ fn draw_button(ui: &mut egui::Ui, rect: Rect, label: &str) -> bool {
     response.clicked()
 }
 
-type BrowserStorage = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<(String, Vec<u8>)>);
+/// Everything origin-private storage holds, as one load.
+struct BrowserStorage {
+    database: Vec<u8>,
+    wal: Vec<u8>,
+    settings: Vec<u8>,
+    font_files: Vec<(String, Vec<u8>)>,
+    /// Saved soundscapes, as text: they are documents rather than blobs, and
+    /// nothing downstream wants them as bytes.
+    #[cfg(feature = "audio")]
+    soundscapes: Vec<(String, String)>,
+}
 
 async fn load_opfs() -> Result<BrowserStorage, JsValue> {
     let value = JsFuture::from(browser_load_database()).await?;
     let array = js_sys::Array::from(&value);
     let raw_fonts = js_sys::Array::from(&array.get(3));
-    let mut fonts = Vec::new();
+    let mut font_files = Vec::new();
     let mut index = 0;
     while index + 1 < raw_fonts.length() {
         if let Some(name) = raw_fonts.get(index).as_string() {
-            fonts.push((
+            font_files.push((
                 name,
                 js_sys::Uint8Array::new(&raw_fonts.get(index + 1)).to_vec(),
             ));
         }
         index += 2;
     }
-    Ok((
-        js_sys::Uint8Array::new(&array.get(0)).to_vec(),
-        js_sys::Uint8Array::new(&array.get(1)).to_vec(),
-        js_sys::Uint8Array::new(&array.get(2)).to_vec(),
-        fonts,
-    ))
+    #[cfg(feature = "audio")]
+    let soundscapes = {
+        let raw = js_sys::Array::from(&array.get(4));
+        let mut scores = Vec::new();
+        let mut index = 0;
+        while index + 1 < raw.length() {
+            if let (Some(name), Some(source)) =
+                (raw.get(index).as_string(), raw.get(index + 1).as_string())
+            {
+                scores.push((name, source));
+            }
+            index += 2;
+        }
+        scores
+    };
+    Ok(BrowserStorage {
+        database: js_sys::Uint8Array::new(&array.get(0)).to_vec(),
+        wal: js_sys::Uint8Array::new(&array.get(1)).to_vec(),
+        settings: js_sys::Uint8Array::new(&array.get(2)).to_vec(),
+        font_files,
+        #[cfg(feature = "audio")]
+        soundscapes,
+    })
 }
 
 async fn save_opfs(database: Vec<u8>, wal: Vec<u8>) -> Result<(), JsValue> {
@@ -703,12 +805,32 @@ async function opfsWriteFont(name, bytes) {
     await writable.close();
 }
 
+// The saved soundscapes are text documents, so they cross as strings. The
+// directory is the browser's stand-in for ~/idiosepius/soundscapes.
+async function opfsReadSoundscapes() {
+    const root = await navigator.storage.getDirectory();
+    let directory;
+    try {
+        directory = await root.getDirectoryHandle("soundscapes");
+    } catch (error) {
+        if (error && error.name === "NotFoundError") return [];
+        throw error;
+    }
+    const result = [];
+    for await (const [name, handle] of directory.entries()) {
+        if (handle.kind !== "file") continue;
+        result.push(name, await (await handle.getFile()).text());
+    }
+    return result;
+}
+
 export async function browser_load_database() {
     return [
         await opfsRead("study.db"),
         await opfsRead("study.db-wal"),
         await opfsRead("settings.json"),
         await opfsReadFonts(),
+        await opfsReadSoundscapes(),
     ];
 }
 
@@ -730,6 +852,51 @@ export function browser_save_settings(settings) {
     );
     saveQueue = write;
     return write;
+}
+
+export function browser_store_soundscape(name, source, settings) {
+    const settingsCopy = new Uint8Array(settings);
+    const write = saveQueue.catch(() => {}).then(async () => {
+        const root = await navigator.storage.getDirectory();
+        const directory = await root.getDirectoryHandle("soundscapes", { create: true });
+        const handle = await directory.getFileHandle(name, { create: true });
+        const writable = await handle.createWritable();
+        await writable.write(source);
+        await writable.close();
+        await opfsWrite("settings.json", settingsCopy);
+    });
+    saveQueue = write;
+    return write;
+}
+
+export function browser_delete_soundscape(name, settings) {
+    const settingsCopy = new Uint8Array(settings);
+    const write = saveQueue.catch(() => {}).then(async () => {
+        const root = await navigator.storage.getDirectory();
+        try {
+            const directory = await root.getDirectoryHandle("soundscapes");
+            await directory.removeEntry(name);
+        } catch (error) {
+            // Already gone is the outcome that was asked for.
+            if (!error || error.name !== "NotFoundError") throw error;
+        }
+        await opfsWrite("settings.json", settingsCopy);
+    });
+    saveQueue = write;
+    return write;
+}
+
+export function download_text(name, text) {
+    const blob = new Blob([text], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = name;
+    anchor.style.display = "none";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 export function browser_store_font(name, bytes, settings) {
@@ -899,6 +1066,16 @@ extern "C" {
         wal: &js_sys::Uint8Array,
     ) -> js_sys::Promise;
     fn browser_save_settings(settings: &js_sys::Uint8Array) -> js_sys::Promise;
+    #[cfg(feature = "audio")]
+    fn browser_store_soundscape(
+        name: &str,
+        source: &str,
+        settings: &js_sys::Uint8Array,
+    ) -> js_sys::Promise;
+    #[cfg(feature = "audio")]
+    fn browser_delete_soundscape(name: &str, settings: &js_sys::Uint8Array) -> js_sys::Promise;
+    #[cfg(feature = "audio")]
+    fn download_text(name: &str, text: &str);
     fn browser_store_font(
         name: &str,
         bytes: &js_sys::Uint8Array,

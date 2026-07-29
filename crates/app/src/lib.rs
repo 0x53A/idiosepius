@@ -6,6 +6,8 @@
 
 #[cfg(target_arch = "wasm32")]
 mod app;
+#[cfg(all(target_arch = "wasm32", feature = "audio"))]
+mod audio;
 #[cfg(target_arch = "wasm32")]
 mod background;
 #[cfg(target_arch = "wasm32")]
@@ -22,6 +24,8 @@ mod explain;
 mod import;
 #[cfg(target_arch = "wasm32")]
 mod import_dialog;
+#[cfg(all(target_arch = "wasm32", feature = "audio"))]
+mod library;
 #[cfg(target_arch = "wasm32")]
 mod math;
 #[cfg(target_arch = "wasm32")]
@@ -30,6 +34,8 @@ mod plot;
 mod richtext;
 #[cfg(target_arch = "wasm32")]
 mod settings;
+#[cfg(all(target_arch = "wasm32", feature = "audio"))]
+mod soundscape;
 #[cfg(target_arch = "wasm32")]
 mod theme;
 
