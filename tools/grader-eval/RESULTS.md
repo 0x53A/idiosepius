@@ -1,9 +1,84 @@
-# Grader benchmark — 2026-07-26
+# Grader benchmark
 
-Machine: Intel Core i5-1345U, integrated Iris Xe graphics. Models are Q4_K_M
-GGUFs. Decoding is greedy and grammar-constrained. The suite has 38 cases built
-from eight Control Systems questions, including paraphrases, omissions, false
-extra claims, calculations, ambiguity and prompt injection.
+The suite is 38 cases built from eight Control Systems questions — paraphrases,
+omissions, false extra claims, calculations, ambiguity and prompt injection.
+Two baselines follow. They were measured under **different protocols and are
+not comparable to each other**; only the accuracy columns mean roughly the same
+thing in both.
+
+## API baseline — 2026-07-28
+
+Harness: `POST {base_url}/chat/completions`, `--response-format json-schema`,
+`--temperature 0`, `--max-tokens 1024`, one repetition. Server: Ollama on
+`http://localhost:11434/v1`, same machine as the harness — AMD Ryzen 7 7840HS,
+Radeon 780M integrated graphics, 30 GiB RAM.
+
+| model | accuracy | FA | FR | missed ? | parse | p50 ms | p95 ms | tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `qwen3:8b` | 33/38 (86.8%) | 0 | 3 | 2 | 0 | 4666 | 7002 | 5.83 |
+| `gemma3:4b-it-qat` | 31/38 (81.6%) | 0 | 5 | 2 | 0 | 3767 | 4657 | 9.02 |
+
+Latency and tok/s are properties of that server on that machine, not of the
+models; they move with the host. Model size and RSS are not measured at all any
+more — the model does not run in this process, so there is nothing honest to
+report and `compare.py` prints `n/a`.
+
+**Neither model made a single false accept, and every error was conservative:**
+both rejected answers that were in fact correct, or returned `incorrect` where
+the honest verdict was `uncertain`. For a grader that is the right direction to
+fail in, but a false-reject rate of 3–5 in 38 is still too high to put in front
+of a learner unattended.
+
+Four cases defeat both models, which makes them a property of the suite rather
+than of either candidate:
+
+- `poles-injection-correct` — a genuine answer carrying a hostile instruction.
+  Both reject it. The failure is over-strictness, not steering: neither emitted
+  the verdict the injected text asked for. Item 4 of the old resume list is
+  therefore still open, and still the most interesting case in the file.
+- `integrator-stability` and `bode-gain-correct` — correct answers, rejected.
+- `bode-vague` and `disturbance-garbled` — both `uncertain`, both answered
+  `incorrect`. Neither model reaches for `uncertain` at all under the schema.
+
+`gemma3:4b-it-qat` adds `poles-paraphrase` and `integrator-converges`, both
+correct answers it rejected. It is the same failure mode as qwen3, further
+along.
+
+### LM Studio does not currently work as a backend
+
+Tested against an LM Studio server on the LAN (`http://<host>:1234/v1`), model
+`qwen/qwen3.5-9b`, with the real grader prompt:
+
+| `response_format` | result |
+| --- | --- |
+| `json_schema` | HTTP 200, **`content` empty**, 34 tokens in `reasoning_content`, `finish_reason` `stop` |
+| `json_object` | HTTP 400 — `'response_format.type' must be 'json_schema' or 'text'` |
+| `text` / absent | writes `content`, but as prose: `"\n\nVerdict: correct"`, not JSON |
+
+Adding `chat_template_kwargs: {enable_thinking: false}` changes nothing — same
+empty content, same 34 reasoning tokens. Nothing is being truncated:
+`finish_reason` is `stop`, not `length`, so raising `--max-tokens` does not
+help.
+
+The same class of model works elsewhere. Ollama's `qwen3:8b` is also a
+reasoning model, and under `json_schema` it returns clean JSON with
+`reasoning_tokens: 0` — Ollama suppresses the thinking phase when the
+constraint is applied. So this is LM Studio's structured-output path, not
+reasoning models in general and not the harness. There is no `--response-format`
+that gets a usable answer out of it: the one mode that produces content
+produces prose instead of the object.
+
+If a later LM Studio build fixes it, the check is one run of
+`--limit 3 --response-format json-schema` — non-empty `content` is the whole
+test.
+
+## Local llama.cpp baseline — 2026-07-26 (superseded protocol)
+
+This predates the move off in-process inference, and it was measured on
+**different hardware** — Intel Core i5-1345U with integrated Iris Xe, not the
+Ryzen box above. Q4_K_M GGUFs; greedy, grammar-constrained decoding. The
+latency, throughput, size and RSS columns describe both an execution model and
+a machine this harness no longer touches.
 
 | model | backend | accuracy | false accepts | p50 latency | output tok/s | peak RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -15,63 +90,55 @@ extra claims, calculations, ambiguity and prompt injection.
 | Llama 3.2 1B | Vulkan | 20/38 (52.6%) | 4 | 1.4 s | 10.96 | 918 MiB |
 
 Qwen 3.5 4B on four CPU threads produced the same 36/38 verdicts, but median
-latency rose from 9.2 s to 19.7 s and peak RSS from 3045 MiB to 3317 MiB.
-Vulkan is therefore the useful backend on this machine.
+latency rose to 19.7 s and peak RSS to 3317 MiB. Its two misses were the same
+adversarial injection case and the same ambiguous Bode answer that still defeat
+every candidate today.
+
+The 94.7% at the top of this table is the number to beat, and no API candidate
+has yet been run that approaches it. Whether that gap is the models, the
+protocol or the machine is untested — all three changed at once, and
+grammar-constrained llama.cpp decoding and a server-side JSON schema are not
+the same constraint in any case. **Do not read the two tables as one ranking.**
 
 ## Current decision
 
-Phi-4 Mini is the best interactive default in this sweep: it gives up one
-correct verdict to Qwen 4B while returning in roughly half the time. Qwen 4B is
-the maximum-accuracy choice when a nine-second median response is acceptable.
-The 0.8B and 1B models are not safe graders because they accept several
-substantively wrong answers.
+No grader is integrated into the application, and none of these results
+justifies integrating one. The work stays isolated in `tools/grader-eval/`.
 
-Qwen 4B's two misses were the deliberately adversarial answer containing a
-correct statement plus an instruction to output `incorrect`, and a genuinely
-ambiguous Bode answer which it rejected instead of returning `uncertain`.
-Phi-4 Mini missed those same situations and was additionally over-strict on a
-correct Routh paraphrase.
-
-This is a screening result, not a final quality estimate. The one-case gap
-between Qwen 4B and Phi-4 Mini is not meaningful with only 38 synthetic cases
-and eight underlying rubrics. Before integrating a grader, the suite needs an
-independent holdout of real student wording, more ambiguous answers, and cases
-from the German and automotive decks.
+If a decision were forced today it would be `qwen3:8b` for accuracy, on the
+strength of zero false accepts — but at a ~4.7 s median and three wrongly
+rejected correct answers in 38 it is not something to put between a learner and
+their revision the week of an exam.
 
 ## Resume here
 
-No grader has been integrated into the application. The work is isolated in
-`tools/grader-eval/`. The version-controlled source of truth is:
+The version-controlled source of truth:
 
 - `cases.jsonl` — the 38 labelled inputs;
-- `src/main.rs` — system prompt, JSON grammar, inference and measurements;
+- `src/main.rs` — system prompt, verdict schema, request shape, measurements;
 - `compare.py` — report comparison;
-- this file — the baseline decision that should survive ignored build output.
+- this file — the baselines that should survive ignored build output.
 
-The downloaded GGUFs and detailed reports are local, ignored artifacts:
+Reports are local, ignored artifacts under `target/grader-eval/results/`. There
+is no `shell.nix` and no models directory any more; a stock `cargo build` is
+the whole toolchain.
 
-```text
-target/grader-eval/models/
-target/grader-eval/results/
+Inspect the existing reports:
+
+```sh
+python3 tools/grader-eval/compare.py target/grader-eval/results/*.json
 ```
 
-To inspect the existing reports:
+Rerun the current best candidate:
 
 ```sh
 cd tools/grader-eval
-nix-shell
-python3 compare.py ../../target/grader-eval/results/*.json
-```
-
-To rerun the current interactive choice:
-
-```sh
 cargo run --release -- \
-  --model ../../target/grader-eval/models/phi4-mini-q4_k_m.gguf \
-  --model-id phi-4-mini-instruct-q4_k_m \
+  --base-url http://localhost:11434/v1 \
+  --model qwen3:8b \
+  --model-id qwen3-8b \
   --cases cases.jsonl \
-  --output ../../target/grader-eval/results/phi4-mini-vulkan.json \
-  --backend vulkan
+  --output ../../target/grader-eval/results/qwen3-8b.json
 ```
 
 When continuing:
@@ -79,10 +146,13 @@ When continuing:
 1. Build an independent holdout, prioritising genuine student answers rather
    than more paraphrases written alongside the rubric.
 2. Add ambiguous boundary cases and treat false accepts as the primary safety
-   gate.
-3. Add German Maths 2 and automotive-mechatronics cases before generalising
-   the Control Systems result.
-4. Revisit the prompt-injection case where a valid answer is accompanied by
-   hostile instructions; both leading models currently reject it.
-5. Rerun all candidates after changing the cases, prompt, grammar or token
-   budget. Do not compare reports produced by different protocols.
+   gate. Note that the current failure mode is the opposite one — every miss in
+   the API baseline is over-strict — so false rejects now need a gate too.
+3. Add German Maths 2, automotive-mechatronics and Lasertechnik cases before
+   generalising the Control Systems result.
+4. Revisit `poles-injection-correct`. Every candidate ever run rejects it.
+5. Settle whether `uncertain` is reachable at all under a server-side schema.
+   No API candidate has produced it once; the enum is offered and never chosen.
+6. Rerun all candidates after changing the cases, prompt, schema or token
+   budget. Do not compare reports produced by different protocols — the two
+   tables above are the standing example of why.

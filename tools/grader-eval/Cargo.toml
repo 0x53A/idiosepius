@@ -9,8 +9,14 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-encoding_rs = "0.8"
-llama-cpp-2 = { version = "=0.1.152", features = ["vulkan"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Blocking + rustls keeps this a pure-Rust build: no OpenSSL, no cmake, no
+# libclang, no shaderc. That is the point of dropping the bundled llama.cpp —
+# the harness builds with a stock cargo and needs no nix shell of its own.
+reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
+  "json",
+  "rustls-tls",
+] }
 
