@@ -272,7 +272,9 @@ python3 tools/packfmt.py --check content/*/*.json
 the renderer must be added to its `SUPPORTED`**, which is precisely why it
 belongs in this repository. `build-sheet.sh` needs LaTeX, which is kept out of
 `shell.nix` (direnv puts every `cd` into that shell and tectonic is large); it
-re-enters `tools/sheet-shell.nix` on its own.
+takes `tectonic`, else a system `xelatex`/`lualatex`, and re-enters
+`tools/sheet-shell.nix` only when neither is installed. Never `pdflatex` — the
+sheet carries no `fontenc`, so it breaks umlauts silently.
 
 `shell.nix` also carries `dbus.lib` for a non-obvious reason: `rfd`'s
 xdg-portal backend *dlopens* `libdbus-1.so.3`. Without it the native import and

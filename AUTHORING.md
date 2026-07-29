@@ -603,9 +603,12 @@ course's conventions and sequence need not suit another course's sheet.
 
 `check-packs.py` and `packfmt.py` need only python3, which the development
 shell provides. `build-sheet.sh` needs LaTeX, which is deliberately *not* in
-that shell — direnv puts every `cd` into it and tectonic is large — so the
-script re-enters `tools/sheet-shell.nix` by itself. There is nothing to set up,
-and a content checkout needs no `shell.nix` of its own.
+that shell — direnv puts every `cd` into it and tectonic is large. It uses
+`tectonic` when it is on `PATH`, otherwise a system `xelatex` or `lualatex`,
+and only re-enters `tools/sheet-shell.nix` when the machine has none of them.
+`pdflatex` is refused: the preamble sets no `fontenc`, so it mangles umlauts
+without failing. There is nothing to set up, and a content checkout needs no
+`shell.nix` of its own.
 
 **Any script that rewrites a pack must go through `tools/packfmt.py`.** It
 serialises in the house style — options and `{"fact": …}` references on one
