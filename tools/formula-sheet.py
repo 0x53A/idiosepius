@@ -54,10 +54,22 @@ def math(src):
     return src
 
 
+# `*…*` is emphasis everywhere else in a pack, so it has to be emphasis here
+# too — otherwise the sheet is the one place the markers show up as ink.
+# The rules follow `richtext.rs`: `**so**` means the same as `*so*`, an
+# asterisk with no closing partner stays literal, and `\*` is always literal.
+LITERAL_STAR = "\0"
+
+
 def text(src):
+    # Before the escapes, or the backslash of `\*` becomes \textbackslash{}.
+    src = src.replace(r"\*", LITERAL_STAR)
     for a, b in TEXT_ESCAPES:
         src = src.replace(a, b)
-    return src
+    # After them, so the braces of \emph{} are not escaped in turn.
+    src = re.sub(r"\*\*([^*]+)\*\*", r"\\emph{\1}", src)
+    src = re.sub(r"\*([^*]+)\*", r"\\emph{\1}", src)
+    return src.replace(LITERAL_STAR, "*")
 
 
 def prose(src):
