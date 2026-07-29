@@ -54,6 +54,13 @@ Lessons (§ 10) are kept in files of their own, numbered `1n` against the topic
 file `0n` they teach, because a topic's prose and its forty questions are not
 comfortable to edit in one file.
 
+That mapping only works while the topic numbers stay inside `01`–`09`. A module
+with more topics shifts the lesson block clear of them instead — Lasertechnik
+has topics `01`–`14` and lessons `21`–`34`, so the offset is 20 rather than 10.
+What matters is that the numbers stay **two digits** and that the offset is
+constant, because the tooling globs `<mod>-[0-9][0-9]-*.json` and a reader
+should be able to find a topic's reading by subtracting.
+
 The prefix is what the tooling globs on, so it must be short, lowercase and
 unique across modules. Every file of a module carries the **same `deck`
 block**, because packs are merged by deck slug and the importer rejects a set
