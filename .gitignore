@@ -6,3 +6,8 @@
 /content
 __pycache__
 web/pkg/
+# Course material a pack was authored from: lecture slides, formula sheets,
+# past papers, Moodle exports. Copyrighted by the institution, often carrying
+# the exporting student's name and session tokens. The pack in content/ is the
+# publishable artifact; its sources are not.
+/LT-source
