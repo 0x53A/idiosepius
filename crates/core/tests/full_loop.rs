@@ -10,12 +10,20 @@ use idiosepius_core::content::{self, Pack};
 use idiosepius_core::model::Response;
 use idiosepius_core::session::{Input, Mode, Session};
 use idiosepius_core::{Store, params, scheduler, stats};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+
+/// Filled in by `imported_store` at run time. `EXAM_HORIZON` only applies
+/// while the exam is still ahead — once it is past, `scheduler::interval_for`
+/// deliberately falls back to plain Leitner. An absolute date here therefore
+/// made `nothing_is_scheduled_past_the_exam` assert a property that stopped
+/// being true on that date, and the test failed on every machine thereafter.
+const EXAM_PLACEHOLDER: &str = "{{EXAM_AT}}";
 
 const PACK: &str = r#"{
   "deck": {
     "slug": "cs",
     "title": "Control Systems",
-    "exam_at": "2026-07-27T09:00:00+02:00"
+    "exam_at": "{{EXAM_AT}}"
   },
   "topics": [
     { "slug": "stability", "title": "Stability", "ord": 1 },
@@ -47,8 +55,14 @@ const PACK: &str = r#"{
 }"#;
 
 fn imported_store() -> (Rc<Store>, i64) {
+    // A week out: long enough that the top interval (3 days) exceeds the
+    // horizon (40 % of 7 days = 2.8 days) and is actually capped, which is
+    // the thing the horizon test is checking.
+    let exam = OffsetDateTime::now_utc() + Duration::days(7);
+    let json = PACK.replace(EXAM_PLACEHOLDER, &exam.format(&Rfc3339).unwrap());
+
     let mut store = Store::open_in_memory().unwrap();
-    let pack: Pack = serde_json::from_str(PACK).unwrap();
+    let pack: Pack = serde_json::from_str(&json).unwrap();
     let deck = content::import_pack(&mut store, &pack).unwrap().deck_id;
     (Rc::new(store), deck)
 }
