@@ -398,6 +398,9 @@ impl FontSettings {
         })
     }
 
+    // The browser writes settings and font bytes in one act; natively the
+    // settings file is rewritten after the import is committed.
+    #[cfg(any(test, target_arch = "wasm32"))]
     pub(crate) fn json_with_import(&self, prepared: &PreparedFont) -> Result<Vec<u8>> {
         let mut copy = self.clone();
         copy.register(prepared);
@@ -493,6 +496,16 @@ fn bundled_options() -> Vec<FontOption> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn system_options() -> Vec<FontOption> {
+    // Forking fc-list and scanning every installed face is not free, and
+    // `FontSettings::default()` runs on paths that never look at the list —
+    // every unit test, and every `--shot` capture. The set does not change
+    // under a running app, so enumerate it once per process.
+    static SYSTEM: std::sync::OnceLock<Vec<FontOption>> = std::sync::OnceLock::new();
+    SYSTEM.get_or_init(enumerate_system_fonts).clone()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn enumerate_system_fonts() -> Vec<FontOption> {
     let output = match std::process::Command::new("fc-list")
         .args(["-f", "%{family}\t%{file}\n"])
         .output()

@@ -517,6 +517,9 @@ fn settings_button(ui: &egui::Ui, rect: Rect, id: &'static str) -> bool {
 }
 
 impl App {
+    // Both shells construct through their own constructor, with the settings
+    // they loaded; this is the bare one the tests build against.
+    #[cfg(test)]
     pub fn new(ctx: &egui::Context, store: Store, shot: Option<Shot>) -> Self {
         Self::new_with_settings(ctx, store, shot, FontSettings::default(), None, None)
     }
@@ -4415,14 +4418,21 @@ fn choice_text(seed: u64, options: &[idiosepius_core::Choice], indices: &[usize]
         return "none".to_owned();
     }
     let order = option_order(seed, options.len());
-    indices
+    // Authored indices come in authored order, but the numbers printed are
+    // slots — so list them by slot, or a multi-answer card pastes as "4.; 1.".
+    let mut listed: Vec<(usize, String)> = indices
         .iter()
         .filter_map(|&index| {
             let slot = order.iter().position(|&i| i == index)?;
             options
                 .get(index)
-                .map(|option| format!("{}. {}", slot + 1, option.text.trim()))
+                .map(|option| (slot, format!("{}. {}", slot + 1, option.text.trim())))
         })
+        .collect();
+    listed.sort_by_key(|(slot, _)| *slot);
+    listed
+        .into_iter()
+        .map(|(_, text)| text)
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -7118,6 +7128,55 @@ mod tests {
             slot_of(&question, TEST_SEED, 0)
         )));
         assert!(text.contains("Explanation\nSet $s=0$ in the transfer function."));
+    }
+
+    /// A transcript is meant to read like the screen, so a multi-answer line
+    /// has to run down the card. Listing authored indices with slot numbers
+    /// printed on them gave "Correct answer: 4. …; 1. …".
+    #[test]
+    fn a_multi_answer_line_is_listed_in_slot_order() {
+        let mut question = clipboard_question();
+        question.body = Body::MultipleChoice {
+            options: (0..4)
+                .map(|i| idiosepius_core::Choice::new(format!("opt{i}"), i < 2))
+                .collect(),
+            multi: true,
+        };
+        for seed in 0..40 {
+            let text = card_text(
+                &question,
+                None,
+                seed,
+                &[],
+                Some(&Response::MultipleChoice {
+                    selected: vec![0, 1],
+                }),
+                None,
+                true,
+                explain::NoteView::Hidden,
+                None,
+            );
+            for label in ["My answer: ", "Correct answer: "] {
+                let line = text
+                    .lines()
+                    .find(|line| line.starts_with(label))
+                    .expect("the line is written");
+                let slots: Vec<usize> = line[label.len()..]
+                    .split("; ")
+                    .map(|entry| {
+                        entry
+                            .split_once('.')
+                            .expect("each entry is numbered")
+                            .0
+                            .parse()
+                            .expect("the number is a slot")
+                    })
+                    .collect();
+                let mut sorted = slots.clone();
+                sorted.sort_unstable();
+                assert_eq!(slots, sorted, "seed {seed} listed {line} out of order");
+            }
+        }
     }
 
     /// The defect this shuffle exists for: every pack authors the correct
