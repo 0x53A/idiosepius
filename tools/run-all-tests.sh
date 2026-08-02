@@ -6,9 +6,16 @@
 #
 #   ./tools/run-all-tests.sh [extra cargo test args...]
 #
-# No nix-shell needed: rusqlite is bundled and nothing here opens a window.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo test --workspace --all-targets "$@"
+test_log=$(mktemp)
+trap 'rm -f "$test_log"' EXIT
+
+if cargo test --workspace --all-targets "$@" >"$test_log" 2>&1; then
+  echo "all workspace tests passed"
+else
+  cat "$test_log" >&2
+  exit 1
+fi

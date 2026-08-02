@@ -78,8 +78,13 @@ pub struct App {
     pending_lesson_questions: Option<(Deck, String, Vec<Question>)>,
     /// A plot opened from any prompt or explanation at a readable size.
     plot_zoom: Option<Figure>,
-    /// The current deck's authored formula facts, shown over any course screen.
+    /// The current deck's authored formula facts, shown beside any course
+    /// screen, or over it when the window is too narrow to hold both.
     formula_sheet: Option<FormulaSheet>,
+    /// Width the docked sheet would take this frame, or `None` if the window
+    /// is too narrow for one. Measured every frame whether a sheet is open or
+    /// not, so opening one knows its form immediately.
+    formula_dock_width: Option<f32>,
     /// Back operations asked for by the browser's History API. They are
     /// applied through the same route as the on-screen button and Escape.
     pending_back: usize,
@@ -167,6 +172,24 @@ struct FormulaSheet {
     deck_title: String,
     formulas: Vec<Fact>,
     filter: String,
+    /// Whether the sheet is currently a column beside the card rather than an
+    /// exclusive modal over it. Recomputed from the window width every frame.
+    docked: bool,
+}
+
+/// Layout of the docked formula sheet. The card gets its natural width first;
+/// the sheet takes only the surplus, held between a legible floor and a ceiling
+/// that keeps the reference from becoming the main event.
+const FORMULA_DOCK_MIN: f32 = 880.0;
+const FORMULA_SHEET_MIN: f32 = 360.0;
+const FORMULA_SHEET_MAX: f32 = 560.0;
+const CARD_NATURAL_WIDTH: f32 = 660.0;
+
+/// Width of the docked sheet's column, or `None` when the window is too narrow
+/// and the sheet must use its modal form.
+fn formula_dock_width(available: f32) -> Option<f32> {
+    (available >= FORMULA_DOCK_MIN)
+        .then(|| (available - CARD_NATURAL_WIDTH).clamp(FORMULA_SHEET_MIN, FORMULA_SHEET_MAX))
 }
 
 /// A pending `--shot` capture.
@@ -449,12 +472,12 @@ fn screen_back_button(ui: &egui::Ui, full: Rect) -> bool {
     response.clicked()
 }
 
-fn formula_sheet_button(ui: &egui::Ui, full: Rect, slot: usize) -> bool {
+fn formula_sheet_button(ui: &egui::Ui, full: Rect, slot: usize, open: bool) -> bool {
     let rect = top_chrome_rect(full, slot);
     let response = ui
         .interact(rect, Id::new("formula-sheet"), Sense::click())
         .on_hover_text("Formula sheet (F)");
-    let hot = response.hovered() || response.has_focus();
+    let hot = response.hovered() || response.has_focus() || open;
     let colour = if hot {
         Palette::ACCENT
     } else {
@@ -638,6 +661,7 @@ impl App {
             pending_lesson_questions: None,
             plot_zoom: None,
             formula_sheet: None,
+            formula_dock_width: None,
             pending_back: 0,
             #[cfg(feature = "audio")]
             pending_audio: None,
@@ -776,9 +800,12 @@ impl App {
             }
             Some(name) => {
                 if let Some(deck) = app.decks.first().cloned()
-                    && let Some(mut screen) = app.begin(deck, Mode::Practice)
+                    && let Some(mut screen) = app.begin(deck.clone(), Mode::Practice)
                 {
                     app.stage_shot(&mut screen);
+                    if name == "formulas-study" {
+                        app.open_formula_sheet(deck.id);
+                    }
                     // The review overlay wraps the screen it was opened from,
                     // which the first frame will do for us.
                     if name == "review"
@@ -841,6 +868,17 @@ impl App {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn take_request(&mut self) -> Option<Request> {
         self.request.take()
+    }
+
+    /// Width the docked formula sheet currently occupies on the right, or
+    /// zero. The browser shell uses this to keep its storage word outside the
+    /// sheet's corner.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn docked_formula_sheet_width(&self) -> f32 {
+        match self.formula_sheet.as_ref() {
+            Some(sheet) if sheet.docked => self.formula_dock_width.unwrap_or(0.0),
+            _ => 0.0,
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -1095,18 +1133,29 @@ impl eframe::App for App {
         } else {
             false
         };
+
+        // A docked sheet has to reserve its column before any screen lays out
+        // the remaining space. Measure every frame even while closed so a
+        // newly opened sheet knows its form without flashing as a modal first.
+        let sheet_was_open = self.formula_sheet.is_some();
+        self.dock_formula_sheet(ui);
+        let formula_docked = self
+            .formula_sheet
+            .as_ref()
+            .is_some_and(|sheet| sheet.docked);
+        let formula_modal = self.formula_sheet.is_some() && !formula_docked;
+        let full = ui.available_rect_before_wrap();
+
         // Collect whatever the player reported since the last frame, and let
-        // `M` reach the mute switch from anywhere — except while the caret is
-        // in a text field, which includes the soundscape editor itself.
+        // `M` reach the start/stop transport from anywhere — except while an
+        // exclusive overlay or text field owns the keyboard.
         #[cfg(feature = "audio")]
         {
             self.soundscape.poll();
             if let Some(interval) = self.soundscape.repaint_interval() {
                 ui.ctx().request_repaint_after(interval);
             }
-            if self.import_view.is_none()
-                && self.plot_zoom.is_none()
-                && !ui.ctx().text_edit_focused()
+            if !self.overlay_owns_keys(ui.ctx())
                 && ui
                     .ctx()
                     .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::M))
@@ -1144,13 +1193,16 @@ impl eframe::App for App {
             Screen::Review(review) => self.review_screen(ui, review),
         };
         let mut screen = next.unwrap_or(screen);
-        let top_settings_visible = !matches!(&screen, Screen::Decks | Screen::Settings(_))
-            && self.import_view.is_none()
-            && self.plot_zoom.is_none()
-            && self.formula_sheet.is_none();
+        // A docked sheet is a companion to the live screen, so its chrome
+        // remains usable. The modal fallback is exclusive and hides it.
+        let chrome_visible =
+            self.import_view.is_none() && self.plot_zoom.is_none() && !formula_modal;
+        let top_settings_visible =
+            !matches!(&screen, Screen::Decks | Screen::Settings(_)) && chrome_visible;
         #[cfg(feature = "audio")]
-        let top_settings_visible = top_settings_visible && !matches!(&screen, Screen::Soundscape(_));
-        let cog = top_chrome_rect(ui.max_rect(), 1);
+        let top_settings_visible =
+            top_settings_visible && !matches!(&screen, Screen::Soundscape(_));
+        let cog = top_chrome_rect(full, 1);
         let open_settings = top_settings_visible && settings_button(ui, cog, "top");
 
         // The soundscape control keeps station immediately left of the cog, so
@@ -1175,15 +1227,10 @@ impl eframe::App for App {
         #[cfg(not(feature = "audio"))]
         let formula_slot = if top_settings_visible { 2 } else { 1 };
         let formula_button = screen_deck_id(&screen).is_some()
-            && self.import_view.is_none()
-            && self.plot_zoom.is_none()
-            && self.formula_sheet.is_none()
-            && formula_sheet_button(ui, ui.max_rect(), formula_slot);
-        let touch_back = screen_depth(&screen) > 0
-            && self.import_view.is_none()
-            && self.plot_zoom.is_none()
-            && self.formula_sheet.is_none()
-            && screen_back_button(ui, ui.max_rect());
+            && chrome_visible
+            && formula_sheet_button(ui, full, formula_slot, formula_docked);
+        let touch_back =
+            screen_depth(&screen) > 0 && chrome_visible && screen_back_button(ui, full);
 
         // Opening a review needs the screen it was opened from, which only
         // exists here: the handler that asked for it is holding a borrow of it.
@@ -1201,6 +1248,7 @@ impl eframe::App for App {
             screen = self.begin_lesson_practice(deck, questions, screen);
         }
         if open_settings {
+            self.formula_sheet = None;
             screen = Screen::Settings(Box::new(screen));
         }
         #[cfg(feature = "audio")]
@@ -1211,6 +1259,7 @@ impl eframe::App for App {
                     self.save_soundscape();
                 }
                 crate::soundscape::Action::Open => {
+                    self.formula_sheet = None;
                     screen = Screen::Soundscape(Box::new(screen));
                 }
             }
@@ -1236,7 +1285,11 @@ impl eframe::App for App {
                 self.open_formula_sheet(deck_id);
             }
         } else if formula_button && let Some(deck_id) = screen_deck_id(&screen) {
-            self.open_formula_sheet(deck_id);
+            if self.formula_sheet.is_some() {
+                self.formula_sheet = None;
+            } else {
+                self.open_formula_sheet(deck_id);
+            }
         }
 
         // egui-winit translates Ctrl/Cmd+C into Event::Copy and deliberately
@@ -1246,9 +1299,16 @@ impl eframe::App for App {
             .ctx()
             .input_mut(|input| take_copy_event(&mut input.events));
         if copy {
+            // A modal is what is being read. A docked sheet sits beside a live
+            // card, so copy still means that card unless the filter has focus.
+            let sheet_owns_copy = self
+                .formula_sheet
+                .as_ref()
+                .is_some_and(|sheet| !sheet.docked || ui.ctx().text_edit_focused());
             let text = self
                 .formula_sheet
                 .as_ref()
+                .filter(|_| sheet_owns_copy)
                 .map(formula_sheet_text)
                 .unwrap_or_else(|| self.visible_text(&screen));
             if !text.trim().is_empty() {
@@ -1276,8 +1336,14 @@ impl eframe::App for App {
         #[cfg(not(target_arch = "wasm32"))]
         self.serve_requests(ui.ctx());
 
+        // Opening or closing changes the width every screen sees, and that is
+        // read only at the top of a frame.
+        if self.formula_sheet.is_some() != sheet_was_open {
+            ui.ctx().request_repaint();
+        }
+
         self.error_bar(ui);
-        self.corner_notice(ui);
+        self.corner_notice(ui, full);
         self.drive_shot(ui.ctx());
     }
 }
@@ -1393,6 +1459,7 @@ impl App {
                         .filter(|fact| fact.kind == FactKind::Formula)
                         .collect(),
                     filter: String::new(),
+                    docked: self.formula_dock_width.is_some(),
                 });
             }
             Err(error) => {
@@ -1401,10 +1468,39 @@ impl App {
         }
     }
 
+    /// Reserve the sheet's column before the active screen lays itself out in
+    /// what remains. On a narrow window this only records the fallback state;
+    /// `show_formula_sheet` draws the modal after the screen instead.
+    fn dock_formula_sheet(&mut self, ui: &mut egui::Ui) {
+        self.formula_dock_width = formula_dock_width(ui.available_rect_before_wrap().width());
+        let width = self.formula_dock_width;
+        let Some(sheet) = self.formula_sheet.as_mut() else {
+            return;
+        };
+        let Some(width) = width else {
+            sheet.docked = false;
+            return;
+        };
+        sheet.docked = true;
+
+        // The flush panel gets one separator hairline from egui; a surrounding
+        // frame would add meaningless strokes along the window edges.
+        let frame = egui::Frame::new().inner_margin(20).fill(Palette::SURFACE);
+        egui::Panel::right(Id::new(("formula-sheet-panel", sheet.deck_id)))
+            .frame(frame)
+            .resizable(false)
+            .exact_size(width)
+            .show(ui, |ui| formula_sheet_body(ui, sheet, None));
+    }
+
+    /// Narrow-window fallback: the formula sheet remains an exclusive modal.
     fn show_formula_sheet(&mut self, ctx: &egui::Context) {
         let Some(sheet) = self.formula_sheet.as_mut() else {
             return;
         };
+        if sheet.docked {
+            return;
+        }
         let width = (ctx.content_rect().width() - 64.0).clamp(260.0, 760.0);
         // Reserve the rest of the viewport for the title, filter, count,
         // close control and frame margins; only the formula list scrolls.
@@ -1418,114 +1514,7 @@ impl App {
             .frame(frame)
             .show(ctx, |ui| {
                 ui.set_width(width);
-                ui.label(
-                    egui::RichText::new(tracked("formula sheet"))
-                        .font(text::title())
-                        .color(Palette::TEXT),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(&sheet.deck_title)
-                        .font(text::small())
-                        .color(Palette::TEXT_DIM),
-                );
-                ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new(tracked("filter"))
-                        .font(text::label())
-                        .color(Palette::TEXT_FAINT),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut sheet.filter)
-                        .id_salt(("formula-sheet-filter", sheet.deck_id))
-                        .font(text::small())
-                        .hint_text("title, equation, explanation or source")
-                        .desired_width(f32::INFINITY)
-                        .min_size(Vec2::new(0.0, 44.0)),
-                );
-                ui.add_space(4.0);
-                let visible_count = sheet
-                    .formulas
-                    .iter()
-                    .filter(|formula| formula_matches_filter(formula, &sheet.filter))
-                    .count();
-                ui.label(
-                    egui::RichText::new(formula_count(
-                        visible_count,
-                        sheet.formulas.len(),
-                        &sheet.filter,
-                    ))
-                    .font(text::small())
-                    .color(Palette::TEXT_DIM),
-                );
-                ui.add_space(8.0);
-
-                egui::ScrollArea::vertical()
-                    .id_salt(("formula-sheet-scroll", sheet.deck_id))
-                    .max_height(scroll_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if sheet.formulas.is_empty() {
-                            ui.label(
-                                egui::RichText::new(
-                                    "No formula facts have been authored for this deck yet.",
-                                )
-                                .font(text::body())
-                                .color(Palette::TEXT_DIM),
-                            );
-                            return;
-                        }
-                        if visible_count == 0 {
-                            ui.label(
-                                egui::RichText::new("No formulas match this filter.")
-                                    .font(text::body())
-                                    .color(Palette::TEXT_DIM),
-                            );
-                            return;
-                        }
-
-                        let mut groups: Vec<(&str, Vec<&Fact>)> = Vec::new();
-                        for formula in sheet
-                            .formulas
-                            .iter()
-                            .filter(|formula| formula_matches_filter(formula, &sheet.filter))
-                        {
-                            let source = formula.source.as_deref().unwrap_or("Other");
-                            if let Some((_, formulas)) =
-                                groups.iter_mut().find(|(name, _)| *name == source)
-                            {
-                                formulas.push(formula);
-                            } else {
-                                groups.push((source, vec![formula]));
-                            }
-                        }
-                        for (group_index, (source, formulas)) in groups.into_iter().enumerate() {
-                            if group_index > 0 {
-                                ui.add_space(10.0);
-                            }
-                            ui.label(
-                                egui::RichText::new(tracked(source))
-                                    .font(text::label())
-                                    .color(Palette::TEXT_FAINT),
-                            );
-                            let (rule, _) = ui.allocate_exact_size(
-                                Vec2::new(ui.available_width(), 7.0),
-                                Sense::hover(),
-                            );
-                            ui.painter().line_segment(
-                                [rule.left_center(), rule.right_center()],
-                                Stroke::new(1.0, Palette::LINE),
-                            );
-                            for formula in formulas {
-                                let mut formula = formula.clone();
-                                // The source is already the section heading.
-                                formula.source = None;
-                                explain::fact_block(ui, &formula);
-                                ui.add_space(8.0);
-                            }
-                        }
-                    });
-
+                formula_sheet_body(ui, sheet, Some(scroll_height));
                 ui.add_space(8.0);
                 ui.add_sized(
                     [ui.available_width(), 44.0],
@@ -1536,6 +1525,125 @@ impl App {
         if modal.should_close() || modal.inner {
             self.formula_sheet = None;
         }
+    }
+}
+
+/// Title, filter and grouped formula list, shared by the docked and modal
+/// forms so their content cannot drift apart.
+fn formula_sheet_body(ui: &mut egui::Ui, sheet: &mut FormulaSheet, scroll_height: Option<f32>) {
+    let docked = scroll_height.is_none();
+    ui.label(
+        egui::RichText::new(tracked("formula sheet"))
+            .font(text::title())
+            .color(Palette::TEXT),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(&sheet.deck_title)
+            .font(text::small())
+            .color(Palette::TEXT_DIM),
+    );
+    ui.add_space(12.0);
+    ui.label(
+        egui::RichText::new(tracked("filter"))
+            .font(text::label())
+            .color(Palette::TEXT_FAINT),
+    );
+    ui.add(
+        egui::TextEdit::singleline(&mut sheet.filter)
+            .id_salt(("formula-sheet-filter", sheet.deck_id))
+            .font(text::small())
+            .hint_text("title, equation, explanation or source")
+            .desired_width(f32::INFINITY)
+            .min_size(Vec2::new(0.0, 44.0)),
+    );
+    ui.add_space(4.0);
+    let visible_count = sheet
+        .formulas
+        .iter()
+        .filter(|formula| formula_matches_filter(formula, &sheet.filter))
+        .count();
+    ui.label(
+        egui::RichText::new(formula_count(
+            visible_count,
+            sheet.formulas.len(),
+            &sheet.filter,
+        ))
+        .font(text::small())
+        .color(Palette::TEXT_DIM),
+    );
+    ui.add_space(8.0);
+
+    const HINT_HEIGHT: f32 = 26.0;
+    let scroll_height =
+        scroll_height.unwrap_or_else(|| (ui.available_height() - HINT_HEIGHT).max(80.0));
+    egui::ScrollArea::vertical()
+        .id_salt(("formula-sheet-scroll", sheet.deck_id))
+        .max_height(scroll_height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if sheet.formulas.is_empty() {
+                ui.label(
+                    egui::RichText::new("No formula facts have been authored for this deck yet.")
+                        .font(text::body())
+                        .color(Palette::TEXT_DIM),
+                );
+                return;
+            }
+            if visible_count == 0 {
+                ui.label(
+                    egui::RichText::new("No formulas match this filter.")
+                        .font(text::body())
+                        .color(Palette::TEXT_DIM),
+                );
+                return;
+            }
+
+            let mut groups: Vec<(&str, Vec<&Fact>)> = Vec::new();
+            for formula in sheet
+                .formulas
+                .iter()
+                .filter(|formula| formula_matches_filter(formula, &sheet.filter))
+            {
+                let source = formula.source.as_deref().unwrap_or("Other");
+                if let Some((_, formulas)) = groups.iter_mut().find(|(name, _)| *name == source) {
+                    formulas.push(formula);
+                } else {
+                    groups.push((source, vec![formula]));
+                }
+            }
+            for (group_index, (source, formulas)) in groups.into_iter().enumerate() {
+                if group_index > 0 {
+                    ui.add_space(10.0);
+                }
+                ui.label(
+                    egui::RichText::new(tracked(source))
+                        .font(text::label())
+                        .color(Palette::TEXT_FAINT),
+                );
+                let (rule, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 7.0), Sense::hover());
+                ui.painter().line_segment(
+                    [rule.left_center(), rule.right_center()],
+                    Stroke::new(1.0, Palette::LINE),
+                );
+                for formula in formulas {
+                    let mut formula = formula.clone();
+                    // The source is already the section heading.
+                    formula.source = None;
+                    explain::fact_block(ui, &formula);
+                    ui.add_space(8.0);
+                }
+            }
+        });
+
+    if docked {
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(tracked("f / esc  close"))
+                .font(text::label())
+                .color(Palette::TEXT_FAINT),
+        );
     }
 }
 
@@ -2101,7 +2209,7 @@ impl App {
 
     /// Brief, non-modal confirmation of something that just happened — a copy,
     /// an import, an export. It never asks for a click and never blocks.
-    fn corner_notice(&mut self, ui: &mut egui::Ui) {
+    fn corner_notice(&mut self, ui: &mut egui::Ui, full: Rect) {
         let Some(note) = &self.notice else {
             return;
         };
@@ -2111,7 +2219,6 @@ impl App {
         }
         let label = tracked(&note.text);
 
-        let full = ui.max_rect();
         let width = (ui
             .painter()
             .layout_no_wrap(label.clone(), text::label(), Palette::ACCENT)
@@ -4042,7 +4149,24 @@ impl App {
         self.apply(study, action)
     }
 
+    /// Whether raw screen shortcuts belong to an exclusive overlay or a text
+    /// field instead. A docked formula sheet is not exclusive: the card beside
+    /// it keeps its keys unless the filter itself has focus.
+    fn overlay_owns_keys(&self, ctx: &egui::Context) -> bool {
+        let formula_is_modal = self
+            .formula_sheet
+            .as_ref()
+            .is_some_and(|sheet| !sheet.docked);
+        formula_is_modal
+            || self.plot_zoom.is_some()
+            || self.import_view.is_some()
+            || ctx.text_edit_focused()
+    }
+
     fn keys(&mut self, ctx: &egui::Context, study: &Study) -> Option<Action> {
+        if self.overlay_owns_keys(ctx) {
+            return None;
+        }
         ctx.input(|i| {
             use egui::Key::*;
             if study.feedback.is_some() {
@@ -6502,14 +6626,18 @@ impl App {
             Palette::TEXT_DIM,
         );
 
-        let (prev, next, deeper) = ui.ctx().input(|i| {
-            use egui::Key::*;
-            (
-                i.key_pressed(ArrowLeft),
-                i.key_pressed(ArrowRight),
-                i.key_pressed(D),
-            )
-        });
+        let (prev, next, deeper) = if self.overlay_owns_keys(ui.ctx()) {
+            (false, false, false)
+        } else {
+            ui.ctx().input(|i| {
+                use egui::Key::*;
+                (
+                    i.key_pressed(ArrowLeft),
+                    i.key_pressed(ArrowRight),
+                    i.key_pressed(D),
+                )
+            })
+        };
         if prev || prev_touch {
             review.idx = review.idx.saturating_sub(1);
         }
@@ -6844,6 +6972,30 @@ mod tests {
         (app, study)
     }
 
+    fn press(context: &egui::Context, key: egui::Key) {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = context.run_ui(input, |_| {});
+    }
+
+    const CARD_KEYS: [egui::Key; 9] = [
+        egui::Key::S,
+        egui::Key::E,
+        egui::Key::D,
+        egui::Key::A,
+        egui::Key::ArrowLeft,
+        egui::Key::ArrowRight,
+        egui::Key::Num1,
+        egui::Key::Space,
+        egui::Key::Enter,
+    ];
+
     fn clipboard_question() -> Question {
         Question {
             id: 1,
@@ -7032,6 +7184,66 @@ mod tests {
 
         sheet.filter = r"omega_d".into();
         assert!(formula_matches_filter(&peak, &sheet.filter));
+    }
+
+    #[test]
+    fn a_modal_formula_sheet_owns_the_card_keys() {
+        let context = egui::Context::default();
+        let (mut app, study) = begin_with_body(Body::TrueFalse { answer: true });
+
+        press(&context, egui::Key::S);
+        assert!(matches!(app.keys(&context, &study), Some(Action::Skip)));
+
+        app.open_formula_sheet(study.session.deck_id());
+        app.formula_sheet.as_mut().unwrap().docked = false;
+        for key in CARD_KEYS {
+            press(&context, key);
+            assert!(
+                app.keys(&context, &study).is_none(),
+                "{key:?} reached the card behind the modal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_docked_formula_sheet_leaves_the_card_keys_unchanged() {
+        let context = egui::Context::default();
+        let (mut app, study) = begin_with_body(Body::TrueFalse { answer: true });
+        let deck_id = study.session.deck_id();
+
+        for key in CARD_KEYS {
+            press(&context, key);
+            let alone = app.keys(&context, &study).is_some();
+
+            app.open_formula_sheet(deck_id);
+            app.formula_sheet.as_mut().unwrap().docked = true;
+            press(&context, key);
+            let docked = app.keys(&context, &study).is_some();
+            app.formula_sheet = None;
+
+            assert_eq!(alone, docked, "{key:?} changed meaning when docked");
+        }
+    }
+
+    #[test]
+    fn formula_sheet_docking_has_a_hard_narrow_window_fallback() {
+        assert_eq!(formula_dock_width(879.0), None);
+        assert_eq!(formula_dock_width(880.0), Some(360.0));
+        assert_eq!(formula_dock_width(320.0), None);
+    }
+
+    #[test]
+    fn formula_sheet_width_serves_the_card_first() {
+        for (available, sheet) in [
+            (880.0, 360.0),
+            (940.0, 360.0),
+            (1200.0, 540.0),
+            (1600.0, 560.0),
+        ] {
+            let width = formula_dock_width(available).expect("wide enough to dock");
+            assert_eq!(width, sheet, "at {available} pt");
+            assert!(available - width >= 520.0);
+        }
     }
 
     #[test]

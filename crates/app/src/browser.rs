@@ -429,7 +429,7 @@ impl BrowserApp {
     /// All that is left of the old toolbar: the buttons moved onto the deck
     /// screen, where they belong, but persistence is invisible and silent, so
     /// it still owes the user one word in the corner.
-    fn storage_state(&self, ui: &egui::Ui) {
+    fn storage_state(&self, ui: &egui::Ui, right_inset: f32) {
         // A storage failure says what went wrong, in full: it is the one thing
         // here the user may have to act on, and "storage error" alone would
         // not tell them whether their answers are being kept.
@@ -439,7 +439,7 @@ impl BrowserApp {
             (None, false) => (tracked("saved"), text::label(), Palette::TEXT_FAINT),
         };
         ui.painter().text(
-            ui.max_rect().right_bottom() + Vec2::new(-12.0, -10.0),
+            ui.max_rect().right_bottom() + Vec2::new(-12.0 - right_inset, -10.0),
             Align2::RIGHT_BOTTOM,
             label,
             font,
@@ -580,7 +580,11 @@ impl eframe::App for BrowserApp {
                 Some(Request::DownloadSoundscape { file, source }) => download_text(&file, &source),
                 None => {}
             }
-            self.storage_state(ui);
+            let sheet_width = self
+                .app
+                .as_ref()
+                .map_or(0.0, App::docked_formula_sheet_width);
+            self.storage_state(ui, sheet_width);
         } else {
             self.setup(ui);
         }

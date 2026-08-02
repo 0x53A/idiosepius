@@ -287,8 +287,24 @@ The same `D` toggles depth on the review screen, where `←`/`→` step through 
 answered cards.
 
 `F` opens the current deck's formula sheet from any screen inside that deck.
-The square `F` control beside Back is its pointer and touch route; `F`, `Esc`,
-Back or the modal's Close control dismisses it.
+The square `F` control beside Back is its pointer and touch route; `F`, `Esc`
+or Back dismisses it, as does the modal's Close control on a narrow window.
+
+**The formula sheet is a companion, not an interruption.** Given a window wide
+enough to hold both, it docks as a column down the right and the card beside it
+stays live — swipeable, answerable and still holding the keyboard. The `F`
+control stays visible and lights to show that the sheet is open. The existing
+soundscape and settings chrome stays with it; opening a screen that is not
+deck-scoped closes the sheet. Only when the window cannot hold both does the
+sheet fall back to the exclusive modal and dim the card behind it.
+
+The card gets its width first, and the sheet takes the surplus between a
+legible floor and a ceiling that keeps a reference beside the question from
+becoming the main event. Header, stage, question controls, top chrome and
+corner notices all use the narrower card column, so nothing is painted over
+the sheet. Focus decides who gets a keystroke: typing in the filter belongs to
+the filter; otherwise a docked sheet leaves the card's shortcuts and copy
+transcript intact.
 
 The whole interface scales with `Ctrl/Cmd` + `+` or `−`; `Ctrl/Cmd` + `0`
 returns to 100 %. Scaling applies equally to prose, formulas, cards and chrome.

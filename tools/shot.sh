@@ -4,6 +4,7 @@
 #
 #   nix-shell --run ./tools/shot.sh            # module cs
 #   nix-shell --run "./tools/shot.sh -m ma"    # module ma
+#   nix-shell --run "./tools/shot.sh formulas-study formulas-narrow"
 #
 # Output lands in target/shots/ (target/shots/<module>/ for anything but cs,
 # so a second module's captures do not overwrite the first's).
@@ -19,11 +20,22 @@ while [[ ${1:-} == -* ]]; do
       shift 2
       ;;
     *)
-      echo "usage: $0 [-m MODULE]" >&2
+      echo "usage: $0 [-m MODULE] [SHOT ...]" >&2
       exit 2
       ;;
   esac
 done
+
+requested=("$@")
+wanted() {
+  ((${#requested[@]} == 0)) && return 0
+  local candidate
+  for candidate in "${requested[@]}"; do
+    [[ $candidate == "$1" ]] && return 0
+  done
+  return 1
+}
+captured=0
 
 out=target/shots
 [[ $module == cs ]] || out=target/shots/$module
@@ -75,12 +87,14 @@ else
   fi
 fi
 
-# shoot <name> [extra idio args...]
-shoot() {
-  local name=$1
-  shift
+# shoot_at <width> <height> <name> [extra idio args...]
+shoot_at() {
+  local width=$1 height=$2 name=$3
+  shift 3
+  wanted "$name" || return 0
+  captured=$((captured + 1))
   # winit prefers Wayland when WAYLAND_DISPLAY is set; force X11 for Xvfb.
-  env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1000x760x24" \
+  env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 ${width}x${height}x24" \
     env LIBGL_ALWAYS_SOFTWARE=1 \
     ./target/debug/idiosepius-app "$db" --shot "$out/$name.pam" "$@" 2>/dev/null
 
@@ -90,8 +104,17 @@ shoot() {
   fi
 }
 
+# shoot <name> [extra idio args...]
+shoot() {
+  local name=$1
+  shift
+  shoot_at 1000 760 "$name" "$@"
+}
+
 shoot math      --screen math
 shoot formulas  --screen formulas
+# The sheet beside a live card is the arrangement worth diffing.
+shoot formulas-study --screen formulas-study --card "$truefalse"
 shoot plots     --screen plots
 shoot plot-zoom --screen plot-zoom
 shoot decks     --screen decks
@@ -126,25 +149,26 @@ shoot review    --screen review --card "$truefalse"
 shoot notes-picked --screen feedback --card "$choice"
 shoot notes-all    --screen review --card "$choice"
 
+# Below the docking threshold the same sheet remains the exclusive modal.
+shoot_at 620 760 formulas-narrow \
+  --screen formulas-study --card "$truefalse"
+
 # A short viewport with enough decks to force the home list to scroll. Add
 # these only after every content-specific capture, so the first deck selected
 # by the screenshot routes stays the real imported module.
-for n in 2 3 4 5 6; do
-  sqlite3 "$db" \
-    "INSERT INTO deck (slug, title, description, exam_at, created_at)
-     VALUES ('shot-$n', 'Screenshot Deck $n', NULL, NULL, $n)"
-done
-env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 620x420x24" \
-  env LIBGL_ALWAYS_SOFTWARE=1 \
-  ./target/debug/idiosepius-app "$db" --shot "$out/decks-small.pam" --screen decks 2>/dev/null
-env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 620x420x24" \
-  env LIBGL_ALWAYS_SOFTWARE=1 \
-  ./target/debug/idiosepius-app "$db" --shot "$out/decks-small-end.pam" --screen decks-scroll 2>/dev/null
-if command -v magick >/dev/null; then
-  magick "$out/decks-small.pam" "$out/decks-small.png" && rm -f "$out/decks-small.pam"
-  magick "$out/decks-small-end.pam" "$out/decks-small-end.png" && rm -f "$out/decks-small-end.pam"
-  echo "  $out/decks-small.png"
-  echo "  $out/decks-small-end.png"
+if wanted decks-small || wanted decks-small-end; then
+  for n in 2 3 4 5 6; do
+    sqlite3 "$db" \
+      "INSERT INTO deck (slug, title, description, exam_at, created_at)
+       VALUES ('shot-$n', 'Screenshot Deck $n', NULL, NULL, $n)"
+  done
+  shoot_at 620 420 decks-small --screen decks
+  shoot_at 620 420 decks-small-end --screen decks-scroll
+fi
+
+if ((${#requested[@]} > 0 && captured == 0)); then
+  echo "none of the requested shots are known: ${requested[*]}" >&2
+  exit 2
 fi
 
 echo "done"

@@ -54,10 +54,22 @@ def math(src):
     return src
 
 
+# `*…*` is emphasis everywhere else in a pack, so it has to be emphasis here
+# too. Keep these rules aligned with `richtext.rs`: `**so**` means the same as
+# `*so*`, an unmatched asterisk stays literal, and `\*` is always literal.
+LITERAL_STAR = "\0"
+
+
 def text(src):
+    # Preserve escaped stars before the backslash itself is escaped.
+    src = src.replace(r"\*", LITERAL_STAR)
     for a, b in TEXT_ESCAPES:
         src = src.replace(a, b)
-    return src
+    # Insert LaTeX only after ordinary text has been escaped, or the braces of
+    # `\emph{}` would themselves be escaped.
+    src = re.sub(r"\*\*([^*]+)\*\*", r"\\emph{\1}", src)
+    src = re.sub(r"\*([^*]+)\*", r"\\emph{\1}", src)
+    return src.replace(LITERAL_STAR, "*")
 
 
 def prose(src):
