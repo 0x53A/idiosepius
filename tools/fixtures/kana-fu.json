@@ -1,0 +1,10 @@
+{
+  "format": "idiosepius-kana-sample",
+  "format_version": 1,
+  "expected": "フ",
+  "recognizer": { "script_scope": "katakana" },
+  "strokes": [[
+    {"x":163,"y":306},{"x":241,"y":318},{"x":691,"y":218},
+    {"x":774,"y":252},{"x":566,"y":568},{"x":246,"y":847}
+  ]]
+}

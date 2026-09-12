@@ -1,0 +1,20 @@
+{
+  "version": "kana-stroke-finetune-v1",
+  "declared_before_training": "2026-09-12",
+  "epochs": 8,
+  "seed": 20260912,
+  "etl_batch_size": 96,
+  "synthetic_batch_size": 32,
+  "synthetic_loss_weight": 0.25,
+  "teacher_kl_weight": 0.25,
+  "teacher_temperature": 2.0,
+  "candidates": {
+    "plain": {"initialization": "cnn-64-etl7-deep-v2", "learning_rate": 0.0002},
+    "residual": {"initialization": "fresh-clean-residual-v1", "learning_rate": 0.0001}
+  },
+  "training": "One pass over ETL training rows per epoch; choose original or corrected proxy per row at random, draw embedded-source synthetic valid controls with replacement. Apply existing trainer augmentation. Supervised all-92 cross-entropy: 0.75 ETL plus 0.25 synthetic; add 0.25 temperature-2 KL to frozen initialization on the same augmented ETL inputs. AdamW, cosine learning rate to 10 percent of initial. No corruption labels are used for training.",
+  "selection": "Maximize the equal-weight mean known-script top-1 over original and corrected ETL4/5/7 validation inputs; break ties by their mean all-92 cross-entropy, then earliest epoch. No test or KanjiVG input selects checkpoints. Retain every epoch.",
+  "promotion": "Existing clean/original ETL validation gates remain required: mean corrected ETL4/7 gain >=0.5pp; ETL5/7 losses <=0.5pp; original ETL4 loss <=1pp and original ETL5/7 losses <=0.5pp. Require <=2 fewer canonical identities in known and both scope, >=99 percent positive controls per reference source, no additional >=0.99-confidence non-kana cases, <10MB model, runtime parity and independent seed confirmation. This trial cannot establish modern handwriting or malformed-ink accuracy. No automatic deployment.",
+  "negative_policy": "Corruption probes have unknown validity and parent labels are provenance only. Evaluate intended-parent recall separately; do not reward accepting corrupted ink as correct. The 26 procedural invalids are a smoke test, not a population false-positive estimate.",
+  "scope": "Research experiment on existing frozen preparations; source-specific threshold redesign is deferred rather than mixed into this experiment. All ETL derivatives remain private."
+}

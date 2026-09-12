@@ -19,20 +19,15 @@ wasm-pack build crates/app \
     --no-typescript \
     "$@"
 
-# wasm-bindgen can emit hashed snippet modules in addition to the predictable
-# loader and .wasm names. Give the service worker a complete, deterministic
-# package list so a first successful visit really is sufficient for offline use.
-python3 - "$repo_root/web/pkg" <<'PY'
-import json
-import sys
-from pathlib import Path
+# The diagnostic canvas loads only its recognizer worker, not egui, the study
+# database or the audio engine. Its generated files join the same manifest.
+wasm-pack build crates/kana-web \
+    --target web \
+    --out-dir ../../web/pkg/kana \
+    --out-name idiosepius_kana_web \
+    --no-pack \
+    --no-typescript \
+    "$@"
 
-package_dir = Path(sys.argv[1])
-manifest_path = package_dir / "asset-manifest.json"
-assets = sorted(
-    f"./pkg/{path.relative_to(package_dir).as_posix()}"
-    for path in package_dir.rglob("*")
-    if path.is_file() and path.name not in {".gitignore", manifest_path.name}
-)
-manifest_path.write_text(json.dumps(assets, indent=2) + "\n", encoding="utf-8")
-PY
+# Include hashed wasm-bindgen snippets and content-version the offline cache.
+python3 tools/write-web-manifest.py

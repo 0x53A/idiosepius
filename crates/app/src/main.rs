@@ -12,6 +12,7 @@ mod coin;
 mod explain;
 mod import;
 mod import_dialog;
+mod kana_canvas;
 #[cfg(feature = "audio")]
 mod library;
 mod math;
@@ -34,9 +35,13 @@ idio — study by swiping
 USAGE
     idio [<study.db>] [--import <pack.json>…]
     idio <study.db> --shot <out.pam> [--screen <name>] [--card <uid>] [--drag <px>]
+    idio --kana-canvas [<ink-or-sample.json>]
+    idio --kana-canvas --save-dir <directory> [<ink-or-sample.json>]
+    idio --kana-canvas-shot <out.pam> [<ink-or-sample.json>]
 
     With no path, uses ~/idiosepius/study.db. On a lesson screen --card picks
     the reading by uid and --drag scrolls it, in pixels.
+    The kana canvas saves to ~/idiosepius/kana-samples unless --save-dir is set.
 
 KEYS
     ← →   answer false / true        1-5    pick an option
@@ -45,6 +50,11 @@ KEYS
     n/enter  confirm / continue
     Ctrl/Cmd+C  copy visible text    Ctrl/Cmd+±  scale interface
     esc   end the session
+
+KANA CANVAS KEYS
+    b/h/k  both / hiragana / katakana     n      next prompt
+    c/u    clear / undo last stroke       i      label invalid ink
+    s      save sample                     Ctrl/Cmd+C  copy raw ink JSON
 ";
 
 fn main() -> Result<()> {
@@ -52,6 +62,30 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{USAGE}");
         return Ok(());
+    }
+
+    if let Some(command) = parse_kana_command(&args)? {
+        let default_sample_dir = default_settings_dir().join("kana-samples");
+        return match command {
+            KanaCommand::Canvas {
+                sample_dir,
+                initial_sample,
+            } => kana_canvas::run(
+                window_icon(),
+                None,
+                sample_dir.unwrap_or(default_sample_dir),
+                initial_sample,
+            ),
+            KanaCommand::Shot {
+                output,
+                initial_sample,
+            } => kana_canvas::run(
+                window_icon(),
+                Some(output),
+                default_sample_dir,
+                initial_sample,
+            ),
+        };
     }
 
     let parsed = parse_args(&args)?;
@@ -134,6 +168,69 @@ fn main() -> Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+#[derive(Debug, PartialEq)]
+enum KanaCommand {
+    Canvas {
+        sample_dir: Option<PathBuf>,
+        initial_sample: Option<PathBuf>,
+    },
+    Shot {
+        output: PathBuf,
+        initial_sample: Option<PathBuf>,
+    },
+}
+
+fn parse_kana_command(args: &[String]) -> Result<Option<KanaCommand>> {
+    let Some(flag) = args.first().map(String::as_str) else {
+        return Ok(None);
+    };
+    match flag {
+        "--kana-canvas" => match &args[1..] {
+            [] => Ok(Some(KanaCommand::Canvas {
+                sample_dir: None,
+                initial_sample: None,
+            })),
+            [path] if path != "--save-dir" && !path.starts_with('-') => {
+                Ok(Some(KanaCommand::Canvas {
+                    sample_dir: None,
+                    initial_sample: Some(PathBuf::from(path)),
+                }))
+            }
+            [option, sample_dir] if option == "--save-dir" && !sample_dir.starts_with('-') => {
+                Ok(Some(KanaCommand::Canvas {
+                    sample_dir: Some(PathBuf::from(sample_dir)),
+                    initial_sample: None,
+                }))
+            }
+            [option, sample_dir, path]
+                if option == "--save-dir"
+                    && !sample_dir.starts_with('-')
+                    && !path.starts_with('-') =>
+            {
+                Ok(Some(KanaCommand::Canvas {
+                    sample_dir: Some(PathBuf::from(sample_dir)),
+                    initial_sample: Some(PathBuf::from(path)),
+                }))
+            }
+            _ => anyhow::bail!("invalid kana canvas arguments\n\n{USAGE}"),
+        },
+        "--kana-canvas-shot" => match &args[1..] {
+            [output] if !output.starts_with('-') => Ok(Some(KanaCommand::Shot {
+                output: PathBuf::from(output),
+                initial_sample: None,
+            })),
+            [output, path] if !output.starts_with('-') && !path.starts_with('-') => {
+                Ok(Some(KanaCommand::Shot {
+                    output: PathBuf::from(output),
+                    initial_sample: Some(PathBuf::from(path)),
+                }))
+            }
+            _ => anyhow::bail!("invalid kana canvas screenshot arguments\n\n{USAGE}"),
+        },
+        _ => Ok(None),
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -254,6 +351,60 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn kana_canvas_arguments_are_parsed_before_database_arguments() {
+        assert_eq!(
+            parse_kana_command(&args(&["--kana-canvas"])).unwrap(),
+            Some(KanaCommand::Canvas {
+                sample_dir: None,
+                initial_sample: None,
+            })
+        );
+        assert_eq!(
+            parse_kana_command(&args(&[
+                "--kana-canvas",
+                "--save-dir",
+                "writer-a",
+                "sample.json",
+            ]))
+            .unwrap(),
+            Some(KanaCommand::Canvas {
+                sample_dir: Some(PathBuf::from("writer-a")),
+                initial_sample: Some(PathBuf::from("sample.json")),
+            })
+        );
+        assert_eq!(
+            parse_kana_command(&args(&["--kana-canvas-shot", "out.pam", "sample.json",])).unwrap(),
+            Some(KanaCommand::Shot {
+                output: PathBuf::from("out.pam"),
+                initial_sample: Some(PathBuf::from("sample.json")),
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_kana_commands_cannot_fall_through_to_the_database() {
+        for invalid in [
+            args(&["--kana-canvas", "--save-dir"]),
+            args(&["--kana-canvas", "--unknown"]),
+            args(&["--kana-canvas", "--save-dir", "writer", "sample", "extra"]),
+            args(&["--kana-canvas-shot"]),
+            args(&["--kana-canvas-shot", "out.pam", "sample", "extra"]),
+        ] {
+            let error = parse_kana_command(&invalid).unwrap_err();
+            assert!(error.to_string().contains("kana canvas"), "{error}");
+        }
+    }
+
+    #[test]
+    fn ordinary_arguments_are_not_claimed_by_the_kana_parser() {
+        assert_eq!(parse_kana_command(&args(&["study.db"])).unwrap(), None);
+        assert_eq!(
+            parse_kana_command(&args(&["--import", "pack.json"])).unwrap(),
+            None
+        );
     }
 
     #[test]

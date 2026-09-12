@@ -2400,6 +2400,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skrifa",
+ "tempfile",
  "ureq",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -2426,6 +2427,16 @@ dependencies = [
  "turso_core",
  "uuid",
  "web-time",
+]
+
+[[package]]
+name = "idiosepius-kana-web"
+version = "0.1.0"
+dependencies = [
+ "idiosepius-core",
+ "serde_json",
+ "wasm-bindgen",
+ "zip",
 ]
 
 [[package]]

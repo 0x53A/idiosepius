@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#060a0d">
+  <title>Kana canvas · Idiosepius</title>
+  <link rel="stylesheet" href="./kana.css">
+</head>
+<body>
+<main>
+  <header><h1>Kana canvas</h1><a href="./">Back to study</a></header>
+  <p class="intro">Write one character. Recognition is experimental; nothing here changes your study progress.</p>
+  <div class="controls">
+    <label>Script <select id="script"><option value="hiragana">Hiragana</option><option value="katakana">Katakana</option></select></label>
+    <label><input id="pen-only" type="checkbox" checked> Pen only</label>
+    <button id="start" disabled>Start a 46-kana set</button>
+  </div>
+  <div class="workspace">
+    <section aria-label="Drawing area">
+      <div class="prompt-row"><span id="prompt">Free drawing</span><span id="progress"></span></div>
+      <canvas id="ink" width="1024" height="1024" aria-label="Draw a kana here with your pen"></canvas>
+      <div class="controls">
+        <button id="undo" disabled>Undo stroke</button><button id="clear" disabled>Clear</button>
+        <button id="save" disabled>Save sample</button><button id="skip" disabled>Skip</button>
+      </div>
+      <p id="ink-info">Pen only ignores fingers on the drawing area. Turn it off for a mouse or finger.</p>
+    </section>
+    <section class="diagnostics" aria-label="Recognition results">
+      <label>Expected kana <input id="expected" maxlength="2" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Optional · − for invalid ink"></label>
+      <div class="classifiers"><section>
+      <h2>Geometry</h2>
+      <p id="verdict" role="status" aria-live="polite">Loading recognizer…</p>
+      <ol id="candidates" aria-label="Nearest candidates"></ol>
+      <p class="detail">Distances are geometric scores, not probabilities. Stroke order is not graded.</p>
+      </section><section>
+      <h2>Vision</h2>
+      <p id="vision-verdict" role="status">Draw to compare.</p>
+      <ol id="vision-candidates" aria-label="Vision candidates"></ol>
+      <p class="detail">Scores rank the 46 kana in the selected script. They are not calibrated probabilities; this model can also guess at scribbles.</p>
+      </section></div>
+      <p id="reference" class="detail"></p>
+      <hr>
+      <p id="storage">Opening sample storage…</p>
+      <button id="export" disabled>Export saved samples</button>
+      <a id="download" hidden>Download sample archive</a>
+      <p class="detail">Saved samples stay in this browser. Export a ZIP to keep a copy or share it for evaluation.</p>
+      <p id="notice" role="status" aria-live="polite"></p>
+    </section>
+  </div>
+</main>
+<script type="module" src="./kana.js"></script>
+</body>
+</html>

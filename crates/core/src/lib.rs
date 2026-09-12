@@ -31,6 +31,7 @@
 pub mod content;
 pub mod db;
 pub mod figure;
+pub mod kana;
 pub mod model;
 pub mod scheduler;
 pub mod session;
@@ -48,3 +49,5 @@ pub use model::{
     lesson_transcript, now_ms, option_order,
 };
 pub use session::{Input, Mode, Session};
+
+pub mod kana_vision;

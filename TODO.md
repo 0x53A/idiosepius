@@ -21,6 +21,61 @@ Turso database per numeric account, rather than applying last-push-wins
 replication to the live SQLite file. Deliberately deferred until after the
 current exams.
 
+## Japanese handwriting cards
+
+Resume from [the kana handoff](KANA-HANDOFF.md), including completed
+experiments, local artifacts, and the ordered next steps.
+
+**Current, 2026-09-12:** [the beginner-error loop](KANA-BEGINNER.md) produced a
+confirmed residual fine-tune that is now embedded. It scored 100% on 2,208
+reference-derived positive stroke controls, passed the frozen ETL regression
+gates in two seeds, reproduced exactly, and passed native/Wasm parity. This is
+not a modern-user handwriting accuracy claim. The rebuilt browser, worker parity
+and offline-update checks pass. Next: strengthen missing-stroke feedback and integrate mark handling only
+after broader tests. The research mark adapter distinguishes 324/324 procedural
+voiced forms without false compositions on the basic controls; clipped public
+references still expose two uncertain body recognitions. No study grading is
+integrated. The model and full previous report are archived outside Cargo output.
+
+The notes below describe the earlier baselines and broader data backlog.
+
+The recognition-first design and prior-art investigation are recorded in
+[`JAPANESE.md`](JAPANESE.md). Preserve vector stroke trajectories from the
+start, but keep identity recognition independent of stroke order: a correctly
+shaped kana in an unconventional order must still be detected. Canonical
+stroke feedback is a separate later layer. The small native-and-Wasm
+order-independent kana recognizer and collection canvas now exist; the next
+gate is held-out real handwriting. The 2026-09-07 orientation fix and browser
+canvas at `web/kana.html` are documented in `JAPANESE.md`; the corrected
+KanjiVG katakana baseline is 44/46 nearest and 29/46 accepted, with no accepted
+wrong identities. One rejected synthetic `マ` still misses the top-five gate.
+A trained CNN now runs beside the geometry matcher in both canvases, with
+model provenance retained in samples. The reused scan benchmark reaches
+83.90% for ETL4 hiragana and 99.74% for ETL5 katakana; the ETL7-trained
+model scores 76.98%/99.39%/99.16% on ETL4/5/7 stroke proxies; see [`KANA-VISION.md`](KANA-VISION.md).
+The quality-first budget is 10 MB. A scan-threshold defect is now isolated and
+an opt-in corrected preparation improves ETL4 validation proxies from 86.39%
+to 90.02% with the same model. Four warm-start trials did not justify replacing
+the deployed weights; fixed translation averaging remains experimental.
+Three fresh 30-epoch runs are complete: the larger residual models improve corrected
+hiragana and reach 91/92 canonical identities in both seeds, but lose about two
+points on original ETL4 proxies, so neither replaces the deployed weights.
+Accuracy-aligned checkpoint selection is available as an opt-in, replayed training
+setting. The next work is source-specific preparation, a frozen training protocol,
+broader handwriting data (audit ETL8G/9G), independent modern-writer
+evaluation, and valid/invalid-ink calibration. Epoch retention and an opt-in
+faster CPU layout are available for those experiments. Reference-shape similarity is informational.
+The official ETL4/ETL5/ETL7 files are available in ignored training storage; the
+trainer and replay tools never touch study progress. A clean Kuzushiji-49
+train/test experiment
+more than doubled held-out historical-hiragana top-1 (12.81 % to 27.24 %) with
+one compact training prototype per character, and transferred modestly to
+KanjiVG, but still rejected 97.59 % of K49. That improves the recognizer
+without clearing the card-integration gate: neither historical offline ink,
+public canonical sources nor same-template synthetic variants substitute for
+modern writers. Do not start a pack plugin system or
+handwriting-quality scoring before that evidence is credible.
+
 ## Reformat the packs through the surviving `packfmt.py`
 
 There were two `packfmt.py` — one here, one in the content repository — with

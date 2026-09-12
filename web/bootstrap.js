@@ -85,7 +85,7 @@ try {
 
 if ("serviceWorker" in navigator) {
   try {
-    await navigator.serviceWorker.register("./service-worker.js");
+    await navigator.serviceWorker.register("./service-worker.js", { updateViaCache: "none" });
   } catch (error) {
     console.error("Could not enable offline use:", error);
   }

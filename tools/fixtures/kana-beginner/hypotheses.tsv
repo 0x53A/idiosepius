@@ -1,0 +1,93 @@
+character	confusables	hypothesis
+あ	おめ	Omit the crossbar or upright; open the crossing in the lower loop.
+い	りこ	Drop either stroke; align both strokes too evenly or rotate their placement.
+う	つら	Omit the upper mark; flatten or reverse the lower curve.
+え	んれ	Omit the upper mark; lose the angular turn before the rightward tail.
+お	あむ	Omit the detached right mark; open or flatten the lower loop.
+か	や	Omit the detached right stroke; lose the bend or hook of the main stroke.
+き	さち	Omit one crossbar; mirror the lower curve. Preserve ordinary pen lifts.
+く	へし	Reverse the bend horizontally; flatten its angle or rotate the entire shape.
+け	は	Omit the crossbar or left stroke; shorten the right descending stroke.
+こ	いに	Omit one horizontal stroke; rotate or overconnect the pair.
+さ	きち	Mirror the lower curve; omit the crossbar. Do not judge joined forms by count alone.
+し	つく	Mirror the lower hook; shorten it into an almost straight line.
+す	む	Lose the internal loop; truncate the descending tail or omit the crossbar.
+せ	さも	Omit either upright; shorten the baseline until contacts are lost.
+そ	てろ	Flatten the middle bend; omit the final curve. Allow different upper-stroke segmentation.
+た	なに	Omit either right-hand mark; lose the cross on the left.
+ち	さら	Mirror the lower curve; omit the crossbar or close the curve into a loop.
+つ	しう	Mirror the main curve; flatten the upper arc or truncate the return.
+て	そ	Omit the upper shoulder; flatten or reverse the lower curve.
+と	う	Omit the short upper stroke; move it into the wrong side of the lower curve.
+な	たは	Omit the upper-right mark; flatten the lower loop or lose the left cross.
+に	こけ	Omit the left stroke or one right horizontal; compress the right pair together.
+ぬ	めね	Omit the terminal loop; alter the central crossing or reverse the terminal curl.
+ね	れわぬ	Omit the terminal loop; simplify the right-hand section into another kana.
+の	め	Open or reverse the inner turn; retrace the loop without changing its identity.
+は	ほけ	Omit the crossbar; lose the loop or move its stem relative to the bar.
+ひ	ゆ	Flatten the bowl; reverse one shoulder or collapse one side.
+ふ	う	Omit a side mark or the upper mark; merge detached parts excessively.
+へ	く	Mirror unequal arms; flatten the peak or rotate the bend.
+ほ	はま	Omit one horizontal bar or the left stroke; distort the lower loop.
+ま	ほも	Omit one bar; open the lower loop or misplace the vertical crossing.
+み	めむ	Lose the left loop; omit the final crossing stroke or shorten the right extension.
+む	すお	Omit the right mark; open the loop or straighten the final return.
+め	ぬの	Add a terminal curl; lose the crossing or omit one stroke.
+も	まし	Omit one horizontal; shorten the hooked stem or change bar placement.
+や	かせ	Omit the short upper mark; reverse the long stroke or close the upper bend.
+ゆ	ひ	Omit the central stroke; open the large loop or move the crossing outside it.
+よ	ま	Omit the upper short arm; lose the lower loop or mirror the arm.
+ら	うち	Omit the upper mark; flatten the lower bowl or misplace the upper bend.
+り	い	Omit either stroke; remove the length difference. Do not reject connected-looking forms solely by count.
+る	ろぬ	Omit the lower loop; overclose or reverse the terminal curl.
+れ	ねわ	Add a loop or remove the rightward tail; lose the left angular turn.
+ろ	るそ	Add a lower loop; flatten the middle turn or truncate the bowl.
+わ	ねれ	Add a loop or pointed tail; open the right-hand bowl.
+を	ちそ	Omit the upper bar; lose a central crossing or truncate the lower sweep.
+ん	えし	Flatten the middle rise; mirror or truncate the final rightward curve.
+ア	マヤ	Omit the inner descending stroke; reverse the upper corner or move its contact.
+イ	ノリ	Omit either stroke; move the short upright away from the long diagonal.
+ウ	ワフ	Omit the upper mark or left short stroke; open the top corner.
+エ	ニコ	Omit the central upright or one horizontal; shift the upright to one edge.
+オ	ナホ	Omit the diagonal; move the vertical crossing or reverse the hook.
+カ	ク力	Omit the diagonal; flatten the bent stroke or place its crossing too high.
+キ	チモ	Omit one crossbar; alter the slope or placement of the long stroke.
+ク	タケ	Omit the upper short stroke; add an interior mark or straighten the bend.
+ケ	クサ	Omit the right descending stroke or upper-left stroke; move the top contact.
+コ	ユロ	Omit the lower bar; close the open left side or move the vertical edge.
+サ	セキ	Omit one upright; alter the lengths or the intersection with the horizontal.
+シ	ツン	Place the short marks across the top instead of down the left; steepen the sweep.
+ス	ヌフ	Omit the final diagonal; move its crossing upward or extend it through the top.
+セ	サヤ	Omit the inner stroke; move its contact or reverse the lower turn.
+ソ	ンリ	Make the sweep too shallow; move the short mark from upper-left toward the left side.
+タ	クヌ	Omit the inner mark; misplace its contact or flatten the outer bend.
+チ	テナキ	Omit the top short stroke or middle bar; straighten the descending curve.
+ツ	シソ	Place the short marks down the left instead of across the top; flatten the sweep.
+テ	チニ	Omit the descending stroke or top bar; tilt the middle bar and tail together.
+ト	ナ	Omit the short branch; put the branch on the left or extend it across the stem.
+ナ	チオ	Omit either stroke; make the crossing look like an extra diagonal or upper bar.
+ニ	エコ	Omit one bar; add an unintended connecting stroke or reverse the length ratio.
+ヌ	ス又	Omit the crossing stroke; move the crossing outside the bent stroke.
+ネ	ホオ	Omit the upper mark or right branch; merge the central diagonal and vertical.
+ノ	ソン	Shorten or reverse the slant; add a detached mark. A simple slash is a valid kana here.
+ハ	ヘ八	Omit one side; connect the upper ends or reverse the relative slopes.
+ヒ	セレ	Omit the upper bar; reverse the lower bend or move the bar below its contact.
+フ	ワウ	Add a left stroke or upper mark; flatten the corner or truncate the diagonal.
+ヘ	へハ	Flatten the peak or separate the arms. Hiragana and katakana can be visually identical.
+ホ	オ木	Omit one side stroke or the top bar; merge a side stroke into the central stem.
+マ	アム	Omit the inner diagonal; reverse its direction of slant or move it above the bend.
+ミ	ニ三	Omit one of three bars; flatten their slopes or distort their spacing.
+ム	マ厶	Omit the right short stroke; open the lower corner or reverse the slant.
+メ	ナノ	Omit either diagonal; flatten one until the crossing resembles a horizontal bar.
+モ	キヒ	Omit one bar; lose the lower right turn or move the stem crossing.
+ヤ	セア	Omit the descending stroke; reverse the top angle or move the contact.
+ユ	コエ	Omit the lower bar; shift the vertical edge or extend the upper bar leftward.
+ヨ	コロ	Omit the middle bar; connect the open left edge or reverse the side of the upright.
+ラ	フヲ	Omit the detached upper bar; add an interior bar or close the left side.
+リ	ソル	Omit either stroke; turn the right stroke into a diagonal sweep or a rightward hook.
+ル	リレ	Omit either stroke; flatten the right bend or shorten its final rise.
+レ	ルし	Lose the lower corner; reverse the final diagonal or add a separate left stroke.
+ロ	コ口	Omit one side; leave a large corner gap. The kanji mouth is not distinguishable by ink alone.
+ワ	ウフ	Omit the left short stroke; add an upper mark or flatten the upper-right turn.
+ヲ	ラフ	Omit the interior bar; shorten the long descending stroke or move its crossing.
+ン	ソシ	Make the sweep too steep; move the short mark toward the top instead of the left.

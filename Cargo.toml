@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/app"]
+members = ["crates/core", "crates/app", "crates/kana-web"]
 default-members = ["crates/app"]
 
 [workspace.package]

@@ -1,0 +1,26 @@
+{
+  "version": "kana-style-affine-synthetic-v1",
+  "declared_before_training": "2026-09-12",
+  "epochs": 4,
+  "seed": 20260914,
+  "etl_batch_size": 96,
+  "synthetic_batch_size": 32,
+  "synthetic_loss_weight": 0.5,
+  "teacher_kl_weight": 0.25,
+  "teacher_temperature": 2.0,
+  "candidates": {
+    "residual": {
+      "initialization": "stroke-finetune-residual-v1",
+      "learning_rate": 5e-05
+    }
+  },
+  "training": "One-factor comparison against the four-epoch style-weight-trial-v1: disable max/min-pooling thickness changes only for synthetic ink, retaining affine augmentation, all ETL scan augmentation, and identical random-number consumption. Same data, initialization, seed, epochs, teacher and supervised mixture. Keep every gate, including 6/6 observed development loops.",
+  "selection": "Unchanged equal-source known-script ETL validation top1, mean all-92 loss tie, earliest epoch. Retain all epochs. Shape validation and observed failures do not select epochs.",
+  "promotion": "All original trial-v1 promotion gates and independent-seed confirmation remain required against the archived pre-finetune baseline. Additionally require no more than 0.25pp regression in any original/clean ETL validation group relative to current deployed residual, 100 percent on original 2208 positive controls, no reduction on the 1104 clipped controls, and improvement on the six observed small-loop controls. No additional >=0.99 non-kana cases. Shape transform validation is diagnostic only and cannot waive a gate. Native/Wasm parity and <10MB remain required. No automatic deployment. All six observed small-loop controls must now be correct, as a development check. Report adapted-source gains separately from KanjiVG and ETL. No corruption is a supervised positive.",
+  "limitation": "Previously inspected AnimCJK hiragana is now adapted training-source data, including the style of the observed \u308b failures. Its canonical and transformed controls are development regression checks, not independent source accuracy. Existing promotion gates remain unchanged and cannot establish modern beginner handwriting accuracy.",
+  "synthetic_sources": [
+    "embedded",
+    "animcjk_clipped_hiragana"
+  ],
+  "synthetic_morphology": false
+}

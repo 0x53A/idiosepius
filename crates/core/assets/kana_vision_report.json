@@ -1,0 +1,311 @@
+{
+  "format": "idiosepius-kana-vision-report-v2",
+  "promoted_at": "2026-09-12",
+  "binary_model_sha256": "adfe3ccbc3de26e15d8cfb7e1ba132c0a1aab5eb77f6696fe661d4c92a101d2c",
+  "checkpoint_sha256": "a736d8b3dad6f1bc12d663b6b6f840c34e0015e2d4b75aae50935bb94dbe0ef8",
+  "best_epoch": 3,
+  "model_bytes": 1989236,
+  "config": {
+    "family": "residual",
+    "depth": 3,
+    "width": 2,
+    "architecture": "kana-residual-depth3-width2-64-v1",
+    "rasterizer": "kana-bitmap-64-v1",
+    "torch": "2.14.0+cpu",
+    "numpy": "2.5.2",
+    "training_seed": 20260912,
+    "threads": 6,
+    "channels_last": true
+  },
+  "training_protocol": {
+    "version": "kana-stroke-finetune-v1",
+    "declared_before_training": "2026-09-12",
+    "epochs": 8,
+    "seed": 20260912,
+    "etl_batch_size": 96,
+    "synthetic_batch_size": 32,
+    "synthetic_loss_weight": 0.25,
+    "teacher_kl_weight": 0.25,
+    "teacher_temperature": 2.0,
+    "candidates": {
+      "plain": {
+        "initialization": "cnn-64-etl7-deep-v2",
+        "learning_rate": 0.0002
+      },
+      "residual": {
+        "initialization": "fresh-clean-residual-v1",
+        "learning_rate": 0.0001
+      }
+    },
+    "training": "One pass over ETL training rows per epoch; choose original or corrected proxy per row at random, draw embedded-source synthetic valid controls with replacement. Apply existing trainer augmentation. Supervised all-92 cross-entropy: 0.75 ETL plus 0.25 synthetic; add 0.25 temperature-2 KL to frozen initialization on the same augmented ETL inputs. AdamW, cosine learning rate to 10 percent of initial. No corruption labels are used for training.",
+    "selection": "Maximize the equal-weight mean known-script top-1 over original and corrected ETL4/5/7 validation inputs; break ties by their mean all-92 cross-entropy, then earliest epoch. No test or KanjiVG input selects checkpoints. Retain every epoch.",
+    "promotion": "Existing clean/original ETL validation gates remain required: mean corrected ETL4/7 gain >=0.5pp; ETL5/7 losses <=0.5pp; original ETL4 loss <=1pp and original ETL5/7 losses <=0.5pp. Require <=2 fewer canonical identities in known and both scope, >=99 percent positive controls per reference source, no additional >=0.99-confidence non-kana cases, <10MB model, runtime parity and independent seed confirmation. This trial cannot establish modern handwriting or malformed-ink accuracy. No automatic deployment.",
+    "negative_policy": "Corruption probes have unknown validity and parent labels are provenance only. Evaluate intended-parent recall separately; do not reward accepting corrupted ink as correct. The 26 procedural invalids are a smoke test, not a population false-positive estimate.",
+    "scope": "Research experiment on existing frozen preparations; source-specific threshold redesign is deferred rather than mixed into this experiment. All ETL derivatives remain private."
+  },
+  "trial_script_sha256": "a33b091235c849d7ead47fae8cfcbd973d1334853ef3d20af3a3339c4c7214bc",
+  "trainer_source_sha256": "186b739c2974b52f0cf962533b04a67239149ccff3f5791b4140d866d5522bbd",
+  "trial_data_sha256": "4f05c550f12242585b01bc9af0d35df88049410e8f72ae8b8fa101f79e593e21",
+  "validation": {
+    "original:etl4": {
+      "samples": 882,
+      "macro_top1": 0.8671497584541062,
+      "top1": 0.8594104051589966,
+      "top5": 0.9353741407394409,
+      "loss": 0.7387090921401978
+    },
+    "original:etl5": {
+      "samples": 2058,
+      "macro_top1": 0.9961180124223602,
+      "top1": 0.9961127042770386,
+      "top5": 0.999514102935791,
+      "loss": 0.07617733627557755
+    },
+    "original:etl7": {
+      "samples": 4600,
+      "macro_top1": 0.9895652173913044,
+      "top1": 0.9895651936531067,
+      "top5": 0.9991304278373718,
+      "loss": 0.051747050136327744
+    },
+    "clean:etl4": {
+      "samples": 882,
+      "macro_top1": 0.9160628019323671,
+      "top1": 0.9149659872055054,
+      "top5": 0.9716553092002869,
+      "loss": 0.4411369562149048
+    },
+    "clean:etl5": {
+      "samples": 2058,
+      "macro_top1": 0.9961180124223602,
+      "top1": 0.9961127042770386,
+      "top5": 0.999514102935791,
+      "loss": 0.07617733627557755
+    },
+    "clean:etl7": {
+      "samples": 4600,
+      "macro_top1": 0.9895652173913044,
+      "top1": 0.9895651936531067,
+      "top5": 0.9991304278373718,
+      "loss": 0.051747050136327744
+    }
+  },
+  "stroke_audit": {
+    "embedded:valid_control": {
+      "samples": 1104,
+      "vision": {
+        "parent_top1": 1.0,
+        "parent_top5": 1.0,
+        "high_confidence_rates": {
+          "0.5": 1.0,
+          "0.9": 1.0,
+          "0.99": 0.9882246376811594,
+          "0.999": 0.9085144927536232
+        }
+      },
+      "geometry": {
+        "parent_top1": 1.0,
+        "parent_top5": 1.0,
+        "acceptance_rate": 0.9166666666666666,
+        "accepted_other_than_parent": 0.0
+      }
+    },
+    "embedded:corruption_probe": {
+      "samples": 1238,
+      "vision": {
+        "parent_top1": 0.6833602584814217,
+        "parent_top5": 0.8731825525040388,
+        "high_confidence_rates": {
+          "0.5": 0.9604200323101777,
+          "0.9": 0.77140549273021,
+          "0.99": 0.6098546042003231,
+          "0.999": 0.47334410339256866
+        }
+      },
+      "geometry": {
+        "parent_top1": 0.6195476575121163,
+        "parent_top5": 0.7859450726978998,
+        "acceptance_rate": 0.4596122778675283,
+        "accepted_other_than_parent": 0.03796445880452343
+      }
+    },
+    "kanjivg:valid_control": {
+      "samples": 1104,
+      "vision": {
+        "parent_top1": 1.0,
+        "parent_top5": 1.0,
+        "high_confidence_rates": {
+          "0.5": 1.0,
+          "0.9": 0.9972826086956522,
+          "0.99": 0.9882246376811594,
+          "0.999": 0.9492753623188406
+        }
+      },
+      "geometry": {
+        "parent_top1": 0.8532608695652174,
+        "parent_top5": 0.9402173913043478,
+        "acceptance_rate": 0.5144927536231884,
+        "accepted_other_than_parent": 0.008152173913043478
+      }
+    },
+    "kanjivg:corruption_probe": {
+      "samples": 1251,
+      "vision": {
+        "parent_top1": 0.715427657873701,
+        "parent_top5": 0.8808952837729817,
+        "high_confidence_rates": {
+          "0.5": 0.9688249400479616,
+          "0.9": 0.8161470823341327,
+          "0.99": 0.6690647482014388,
+          "0.999": 0.5443645083932853
+        }
+      },
+      "geometry": {
+        "parent_top1": 0.4676258992805755,
+        "parent_top5": 0.7026378896882494,
+        "acceptance_rate": 0.16626698641087131,
+        "accepted_other_than_parent": 0.030375699440447643
+      }
+    },
+    "procedural:non_kana": {
+      "samples": 26,
+      "vision": {
+        "parent_top1": null,
+        "parent_top5": null,
+        "high_confidence_rates": {
+          "0.5": 0.6923076923076923,
+          "0.9": 0.15384615384615385,
+          "0.99": 0.0,
+          "0.999": 0.0
+        }
+      },
+      "geometry": {
+        "parent_top1": null,
+        "parent_top5": null,
+        "acceptance_rate": 0.0,
+        "accepted_other_than_parent": null
+      }
+    }
+  },
+  "stroke_corpus_sha256": "78f87f1c3a5e89e17d783702b6569afe7db35fd536d7a5154a2b0bab8b048c0a",
+  "gates": {
+    "etl_gates": {
+      "validation_gates_passed": true,
+      "mean_clean_hiragana_gain_pp": 1.0956555604934692,
+      "clean_deltas_pp": {
+        "etl4": 1.473921537399292,
+        "etl5": 0.24295449256896973,
+        "etl7": 0.7173895835876465
+      },
+      "original_deltas_pp": {
+        "etl4": -0.4535198211669922,
+        "etl5": 0.24295449256896973,
+        "etl7": 0.7173895835876465
+      },
+      "failures": []
+    },
+    "stroke_failures": [],
+    "positive_controls": {
+      "embedded": 1.0,
+      "kanjivg": 1.0
+    },
+    "baseline_reference": {
+      "canonical_known_top1": 88,
+      "canonical_both_top1": 88
+    },
+    "candidate_reference": {
+      "canonical_known_top1": 92,
+      "canonical_both_top1": 92
+    },
+    "native_logit_delta": 2.982818603669557e-06,
+    "model_bytes": 1989236,
+    "eligible_for_confirmation": true,
+    "note": "Eligibility for another seed and further checks only; not a modern pen accuracy or validity claim. No deployment."
+  },
+  "confirmation": {
+    "etl_gates": {
+      "validation_gates_passed": true,
+      "mean_clean_hiragana_gain_pp": 1.0918110609054565,
+      "clean_deltas_pp": {
+        "etl4": 1.8140554428100586,
+        "etl5": 0.1943647861480713,
+        "etl7": 0.3695666790008545
+      },
+      "original_deltas_pp": {
+        "etl4": -0.4535198211669922,
+        "etl5": 0.1943647861480713,
+        "etl7": 0.3695666790008545
+      },
+      "failures": []
+    },
+    "stroke_failures": [],
+    "positive_controls": {
+      "embedded": 1.0,
+      "kanjivg": 1.0
+    },
+    "baseline_reference": {
+      "canonical_known_top1": 88,
+      "canonical_both_top1": 88
+    },
+    "candidate_reference": {
+      "canonical_known_top1": 92,
+      "canonical_both_top1": 92
+    },
+    "native_logit_delta": 4.3100402828955e-06,
+    "model_bytes": 1989236,
+    "eligible_for_confirmation": true,
+    "note": "Eligibility for another seed and further checks only; not a modern pen accuracy or validity claim. No deployment."
+  },
+  "reproduction": {
+    "passed": true,
+    "files": {
+      "model.bin": "adfe3ccbc3de26e15d8cfb7e1ba132c0a1aab5eb77f6696fe661d4c92a101d2c",
+      "best.pt": "a736d8b3dad6f1bc12d663b6b6f840c34e0015e2d4b75aae50935bb94dbe0ef8",
+      "history.json": "b01b21dcf465dae3583030d77430b1ae205ce76dd9b9cc427c3be53eed1249a0",
+      "config.json": "1d3cd1bbf97cb59523347e2c3b274919c2ed94f87e37a22e62eaec3109c0ae58",
+      "report.json": "195e3bd39e9a7df1ee53607ae9e0efc2f9ea9928d0666d3ec2b1efd69f009612",
+      "initial-validation.json": "0652d8e04ef630690ef1c6e99c0b74e38ce9307fcfe1017e119b22304062b94e",
+      "synthetic-golden.json": "cf88e47f2d010d43d5969e97c59789312d3df8de9649e2ffbc35985f00a5e7a7",
+      "epoch-001.pt": "452123e045b10fc0254ff16319eb636219443952ca16830277b2d0bc3b348000",
+      "epoch-002.pt": "9444fa7763297e8dc6816613a650fcf43d28514eec16e629fad2dc42c90917b5",
+      "epoch-003.pt": "ad2d43865ea4d3fd1446bab49390460c6d7aa5df3d61a23026e376a352db9a9a",
+      "epoch-004.pt": "9ac8d487c8772a6e11211004315db61a288a465802349914531c56b9beaf193d",
+      "epoch-005.pt": "fa6d82399492e617de4d5669e396fc1737e5dcfa1f7da0f3c7fca4fa3957c877",
+      "epoch-006.pt": "8cd68bd4a1e1ea9a802117b48e2c4921fb576ddcf4901f28df343fe8cc476979",
+      "epoch-007.pt": "a29dc7e766e42f1f4805d048d2ea8179fbcaa126cff325ad4dfd82262bbe444a",
+      "epoch-008.pt": "1cbe49b9e3efad69e3c9fba8c7d831eaeaa95c4b81b7011d7c66be65f078d8f0"
+    },
+    "replica": "kana-artifacts/kana-training/stroke-finetune-residual-v1-reproduction",
+    "note": "Exact repeat on nixos-server; same prepared inputs, CPU and pinned environment."
+  },
+  "wasm_parity": {
+    "passed": true,
+    "samples": 92,
+    "browser": "149.0.7827.155",
+    "model_sha256": "adfe3ccbc3de26e15d8cfb7e1ba132c0a1aab5eb77f6696fe661d4c92a101d2c",
+    "maximum_score_delta": 3.637978807091713e-12,
+    "milliseconds": {
+      "median": 18.80000000447035,
+      "p95": 25.5,
+      "maximum": 38.3999999910593
+    },
+    "note": "Desktop Wasm module replay of public references, both classifiers; no worker scheduling, independent handwriting accuracy, or iPad latency claim."
+  },
+  "data_attribution": "ETL Character Database / Electrotechnical Laboratory, Japanese Technical Committee for Optical Character Recognition, ETL Character Database, 1973–1984",
+  "terms": "https://etlcdb.db.aist.go.jp/download2/",
+  "split_method": "ETL4 sheet-disjoint; ETL5 and ETL7 conservatively grouped by sex, age, industry, occupation and collection date, not verified writer-disjoint. Seed 20260908; ETL4/5 retain earlier assignments.",
+  "split_sha256": "86101bb60431f3b743880f726b6cfaef8e6e81395d03352020b36f8437bc3415",
+  "current_model_test_evaluation": null,
+  "previous_deployed_model": {
+    "binary_model_sha256": "e888da2c5c12599f4e94e7de310d9cfdeb6ac0bf858eba70a92c845f03252886",
+    "archived_report": "kana-artifacts/model-releases/pre-stroke-finetune-20260912/kana_vision_report.json",
+    "report_sha256": "5bf6dca7f970b788a5955570e23c7c53bc49e9114eaba954b18d6413c3724b93"
+  },
+  "limitations": [
+    "Synthetic controls and historical scan proxies do not establish modern user handwriting accuracy.",
+    "CNN softmax is uncalibrated and is not an acceptance or writing-quality score.",
+    "The CNN covers 92 basic kana; mark composition and missing-stroke feedback are research tools, not deployed features.",
+    "No test records were evaluated for this candidate; earlier test figures belong to the archived model.",
+    "No study progress or scheduler integration."
+  ]
+}

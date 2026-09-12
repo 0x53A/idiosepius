@@ -27,6 +27,19 @@ while [[ ${1:-} == -* ]]; do
 done
 
 requested=("$@")
+# Standalone diagnostic capture: no content import or database is needed.
+if [[ ${requested[*]} == kana ]]; then
+  mkdir -p target/shots
+  cargo build -p idiosepius-app
+  env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1000x760x24" \
+    env LIBGL_ALWAYS_SOFTWARE=1 ./target/debug/idiosepius-app \
+    --kana-canvas-shot target/shots/kana.pam tools/fixtures/kana-fu.json
+  if command -v magick >/dev/null; then
+    magick target/shots/kana.pam target/shots/kana.png
+  fi
+  echo "target/shots/kana.pam"
+  exit 0
+fi
 wanted() {
   ((${#requested[@]} == 0)) && return 0
   local candidate

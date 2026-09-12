@@ -38,7 +38,12 @@ committing in one does nothing for the rest.
 This guide, and all the tooling, live in the **application** repository. A
 content checkout holds content only; see § 11.
 
-Within a module, files are flat and prefixed with a short module code:
+Within a module, files are flat. **Filenames have no meaning to the importer:**
+it merges every pack it is given, and gets deck, topic, question and lesson
+identity and order from the JSON. Names exist only to make the repository
+comfortable to navigate.
+
+The existing modules use this layout:
 
 ```
 <mod>-00-facts.json       shared facts: symbols and notes
@@ -50,14 +55,25 @@ Within a module, files are flat and prefixed with a short module code:
 <mod>-formula-sheet.pdf   generated — never hand-edited
 ```
 
-Lessons (§ 10) are kept in files of their own, numbered `1n` against the topic
-file `0n` they teach, because a topic's prose and its forty questions are not
-comfortable to edit in one file.
+Do not copy the `01` questions / `11` lessons offset into a new module. It
+stops expressing the relationship once a course has more than nine topics.
+Prefer adjacent pairs with the same filing number instead:
 
-The prefix is what the tooling globs on, so it must be short, lowercase and
-unique across modules. Every file of a module carries the **same `deck`
-block**, because packs are merged by deck slug and the importer rejects a set
-that describes more than one deck.
+```
+01-<topic>-questions.json
+01-<topic>-lessons.json       (optional)
+02-<topic>-questions.json
+02-<topic>-lessons.json       (optional)
+```
+
+The number is a human sorting aid, not an identifier or an importer constraint;
+the topic slug and each question or lesson `uid` carry those jobs. A module
+prefix is likewise optional. Existing repositories retain theirs because it
+still labels a loose file usefully, not because the pack format requires it.
+
+Every file of a module carries the **same `deck` block**, because packs are
+merged by deck slug and the importer rejects a set that describes more than
+one deck.
 
 ```json
 {
@@ -88,28 +104,21 @@ rejected at import.
 Everything below is run from the **application checkout's root**.
 
 1. `git init content/<module-name>` — its own repository, ignored by this one.
-2. Pick the prefix. Create `<mod>-00-facts.json` with the `deck` block and an
-   empty `questions: []`.
-3. Write the topic files. Keep a file to one topic and roughly 20–35 questions
-   — beyond that it stops being editable by hand.
+2. Create a facts pack with the `deck` block and an empty `questions: []`.
+3. Write paired `NN-<topic>-questions.json` and, when needed,
+   `NN-<topic>-lessons.json` files. Keep a question file to one topic and
+   roughly 20–35 questions — beyond that it stops being editable by hand.
 4. Write `content/<module-name>/CLAUDE.md` — see § 13.
 5. `python3 tools/check-packs.py content/<module-name>`
 6. `python3 tools/packfmt.py --check content/<module-name>/*.json`
-7. If the subject has formulas, add `<mod>-00-formulas.json` and run
-   `./tools/build-sheet.sh <mod>`.
-
-Nothing else needs changing. The scripts discover modules by prefix, so no
-script has a list of modules to keep in step.
+7. If the subject has formulas, add a formula pack. The current printed-sheet
+   convenience command discovers the existing `<mod>-00-formulas.json` naming
+   and is run as `./tools/build-sheet.sh <mod>`; that is a tooling interface,
+   not an import requirement.
 
 Reimporting a deck into a personal study database is deliberately not an
 authoring or validation step. It changes user state and is left to the user;
 agents must not run `reimport.sh`.
-
-**Glob two digits.** Any script that finds packs must use
-`<mod>-[0-9][0-9]-*.json`, never `<mod>-0*.json`. The latter silently stops at
-the ninth topic file, which is a bug that looks exactly like success: the
-import reports a plausible count and nobody notices the missing topics. Check
-the reported topic count against what you expect.
 
 ### Why a repository per module
 
@@ -117,12 +126,10 @@ Modules are separate bodies of work with separate lifetimes — a course ends,
 its deck stops changing, and it should stop appearing in another course's
 history.
 
-One question from that split is still open: **whether the file prefixes
-survive.** Inside `content/<module-name>/`, `cs-01-modeling.json` says "cs"
-twice, and `01-modeling.json` would be cleaner. It stays as it is for now:
-renaming should go through `git mv` so the history follows, and that is the
-author's call, not a script's. The prefix is also still what the tooling globs
-on, so dropping it is not a pure rename.
+Existing repositories need not be renamed to the preferred paired layout.
+Their filenames are familiar navigation, and a rename should happen through
+`git mv` only when its author finds the cleaner layout worth the history-only
+diff.
 
 ---
 

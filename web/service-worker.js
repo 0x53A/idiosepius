@@ -1,27 +1,22 @@
-const CACHE_PREFIX = "idiosepius-offline-";
-const CACHE_NAME = `${CACHE_PREFIX}v1`;
-const PACKAGE_MANIFEST = "./pkg/asset-manifest.json";
-const APP_SHELL = [
-  "./",
-  "./index.html",
-  "./bootstrap.js",
-  "./manifest.webmanifest",
-  "./icons/icon-192.png",
-  "./icons/icon-512.png",
-  "./icons/icon-maskable-512.png",
-  "./icons/apple-touch-icon.png",
-];
+importScripts("./pkg/cache-manifest.js");
+const CACHE_PREFIX = `idiosepius-offline-${encodeURIComponent(self.registration.scope)}-`;
+const CACHE_NAME = `${CACHE_PREFIX}${self.IDIOSEPIUS_OFFLINE.version}`;
+// Keep this handle for the worker's lifetime. An old in-flight request must
+// not reopen and recreate its cache after a newer worker has removed it.
+const currentCache = caches.open(CACHE_NAME);
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
     (async () => {
-      const response = await fetch(PACKAGE_MANIFEST);
-      if (!response.ok) {
-        throw new Error("Could not read the web package manifest");
+      const cache = await currentCache;
+      try {
+        await cache.addAll(
+          self.IDIOSEPIUS_OFFLINE.assets.map((url) => new Request(url, { cache: "reload" })),
+        );
+      } catch (error) {
+        await caches.delete(CACHE_NAME);
+        throw error;
       }
-      const packageAssets = await response.json();
-      const cache = await caches.open(CACHE_NAME);
-      await cache.addAll([...APP_SHELL, PACKAGE_MANIFEST, ...packageAssets]);
       await self.skipWaiting();
     })(),
   );
@@ -59,8 +54,7 @@ self.addEventListener("fetch", (event) => {
         if (!response.ok || response.type !== "basic") {
           return;
         }
-        return caches
-          .open(CACHE_NAME)
+        return currentCache
           .then((cache) => cache.put(request, response.clone()));
       })
       .catch(() => {}),
@@ -68,12 +62,13 @@ self.addEventListener("fetch", (event) => {
 
   event.respondWith(
     network.catch(async () => {
-      const cached = await caches.match(request);
+      const cache = await currentCache;
+      const cached = await cache.match(request);
       if (cached) {
         return cached;
       }
       if (request.mode === "navigate") {
-        return caches.match("./index.html");
+        return cache.match("./index.html");
       }
       return Response.error();
     }),

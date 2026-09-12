@@ -1,0 +1,16 @@
+{
+  "version": "kana-shape-finetune-v1",
+  "declared_before_training": "2026-09-12",
+  "epochs": 4,
+  "seed": 20260914,
+  "etl_batch_size": 96,
+  "synthetic_batch_size": 32,
+  "synthetic_loss_weight": 0.25,
+  "teacher_kl_weight": 0.25,
+  "teacher_temperature": 2.0,
+  "candidates": {"residual": {"initialization": "stroke-finetune-residual-v1", "learning_rate": 0.00005}},
+  "training": "Same teacher-distilled ETL/synthetic recipe as trial-v1, warm-started from the confirmed deployed residual. Add 64 deterministic embedded-source shape variants per each of 92 classes, retaining the original 1104 controls. Rotation +/-12deg, scale 0.85..1.15, shear +/-0.10, arc-length sinusoidal displacement 0..1.2 reference units, 32/48/96 sampled points. All classes remain equally represented. No observed AnimCJK hiragana failures enter training.",
+  "selection": "Unchanged equal-source known-script ETL validation top1, mean all-92 loss tie, earliest epoch. Retain all epochs. Shape validation and observed failures do not select epochs.",
+  "promotion": "All original trial-v1 promotion gates and independent-seed confirmation remain required against the archived pre-finetune baseline. Additionally require no more than 0.25pp regression in any original/clean ETL validation group relative to current deployed residual, 100 percent on original 2208 positive controls, no reduction on the 1104 clipped controls, and improvement on the six observed small-loop controls. No additional >=0.99 non-kana cases. Shape transform validation is diagnostic only and cannot waive a gate. Native/Wasm parity and <10MB remain required. No automatic deployment.",
+  "limitation": "Exploratory small-loop/general shape robustness experiment. Embedded reference transforms and previously inspected source failures are development evidence, not independent modern handwriting accuracy. Invalid-writing feedback remains separate."
+}

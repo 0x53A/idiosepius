@@ -195,6 +195,25 @@ pub(crate) fn install_fonts(ctx: &egui::Context) {
         }
     }
 
+    // The primary UI face remains monospace. This is only a glyph fallback
+    // for Japanese content, whose characters the preferred Latin mono faces
+    // generally do not contain.
+    if let Some(path) = find_font("Noto Sans CJK JP")
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        fonts.font_data.insert(
+            "ui-japanese".to_owned(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        for family in [FontFamily::Monospace, FontFamily::Proportional] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("ui-japanese".to_owned());
+        }
+    }
+
     ctx.set_fonts(fonts);
 }
 
